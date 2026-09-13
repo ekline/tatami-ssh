@@ -708,3 +708,386 @@ Maintain the distinction between:
 - **open question**
 
 Avoid silently turning an experimental proposal into a protocol requirement.
+
+---
+
+# New architectural direction: HTTP/3-inspired QUIC mapping
+
+The HTTP/2 -> HTTP/3 transition provides a useful architectural precedent. Tatami should not be framed as simply tunneling RFC 4254 SSH packets through QUIC. Instead, preserve the externally meaningful SSH semantics while replacing TCP-era transport mechanisms with native QUIC mechanisms where the mapping is sound.
+
+A strong working model is:
+
+```text
+                         QUIC connection
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                 │
+       SSH control stream   SSH channel       SSH channel
+              │              stream 1          stream 2
+              │                │                 │
+       identification          │                 │
+       exchange +              data              data
+       connection-level
+       SSH semantics
+```
+
+This is analogous in spirit to HTTP/3's use of a dedicated control stream plus independent request streams and other specialized QUIC streams. It is a design precedent, not a requirement to copy HTTP/3's exact wire format.
+
+## Identification exchange and session binding
+
+The SSH `SSH-2.0-...` identification exchange needs explicit treatment. In conventional SSH, the client and server identification strings are outside the binary packet protocol and are inputs to the RFC 4253 exchange hash `H`.
+
+For SSH-over-QUIC, the working direction is to retain the familiar SSH identification exchange on the SSH control stream, but not attempt to reconstruct the RFC 4253 DH-based `H`. Instead, the TLS exporter/session-binding construction should explicitly bind the SSH/QUIC session to the identification exchange and other explicitly defined SSH/QUIC context.
+
+Conceptually:
+
+```text
+SSH identification exchange
+        │
+SSH/QUIC negotiation/context
+        │
+        ├── client identification
+        ├── server identification
+        └── other explicitly defined context
+                  │
+                  ▼
+          TLS exporter
+                  │
+                  ▼
+       SSH/QUIC session binding
+```
+
+The exact exporter label, context, output length, and userauth-signature implications remain open design questions.
+
+## SSH flow control versus QUIC flow control
+
+SSH RFC 4254 channel windows are a major example of TCP-era/application transport machinery that may be redundant when SSH is bound directly to QUIC. SSH has per-channel windows and `SSH_MSG_CHANNEL_WINDOW_ADJUST`; QUIC already provides stream-level and connection-level flow control.
+
+The preferred direction is therefore to investigate a semantic mapping rather than blindly carrying SSH window messages inside channel streams:
+
+```text
+SSH channel
+     │
+     │ conceptual flow-control semantics
+     ▼
+QUIC stream flow control
+```
+
+This follows the architectural lesson of HTTP/3, where HTTP/2 flow-control mechanisms that duplicate QUIC capabilities are not simply tunneled through QUIC.
+
+However, this is not yet a protocol decision. RFC 4254 also carries channel parameters such as initial window size and maximum packet size, and SSH's observable channel semantics must be preserved. The SSH/QUIC binding must determine exactly which parameters remain meaningful and how they map to QUIC.
+
+Important candidate mappings to investigate:
+
+| SSH concept | Possible SSH/QUIC treatment |
+|---|---|
+| SSH channel | QUIC bidirectional stream |
+| channel window | QUIC stream flow control |
+| connection-wide resource limit | QUIC connection flow control |
+| `SSH_MSG_CHANNEL_WINDOW_ADJUST` | potentially eliminated/translated rather than transmitted |
+| `SSH_MSG_CHANNEL_DATA` | channel-stream data |
+| `SSH_MSG_CHANNEL_EXTENDED_DATA` | channel-stream data with SSH-level type semantics, exact encoding TBD |
+| `SSH_MSG_CHANNEL_EOF` | potentially related to QUIC FIN, but semantic equivalence must be demonstrated |
+| `SSH_MSG_CHANNEL_CLOSE` | SSH-level close semantics; relationship to QUIC stream termination TBD |
+| maximum SSH packet size | likely remains relevant to SSH framing; exact role TBD |
+
+Do not assume a one-to-one mapping between SSH EOF/CLOSE and QUIC FIN/RESET/STOP_SENDING. These have related but not necessarily identical semantics.
+
+## Control-stream hypothesis
+
+The current strong candidate is that SSH-over-QUIC has a dedicated QUIC stream for SSH connection-level protocol state. It should be investigated as the home for:
+
+- the SSH identification exchange;
+- SSH/QUIC negotiation or capability information, if required;
+- connection-level SSH protocol messages such as global requests and their responses;
+- any other SSH state that cannot naturally be associated with an individual channel.
+
+The exact stream direction, stream type, bootstrap rules, and whether additional unidirectional streams are needed remain open.
+
+## Architectural principle
+
+Add the following principle to the design plan:
+
+> **Preserve SSH's externally meaningful semantics; replace underlying transport mechanisms with native QUIC mechanisms where QUIC provides an appropriate equivalent. Do not tunnel TCP-era SSH transport machinery through QUIC merely for the sake of byte-for-byte similarity.**
+
+This makes the Tatami design philosophy closer to the HTTP/3 transition: an application protocol is mapped onto QUIC rather than merely encapsulated inside it.
+
+## New design ledger entries
+
+- **D-013 — QUIC-native SSH stream multiplexing.** SSH-over-QUIC uses QUIC native stream multiplexing as a primary design hypothesis. A dedicated SSH control stream is paired with independent QUIC streams associated with SSH channels. The binding should preserve SSH semantics while using QUIC transport primitives where appropriate.
+- **D-014 — HTTP/3-inspired transport mapping principle.** Preserve externally meaningful SSH semantics, but replace SSH/TCP transport mechanisms with native QUIC mechanisms where an appropriate semantic mapping exists. Do not tunnel redundant transport machinery solely for compatibility with the old wire encoding.
+- **D-015 — SSH identification remains explicit.** The SSH `SSH-2.0-...` identification exchange remains part of the SSH-over-QUIC protocol bootstrap and must be explicitly bound into the replacement session-binding construction; the design should not attempt to reproduce RFC 4253's DH-based `H`.
+
+New open questions:
+
+- **AQ-015 — SSH/QUIC control-stream design.** Determine which SSH protocol elements belong on a dedicated control stream, including the identification exchange and connection-level SSH messages.
+- **AQ-016 — SSH/QUIC flow-control mapping.** Determine whether RFC 4254 channel windows and `SSH_MSG_CHANNEL_WINDOW_ADJUST` should be carried over QUIC, translated into QUIC stream flow control, or otherwise represented, while preserving observable SSH channel semantics.
+- **AQ-017 — SSH/QUIC stream termination mapping.** Determine the relationship between SSH EOF/CLOSE semantics and QUIC FIN/RESET/STOP_SENDING.
+- **AQ-018 — SSH channel-stream framing.** Determine whether channel streams carry ordinary SSH channel messages, a reduced SSH representation, or another precisely specified mapping, including `CHANNEL_DATA`, `CHANNEL_EXTENDED_DATA`, channel requests, and channel-open parameters.
+
+---
+
+# Internet-Draft-first versus implementation-first strategy
+
+The project should explicitly consider writing a **design-level Internet-Draft before substantial implementation**, rather than treating the I-D as documentation written after the code.
+
+The motivation is strong: the eventual goal is an Internet-Draft describing a standards-oriented way to bind SSH to QUIC. A draft written first can serve as an explicit protocol contract for the implementation and can substantially reduce accidental protocol drift between the implementation and the eventual specification.
+
+However, the draft should not be treated as immutable. Implementation experience is expected to challenge the design. The recommended process is therefore:
+
+```text
+protocol research / design
+          │
+          ▼
+   draft I-D (v0.x)
+          │
+          ▼
+ implementation + tests
+          │
+          ├── confirms design
+          │
+          └── exposes problems / missing semantics
+                    │
+                    ▼
+             revise I-D + ledger
+                    │
+                    ▼
+             implementation
+```
+
+The initial I-D should specify the architecture and wire semantics sufficiently for an independent implementation, but should clearly mark experimentally motivated or provisional sections where the design is not yet validated.
+
+The coding agent should receive the draft together with the design ledger. It should treat the draft as the current protocol specification, but must **not silently invent protocol behavior** where the draft is intentionally unresolved. Instead it should isolate unresolved questions behind interfaces, experimental features, tests, or explicit TODOs and report where implementation experience conflicts with the draft.
+
+This approach is preferable to either extreme:
+
+- **Code-first with no protocol specification:** risks implementation decisions becoming de facto protocol requirements and makes later I-D cleanup difficult.
+- **Specification-first with no implementation feedback:** risks spending substantial effort specifying a protocol whose practical stream, flow-control, interoperability, or library constraints have not been tested.
+
+The recommended compromise is a **design-first experimental I-D**, followed by implementation-driven revision.
+
+## Proposed I-D development stages
+
+1. **Architecture draft:** define the protocol model, security model, stream model, and relationship to RFC 4252/4253/4254 and QUIC.
+2. **Wire-format draft:** specify control stream, channel stream association, bootstrap/identification exchange, session binding, and mappings for channel lifecycle and flow control to the degree needed for implementation.
+3. **Reference implementation:** implement against that draft and create interoperability tests.
+4. **Design revision:** record deviations, failed hypotheses, and necessary changes in the ledger and update the draft.
+5. **Candidate I-D:** consolidate the experimentally validated protocol and include comparison with `draft-bider-ssh-quic`.
+
+The first draft should deliberately distinguish **normative protocol requirements** from **implementation experiments** and **known open questions**.
+
+---
+# Checkpoint — 2026-09-13 — Before Section 7 design
+
+## Working method / continuity requirement
+
+The user explicitly requested frequent checkpoints so the design discussion can be resumed if conversation state is lost. Treat this file as the persistent continuity record. After each substantial design step, update the checkpoint with:
+
+- decisions that have become firm;
+- strong candidates that remain provisional;
+- rejected alternatives and why, where useful;
+- newly discovered open questions;
+- the current I-D section/status;
+- important RFC/web research findings;
+- the next concrete task.
+
+Do not silently promote a hypothesis into a protocol requirement.
+
+## I-D progress checkpoint
+
+Draft 00 has Sections 1–6 established conceptually:
+
+1. Abstract
+2. Introduction / scope
+3. Goals and design principles
+4. Terminology
+5. Relationship to SSH and QUIC
+6. Architectural model
+
+The next section is **§7 Connection Bootstrap and SSH Identification**.
+
+The immediate design work is to establish the bootstrap wire model before drafting detailed normative prose.
+
+## Section 7 research checkpoint
+
+RFC 4253 §4 says SSH works over an 8-bit-clean, binary-transparent transport and requires both endpoints to send an SSH identification string after the connection is established. The SSHv2 identification form is:
+
+`SSH-protoversion-softwareversion SP comments CR LF`
+
+The maximum length is 255 characters including CR LF. The portion before CR LF is used in the classic Diffie-Hellman exchange hash. After the identification string, conventional SSH begins the binary packet protocol. RFC 4253 also permits the server to send pre-identification lines that do not begin with `SSH-`.
+
+For Tatami/QUIC, these facts create a deliberate design fork:
+
+1. Preserve the SSH identification exchange as an explicit SSH-over-QUIC bootstrap element; or
+2. replace it with a QUIC/TLS-native negotiation mechanism.
+
+Current working direction remains (1): retain explicit SSH identification semantics, while binding the identifiers into the new SSH/QUIC session-binding construction rather than reconstructing the RFC 4253 DH exchange hash.
+
+QUIC provides authenticated application-protocol negotiation through TLS/ALPN unless another authenticated mechanism is used. RFC 9001 §8.1 therefore makes ALPN a likely candidate for identifying the SSH-over-QUIC application protocol at the QUIC/TLS layer. This does **not** by itself answer whether the SSH `SSH-2.0-...` identification exchange should remain; those are separate protocol-layer questions.
+
+QUIC stream IDs encode initiator and directionality. Client-initiated bidirectional streams are even; server-initiated bidirectional streams are odd; unidirectional streams use the other two ID forms. This is relevant to the eventual control-stream and channel-stream bootstrap rules.
+
+## Section 7 provisional model
+
+Strong candidate, not yet final:
+
+```text
+UDP / QUIC
+    │
+    ├── TLS 1.3 + authenticated ALPN
+    │       └── identifies SSH-over-QUIC application protocol
+    │
+    ▼
+QUIC connection established
+    │
+    ▼
+SSH-over-QUIC control stream
+    │
+    ├── SSH identification exchange
+    │       ├── client SSH-2.0-...
+    │       └── server SSH-2.0-...
+    │
+    └── SSH/QUIC binding / connection-level negotiation
+            │
+            ▼
+       SSH authentication + channels
+```
+
+Important: this is a **layering hypothesis**, not yet a final wire specification.
+
+## New/open questions for §7
+
+- AQ-019 — What exact ALPN identifier should identify SSH-over-QUIC? Is registration required or can an experimental/private-use identifier be used during implementation?
+- AQ-020 — Is the SSH identification exchange mandatory in QUIC mode, and if so, must it be byte-for-byte RFC 4253 compliant apart from transport context?
+- AQ-021 — How should RFC 4253's optional pre-identification server lines map to QUIC, if at all? They may be unnecessary because QUIC already has authenticated application negotiation.
+- AQ-022 — Which endpoint opens the SSH control stream, and is its stream type/directionality fixed?
+- AQ-023 — What event marks the transition from QUIC/TLS handshake completion to the SSH identification exchange? Must the application wait for handshake completion before opening the control stream?
+- AQ-024 — Which bootstrap values must be included in the eventual SSH/QUIC session-binding context: ALPN, QUIC version, SSH identifiers, implementation-independent protocol version, negotiated capabilities, or other values?
+- AQ-025 — How does the bootstrap model permit clean failure reporting when the peer speaks ordinary SSH over TCP/another protocol rather than SSH-over-QUIC?
+
+## Current I-D section/status table
+
+| Section | Subject | Status |
+|---|---|---|
+| 1 | Abstract | Draft 00 |
+| 2 | Introduction / scope | Draft 00 |
+| 3 | Goals / non-goals | Draft 00 |
+| 4 | Terminology | Draft 00 |
+| 5 | Relationship to SSH and QUIC | Draft 00 |
+| 6 | Architectural model | Draft 00 |
+| 7 | Connection bootstrap & identification | **Research / design in progress** |
+| 8 | SSH/QUIC session binding | Major research question |
+| 9 | QUIC stream architecture | Major design question |
+| 10 | SSH channel mapping | Major design question |
+| 11 | Flow control | Major design question |
+| 12 | SSH authentication | Depends partly on §8 |
+| 13 | Rekeying / key updates | Open |
+| 14 | Migration / NAT rebinding | Strong objective |
+| 15 | Resumption | Experimental/later |
+| 16 | TCP compatibility | Important interoperability section |
+| 17 | Implementation experience | Later |
+| 18 | Interoperability testing | Later |
+| 19 | Security considerations | Develop alongside protocol |
+| 20 | Lessons learned | Later |
+| 21 | Future standardization considerations | Later |
+| 22 | IANA considerations | Determine during design |
+| 23 | References | Maintain continuously |
+| A | Comparison with `draft-bider-ssh-quic` | Appendix; optional |
+
+## Next checkpoint trigger
+
+Before making a firm decision about ALPN, control-stream direction, or exact identification/bootstrap encoding, research the relevant QUIC/TLS/SSH requirements and record the rationale here. Then draft §7 only after the wire behavior is sufficiently clear to avoid accidental protocol decisions.
+---
+
+# Checkpoint — 2026-09-13: SSH channel ↔ QUIC stream and preserved channel framing
+
+The discussion following review of RFC 4254 identified an important semantic constraint on QUIC stream mapping.
+
+## Key observation
+
+SSH stdout and stderr are not separate SSH channels. For an interactive/session channel, normal output is carried by `SSH_MSG_CHANNEL_DATA`, while stderr is carried by `SSH_MSG_CHANNEL_EXTENDED_DATA` with the SSH extended-data type code for stderr. Both are messages belonging to the same SSH channel and therefore share the channel's message ordering and channel flow-control semantics.
+
+Consequently, mapping stdout and stderr to independent QUIC streams would not automatically preserve their relative ordering. A sequence such as:
+
+    CHANNEL_DATA           stdout "A"
+    CHANNEL_EXTENDED_DATA  stderr "B"
+    CHANNEL_DATA           stdout "C"
+    CHANNEL_EXTENDED_DATA  stderr "D"
+
+has an ordering relationship within the SSH channel that separate QUIC streams would not intrinsically preserve.
+
+## Candidate architecture now favored provisionally
+
+A more defensible architecture is:
+
+    One SSH connection <-> one QUIC connection
+
+    One SSH channel <-> one QUIC bidirectional stream
+
+    SSH channel message framing is preserved within that QUIC stream.
+
+In other words, the QUIC stream is the transport substrate for an SSH channel, rather than being declared semantically identical to the SSH channel byte/message protocol.
+
+A dedicated QUIC bidirectional control stream remains a separate candidate/architectural component for SSH connection-level messages.
+
+Conceptually:
+
+    QUIC connection
+    |
+    +-- SSH control stream
+    |      +-- connection-level SSH messages
+    |
+    +-- QUIC stream <-> SSH channel 0
+    |      +-- CHANNEL_DATA
+    |      +-- CHANNEL_EXTENDED_DATA
+    |      +-- CHANNEL_REQUEST
+    |      +-- CHANNEL_SUCCESS/FAILURE
+    |      +-- CHANNEL_EOF
+    |      +-- CHANNEL_CLOSE
+    |
+    +-- QUIC stream <-> SSH channel 1
+    |      +-- same SSH channel message protocol
+    |
+    +-- ...
+
+## Architectural rationale
+
+This preserves the distinction between two layers of multiplexing:
+
+- QUIC performs connection-level multiplexing and supplies independent ordered/reliable streams.
+- SSH channel messages retain SSH application semantics within each channel stream.
+
+This avoids inventing new mechanisms for stdout/stderr ordering and retains the SSH channel state machine, including channel data versus extended data, requests and replies, directional EOF, close, and channel-specific flow-control semantics.
+
+The useful design statement is:
+
+> QUIC streams provide transport concurrency; SSH channel messages provide application semantics.
+
+Another useful formulation is:
+
+> Each SSH channel is mapped to one QUIC bidirectional stream, while the SSH channel's message framing and semantics are preserved within that stream.
+
+This is deliberately more precise than saying that a QUIC stream is semantically equivalent to an SSH channel.
+
+## Burden of proof
+
+The project should not reject more QUIC-native decompositions categorically, but the burden of proof should be on any transformation that removes or redistributes SSH channel message semantics. In particular, a design using multiple QUIC streams for stdout/stderr or other portions of one SSH channel would need to demonstrate preservation of all externally meaningful SSH behavior, including ordering, flow control, requests/replies, EOF, and close semantics.
+
+## Control-plane observation
+
+Retaining a dedicated control stream remains compatible with the one-channel/one-stream mapping. Connection-level SSH messages can remain on the control stream while channel-specific messages remain on the stream corresponding to their SSH channel. This gives QUIC native multiplexing between SSH channels without collapsing the SSH channel protocol itself.
+
+## Important remaining design question
+
+This is a strong provisional architectural direction, but it is not yet a final numbered design decision. The next research/design pass must examine the interaction among SSH channel flow control, QUIC stream flow control, SSH EOF/close semantics, channel request ordering, stream creation/termination, and the control-stream design. The goal is to establish whether the proposed mapping can be specified cleanly without either redundant transport machinery or changed SSH-observable semantics.
+
+## Impact on prior decisions/open questions
+
+- Prior D-013 (QUIC-native SSH stream multiplexing) should be revisited and refined rather than treated as final.
+- Prior D-014 (replace SSH/TCP transport mechanisms with QUIC-native mechanisms where an appropriate semantic mapping exists) remains useful, but now has a stronger semantic-preservation test.
+- The candidate mapping is compatible with the project's core goal: preserve externally meaningful SSH semantics while using QUIC for connection/stream transport concurrency.
+- I-D sections 9 (QUIC stream architecture), 10 (SSH channel mapping), and 11 (flow control) remain design work, with this checkpoint providing their current architectural hypothesis.
+
+## Suggested empirical validation
+
+Interoperability/behavior tests should include deliberately interleaved stdout/stderr output, both with and without a PTY where meaningful, to establish the observable behavior of conventional SSH implementations and to ensure the QUIC binding does not inadvertently alter it.
