@@ -8,7 +8,7 @@
 
 ## Project
 
-**Tatami-ssh** is a Rust SSH implementation exploring QUIC as an alternate transport for SSH.
+**Tatami-rs** is a Rust SSH implementation exploring QUIC as an alternate transport for SSH.
 
 The original working document was `tatami-ssh.md`, a poorly formatted architecture/implementation outline. The goal is to iteratively turn it into a coherent implementation specification, then use implementation experience to inform an Internet-Draft describing how QUIC can replace TCP as the transport for SSH.
 
