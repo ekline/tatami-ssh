@@ -149,7 +149,7 @@ pub fn is_valid_name(name: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    fn collect<'a>(list: NameList<'a>) -> [Option<&'a [u8]>; 4] {
+    fn collect(list: NameList<'_>) -> [Option<&[u8]>; 4] {
         let mut it = list.iter();
         [it.next(), it.next(), it.next(), it.next()]
     }
