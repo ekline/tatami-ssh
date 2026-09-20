@@ -74,6 +74,9 @@ if [ "$run_embedded" -eq 1 ]; then
     if rustc --print sysroot >/dev/null 2>&1 \
         && [ -d "$(rustc --print sysroot)/lib/rustlib/$EMBEDDED_TARGET" ]; then
         step cargo check --workspace --no-default-features --target "$EMBEDDED_TARGET"
+        # Isolated allocation-free check: the workspace build above unifies
+        # `alloc` into tatami-wire through its dependents.
+        step cargo check -p tatami-wire --no-default-features --target "$EMBEDDED_TARGET"
         step cargo check -p tatami-wire --no-default-features --features alloc --target "$EMBEDDED_TARGET"
         step cargo check -p tatami --no-default-features --features tcp,quic --target "$EMBEDDED_TARGET"
     elif [ "${CHECK_EMBEDDED_REQUIRED:-0}" = 1 ]; then

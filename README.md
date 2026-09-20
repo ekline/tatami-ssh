@@ -16,13 +16,22 @@ Early. What runs today:
   `KEXINIT` proposal. It does **not** send a client `KEXINIT`, perform key
   exchange, obtain a host key, or authenticate. The output describes what the
   server *advertised*, not what was negotiated.
-- **`tatami-server`** — an entry-point stub. `--help`/`--version` only; it
-  does not listen.
+- **`tatami-server observe`** — a TCP diagnostic listener. It sends
+  `SSH-2.0-tatami_observer_0.1.0`, records each connecting client's
+  identification and initial `KEXINIT` proposal as JSON Lines, and closes.
+  It sends **no** server `KEXINIT`, has no host key, and authenticates nobody.
+  It observes early peer offers; it is **not an SSH service**.
 
 Library pieces behind that: bounded SSH primitive codecs and `KEXINIT` /
 channel-opening / transport-message codecs (`tatami-wire`), identification and
-initial packet parsing plus a portable probe state machine (`tatami-tcp`), and
-a pure channel-opening engine (`tatami-connection`).
+initial packet parsing, shared bounded pre-`KEXINIT` handling, portable probe
+and observer state machines and a bounded blocking listener (`tatami-tcp`), a
+pure channel-opening engine (`tatami-connection`), and JSON Lines reporting
+(`tatami`).
+
+Two runtime tracks remain ahead and are **not** started by this code: real TCP
+key exchange with host-key trust and protected packets, and a QUIC handshake
+observer after the backend audit in `docs/quic-observer-readiness.md`.
 
 ## Running the probe
 
@@ -55,6 +64,67 @@ locally with `sshd -D -f /dev/null -p 2299 -o ListenAddress=127.0.0.1 -h
 `ext-info-s` and `kex-strict-s-v00@openssh.com` markers annotated as
 non-methods, `[preauth]` close in sshd's log.
 
+## Running the observer
+
+```sh
+# Local diagnostic, finite duration and connection count.
+cargo run -p tatami --features std,tcp --bin tatami-server -- \
+  observe --listen 127.0.0.1:2222 --timeout 5s \
+  --max-concurrent 32 --max-connections 100 --run-for 10m --format jsonl
+
+# IPv6 banner-only observation.
+cargo run -p tatami --features std,tcp --bin tatami-server -- \
+  observe --listen '[::1]:2222' --banner-only --run-for 1m --format jsonl
+
+# Explicit public bind, for you to run on the intended host.
+cargo run -p tatami --features std,tcp --bin tatami-server -- \
+  observe --listen 0.0.0.0:2222 --format jsonl > observations.jsonl
+```
+
+`observe` without `--listen` binds `127.0.0.1:2222`. Without `--run-for` or
+`--max-connections` it runs until interrupted. One address per process: run
+separate instances for IPv4 and IPv6 rather than relying on dual-stack
+wildcard behaviour. Binding port 22 needs OS privileges and must not displace
+an existing SSH service; the program never edits firewall or service settings.
+
+Defaults (all local policy, all configurable): 32 concurrent observations;
+5 s per connection from acceptance, covering the banner write and all reads;
+64 KiB packet-length cap; 16 packets and 256 KiB through the first `KEXINIT`;
+256-byte sample of unexpected input; 128 pending records; records over 256 KiB
+truncated; 5 s shutdown grace. Excess connections beyond the concurrency limit
+are accepted, closed without a banner, counted as `dropped_at_capacity`, and
+count toward `--max-connections`.
+
+Output is JSON Lines on stdout (schema 1: `listener_started`,
+`connection_observation`, `overload`, `listener_stopped`); diagnostics go to
+stderr. Each observation carries the peer socket address, timestamps, byte
+counts, the sent server identification, the parsed client identification and
+anomalies, the client proposal with directional lists and marker annotations,
+the last stage, a stable `outcome`/`reason`, and explicit
+`key_exchange_completed: false` / `peer_authenticated: false`. Peer addresses
+and banners describe where packets came from and what was sent; they do not
+identify an operator or establish intent. For long runs redirect stdout to a
+file and rotate it externally; nothing is kept in memory.
+
+Exit status: 0 clean finite/requested stop; 1 listener/output/runtime failure;
+2 usage error. A malformed peer is a record, not a failed process.
+
+Because no server `KEXINIT` is sent, a client that waits for it will end with
+`outcome: timeout` after the connection deadline, with its identification
+recorded. `tatami-client probe` against the observer produces exactly that
+partial exchange on both sides (tested). OpenSSH sends its `KEXINIT` right
+after its identification, so it is fully observed.
+
+Observed with a real client during development (`OpenSSH_10.2p1`, command
+`ssh -F /dev/null -vv -p 2299 -o BatchMode=yes -o ConnectTimeout=5
+-o ConnectionAttempts=1 -o IdentityAgent=none -o IdentitiesOnly=yes localhost`):
+the client logged `remote software version tatami_observer_0.1.0`,
+`SSH2_MSG_KEXINIT sent`, then `Connection closed by 127.0.0.1 port 2299` and
+exited 255 (expected). The observer recorded `outcome: proposal` with the
+client identification `SSH-2.0-OpenSSH_10.2`, 16 KEX names including
+`ext-info-c` and `kex-strict-c-v00@openssh.com` annotated as markers, 16
+server-host-key algorithm names, and 1646 bytes read.
+
 ## Checks
 
 ```sh
@@ -65,9 +135,16 @@ Runs formatting, Clippy, the feature matrix, tests, docs and (when the
 `thumbv7em-none-eabi` target is installed) a core/alloc-only build. CI runs it
 on Rust 1.85.0 and stable.
 
-## Next milestone
+## Next milestones
 
-A real key-exchange method with host-key signature verification and trust
-policy, then protected packets and service negotiation. That needs separate
-algorithm and cryptographic-provider review; displaying `KEXINIT` does not
-begin it.
+Two separate tracks, neither begun by the probe or the observer:
+
+1. **TCP:** a real key-exchange method with host-key signature verification
+   and trust policy, then protected packets and service negotiation. Needs the
+   algorithm/provider audit outlined in `docs/specification-inventory.md`.
+2. **QUIC:** a TLS/QUIC handshake observer after the backend audit in
+   `docs/quic-observer-readiness.md`, and only later an SSH-over-QUIC observer
+   once the mapping's open questions are settled. No `--quic` option exists.
+
+File transfer direction (SFTP v3 baseline, one transfer per stream experiment)
+is recorded in `docs/decisions.md` W-25 and is not implemented.

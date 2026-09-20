@@ -215,10 +215,10 @@ fn client_disconnect_exits_1() {
 }
 
 #[test]
-fn server_stub_behaviour() {
+fn server_help_version_and_unsupported_commands() {
     let o = server(&["--help"]);
     assert_eq!(code(&o), 0);
-    assert!(stdout(&o).contains("entry-point stub"));
+    assert!(stdout(&o).contains("not an SSH service"));
 
     let o = server(&["--version"]);
     assert_eq!(code(&o), 0);
@@ -227,10 +227,15 @@ fn server_stub_behaviour() {
         format!("tatami-server {}", env!("CARGO_PKG_VERSION"))
     );
 
+    // No command, unsupported commands and unknown options are usage errors
+    // and must not open a listener.
     let o = server(&[]);
-    assert_eq!(code(&o), 1);
-    assert!(stderr(&o).contains("not implemented"));
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("no SSH service is implemented"));
     assert!(stdout(&o).is_empty());
+
+    let o = server(&["serve"]);
+    assert_eq!(code(&o), 2);
 
     let o = server(&["--listen", "0.0.0.0:22"]);
     assert_eq!(code(&o), 2);

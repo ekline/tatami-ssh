@@ -18,9 +18,13 @@ The Cargo workspace now exists with all seven packages (see `architecture.md`, d
 | Identification exchange, initial packet framing | Implemented for the TCP binding only (§4 first row: TCP keeps its own envelope) | `tatami-tcp::{ident,packet}` |
 | TCP initial-offer probe and `tatami-client probe` | Implemented; sends no client `KEXINIT`; verified against OpenSSH_10.2p1 | `tatami-tcp::{probe,io}`, `tatami::client::probe` |
 | Opening lifecycle engine (§2.2 items 2, 3, 4, 7 for opening only) | Implemented; no data, window accounting, EOF or close | `tatami-connection::opening` |
-| `tatami-server` | Entry-point stub only | `crates/tatami/src/bin/tatami-server.rs` |
+| `tatami-server observe` (round 2) | Implemented: TCP diagnostic listener sending only a server identification; records client identification and client `KEXINIT` as JSON Lines; verified against OpenSSH_10.2p1 (README). Not an SSH service. | `tatami-tcp::{initial,observer,io::listener}`, `tatami::server::observe` |
+| QUIC handshake observer | Designed only; backend audit and proposed slice in `quic-observer-readiness.md`; no code, no `--quic` | — |
+| SFTP / file transfer | Direction recorded (W-25); nothing implemented | — |
 | Key exchange, host-key verification, packet protection, userauth | Not started; next milestone | — |
 | QUIC record framing, association, session binding (AQ-018, AQ-026, P-04) | Not started; no wire choice made | — |
+
+**Protocol notes from the observer (round 2):** RFC 4253 §4.2 prelude lines are a server privilege; the observer classifies non-`SSH-` client bytes as unexpected input rather than a prelude (W-19). A client `1.99` identification is an anomaly to report, not a licence for SSH-1 behaviour. RFC 8308 `no-flow-control` requires a single simultaneous channel and is not a template for the multichannel QUIC mapping; the observer sends no `KEXINIT` and therefore neither offers nor receives `EXT_INFO` (see `specification-inventory.md` §2). None of this settles AQ-015/AQ-018–AQ-023/AQ-026.
 
 Item 1 of "Next concrete work" in §5 is complete. Validation rows "Message codecs" and "Opening state" in §5 now have executable evidence in package tests; "Interoperability" has one recorded manual smoke test (README), not a claim of interoperability.
 

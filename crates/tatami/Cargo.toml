@@ -23,6 +23,11 @@ tatami-connection = { workspace = true }
 tatami-tcp = { workspace = true, optional = true }
 tatami-quic = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Test-only: an independent JSON parser to validate JSON Lines output.
+# MSRV 1.56; never a dependency of any library target.
+serde_json = "1"
+
 [[bin]]
 name = "tatami-client"
 path = "src/bin/tatami-client.rs"

@@ -24,15 +24,15 @@
 //!
 //! # Message handling before `KEXINIT`
 //!
-//! | Message | Behaviour |
-//! |---|---|
-//! | `IGNORE`, `DEBUG`, `UNIMPLEMENTED` | Decoded, reported as an event, skipped. |
-//! | `DISCONNECT` | Decoded; ends the probe with [`ProbeEnd::Disconnected`]. |
-//! | `KEXINIT` | Decoded; ends the probe with [`ProbeEnd::Proposal`]. |
-//! | `NEWKEYS`, method-specific 30–49 | Ends the probe: the initial decoder is not valid past this point. |
-//! | anything else | Ends the probe with [`ProbeError::UnexpectedMessage`]. |
+//! Shared with the server observer; see [`crate::initial`].
 //!
-//! No bytes are ever skipped without being framed as a packet.
+//! # Buffering bound
+//!
+//! Input is held in an [`InputBuffer`] whose capacity is the packet cap plus
+//! framing plus the identification-phase limits. [`Probe::feed`] rejects
+//! (without copying) input that would exceed it and ends the probe with
+//! [`ProbeError::InputOverflow`]. Adapters should read at most
+//! [`Probe::room`] bytes per read.
 //!
 //! # Portability
 //!
@@ -44,15 +44,16 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use tatami_wire::kexinit::{KexInit, OwnedKexInit};
-use tatami_wire::transport::{Debug, Disconnect, Ignore, Unimplemented};
-use tatami_wire::{MessageError, msg};
+use tatami_wire::kexinit::OwnedKexInit;
 
+pub use crate::ident::OwnedIdentification;
 use crate::ident::{
-    IdentError, IdentLimits, IdentStep, Identification, IdentificationReader, LineTerminator,
-    VersionSupport, is_version_token,
+    IdentLimits, IdentStep, IdentificationReader, InvalidLocalIdentification, LineTerminator,
+    build_identification,
 };
-use crate::packet::{PacketError, PacketLimits, PacketStep, decode_initial_packet};
+pub use crate::initial::InitialError as ProbeError;
+use crate::initial::{InitialLimits, InitialPackets, InitialStep, InputBuffer, SkippedMessage};
+use crate::packet::{HEADER_LEN, PacketLimits};
 
 /// Software version token sent in the client identification. Validated by
 /// [`Probe::new`] and by a unit test against RFC 4253 §4.2 token rules.
@@ -62,7 +63,7 @@ pub const DEFAULT_SOFTWARE_VERSION: &str = "tatami_0.1.0";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeConfig {
     /// `softwareversion` token for the client identification. Must satisfy
-    /// [`is_version_token`].
+    /// [`crate::ident::is_version_token`] and fit the 255-byte line limit.
     pub software_version: String,
     /// Identification phase limits.
     pub ident: IdentLimits,
@@ -78,13 +79,35 @@ pub struct ProbeConfig {
 
 impl Default for ProbeConfig {
     fn default() -> Self {
+        let initial = InitialLimits::default();
         ProbeConfig {
             software_version: String::from(DEFAULT_SOFTWARE_VERSION),
             ident: IdentLimits::default(),
-            packet: PacketLimits::default(),
-            max_packets_before_kexinit: 16,
-            max_bytes_before_kexinit: 256 * 1024,
+            packet: initial.packet,
+            max_packets_before_kexinit: initial.max_packets,
+            max_bytes_before_kexinit: initial.max_bytes,
         }
+    }
+}
+
+impl ProbeConfig {
+    fn initial_limits(&self) -> InitialLimits {
+        InitialLimits {
+            packet: self.packet,
+            max_packets: self.max_packets_before_kexinit,
+            max_bytes: self.max_bytes_before_kexinit,
+        }
+    }
+
+    /// Largest amount of unconsumed input the probe will hold.
+    #[must_use]
+    pub fn buffer_capacity(&self) -> usize {
+        let packet = self.packet.max_packet_length as usize + HEADER_LEN;
+        let ident = self
+            .ident
+            .max_prelude_line
+            .max(self.ident.max_identification_line);
+        packet.max(ident) + ident
     }
 }
 
@@ -106,36 +129,6 @@ impl fmt::Display for Stage {
             Stage::InitialPackets => "awaiting server KEXINIT",
             Stage::Finished => "finished",
         })
-    }
-}
-
-/// Owned copy of a server [`Identification`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OwnedIdentification {
-    /// Exact bytes without the terminator.
-    pub line: Vec<u8>,
-    /// Terminator observed.
-    pub terminator: LineTerminator,
-    /// `protoversion` (always printable ASCII).
-    pub protocol_version: String,
-    /// `softwareversion` (always printable ASCII).
-    pub software_version: String,
-    /// Raw comment bytes, if present. Untrusted.
-    pub comments: Option<Vec<u8>>,
-    /// Version classification.
-    pub support: VersionSupport,
-}
-
-impl From<Identification<'_>> for OwnedIdentification {
-    fn from(i: Identification<'_>) -> Self {
-        OwnedIdentification {
-            line: i.line.to_vec(),
-            terminator: i.terminator,
-            protocol_version: String::from_utf8_lossy(i.protocol_version).into_owned(),
-            software_version: String::from_utf8_lossy(i.software_version).into_owned(),
-            comments: i.comments.map(<[u8]>::to_vec),
-            support: i.support,
-        }
     }
 }
 
@@ -172,6 +165,26 @@ pub enum ProbeEvent {
     },
 }
 
+impl From<SkippedMessage> for ProbeEvent {
+    fn from(m: SkippedMessage) -> Self {
+        match m {
+            SkippedMessage::Ignored { data_len } => ProbeEvent::Ignored { data_len },
+            SkippedMessage::Debug {
+                always_display,
+                message,
+                language_tag,
+            } => ProbeEvent::Debug {
+                always_display,
+                message,
+                language_tag,
+            },
+            SkippedMessage::Unimplemented { sequence_number } => {
+                ProbeEvent::Unimplemented { sequence_number }
+            }
+        }
+    }
+}
+
 /// Something about a syntactically valid `KEXINIT` that a conforming peer
 /// would not send. Reported alongside the proposal rather than hidden.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +193,17 @@ pub enum ProposalAnomaly {
     NonzeroReserved(u32),
     /// A required algorithm list was empty.
     EmptyAlgorithmList(&'static str),
+}
+
+impl ProposalAnomaly {
+    /// Stable, machine-readable code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            ProposalAnomaly::NonzeroReserved(_) => "kexinit_nonzero_reserved",
+            ProposalAnomaly::EmptyAlgorithmList(_) => "kexinit_empty_algorithm_list",
+        }
+    }
 }
 
 impl fmt::Display for ProposalAnomaly {
@@ -193,101 +217,45 @@ impl fmt::Display for ProposalAnomaly {
     }
 }
 
-/// Protocol-level failure that ends the probe.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProbeError {
-    /// Identification phase failure.
-    Ident(IdentError),
-    /// Packet framing failure.
-    Packet(PacketError),
-    /// A packet had an empty payload.
-    EmptyPayload,
-    /// A recognised message failed to decode.
-    Message {
-        /// Message number.
-        number: u8,
-        /// Decoder error.
-        error: MessageError,
-    },
-    /// A message that is not valid before `KEXINIT` in this probe.
-    UnexpectedMessage {
-        /// Message number.
-        number: u8,
-    },
-    /// `NEWKEYS` or a key-exchange-method-specific message arrived before
-    /// `KEXINIT`; the initial decoder cannot continue past this point.
-    UnsupportedTransition {
-        /// Message number.
-        number: u8,
-    },
-    /// More than [`ProbeConfig::max_packets_before_kexinit`] packets.
-    PacketBudgetExceeded {
-        /// The configured limit.
-        limit: usize,
-    },
-    /// More than [`ProbeConfig::max_bytes_before_kexinit`] bytes.
-    ByteBudgetExceeded {
-        /// The configured limit.
-        limit: usize,
-    },
-}
-
-impl fmt::Display for ProbeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProbeError::Ident(e) => write!(f, "identification: {e}"),
-            ProbeError::Packet(e) => write!(f, "packet framing: {e}"),
-            ProbeError::EmptyPayload => f.write_str("packet with empty payload"),
-            ProbeError::Message { number, error } => {
-                write!(f, "malformed {}: {error}", describe_msg(*number))
-            }
-            ProbeError::UnexpectedMessage { number } => {
-                write!(f, "unexpected {} before KEXINIT", describe_msg(*number))
-            }
-            ProbeError::UnsupportedTransition { number } => write!(
-                f,
-                "{} before KEXINIT; initial packet decoding cannot continue",
-                describe_msg(*number)
-            ),
-            ProbeError::PacketBudgetExceeded { limit } => {
-                write!(f, "more than {limit} packets before KEXINIT")
-            }
-            ProbeError::ByteBudgetExceeded { limit } => {
-                write!(f, "more than {limit} bytes before KEXINIT")
-            }
-        }
-    }
-}
-
-impl core::error::Error for ProbeError {}
-
-fn describe_msg(number: u8) -> MsgName {
-    MsgName(number)
-}
-
-struct MsgName(u8);
-
-impl fmt::Display for MsgName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match msg::name(self.0) {
-            Some(n) => write!(f, "{n} ({})", self.0),
-            None => write!(f, "message number {}", self.0),
-        }
-    }
-}
-
-/// The server's first `KEXINIT`, as advertised. Nothing here is negotiated
-/// or authenticated.
+/// A peer's first `KEXINIT`, as advertised. Nothing here is negotiated or
+/// authenticated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
     /// Decoded, owned proposal.
     pub kexinit: OwnedKexInit,
-    /// Exact payload bytes (`I_S` form) for a future exchange hash.
+    /// Exact payload bytes (`I_S`/`I_C` form) for a future exchange hash.
     pub raw_payload: Vec<u8>,
     /// Deviations from RFC 4253 found in an otherwise decodable message.
     pub anomalies: Vec<ProposalAnomaly>,
     /// Bytes received after the `KEXINIT` packet that were not examined.
     pub unexamined_bytes: usize,
+}
+
+impl Proposal {
+    /// Builds a proposal record from a decoded `KEXINIT`, collecting
+    /// anomalies.
+    #[must_use]
+    pub fn from_kexinit(
+        kexinit: &tatami_wire::kexinit::KexInit<'_>,
+        payload: &[u8],
+        unexamined_bytes: usize,
+    ) -> Self {
+        let mut anomalies = Vec::new();
+        if kexinit.reserved != 0 {
+            anomalies.push(ProposalAnomaly::NonzeroReserved(kexinit.reserved));
+        }
+        anomalies.extend(
+            kexinit
+                .empty_algorithm_lists()
+                .map(ProposalAnomaly::EmptyAlgorithmList),
+        );
+        Proposal {
+            kexinit: kexinit.to_owned(),
+            raw_payload: payload.to_vec(),
+            anomalies,
+            unexamined_bytes,
+        }
+    }
 }
 
 /// Terminal outcome of the portable probe.
@@ -327,49 +295,31 @@ pub enum Step {
 }
 
 /// Error from [`Probe::new`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InvalidSoftwareVersion;
-
-impl fmt::Display for InvalidSoftwareVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("software version must be printable ASCII without whitespace or '-'")
-    }
-}
-
-impl core::error::Error for InvalidSoftwareVersion {}
+pub type InvalidSoftwareVersion = InvalidLocalIdentification;
 
 /// The portable probe state machine.
 #[derive(Debug)]
 pub struct Probe {
-    config: ProbeConfig,
     client_line: Vec<u8>,
     stage: Stage,
     ident: IdentificationReader,
-    buf: Vec<u8>,
-    packets: usize,
-    bytes: usize,
+    packets: InitialPackets,
+    buf: InputBuffer,
     end: Option<ProbeEnd>,
 }
 
 impl Probe {
-    /// Creates a probe, validating the configured software version token.
+    /// Creates a probe, validating the configured software version token
+    /// and the resulting identification length.
     pub fn new(config: ProbeConfig) -> Result<Self, InvalidSoftwareVersion> {
-        if !is_version_token(config.software_version.as_bytes()) {
-            return Err(InvalidSoftwareVersion);
-        }
-        let mut client_line = Vec::with_capacity(16 + config.software_version.len());
-        client_line.extend_from_slice(b"SSH-2.0-");
-        client_line.extend_from_slice(config.software_version.as_bytes());
-        client_line.extend_from_slice(b"\r\n");
+        let client_line = build_identification(&config.software_version)?;
         Ok(Probe {
-            ident: IdentificationReader::new(config.ident),
             client_line,
             stage: Stage::Identification,
-            buf: Vec::new(),
-            packets: 0,
-            bytes: 0,
+            ident: IdentificationReader::new(config.ident),
+            packets: InitialPackets::new(config.initial_limits()),
+            buf: InputBuffer::new(config.buffer_capacity()),
             end: None,
-            config,
         })
     }
 
@@ -398,12 +348,21 @@ impl Probe {
         self.buf.len()
     }
 
-    /// Appends received bytes. Ignored once finished. Callers must drain
-    /// [`Probe::step`] after each feed; unconsumed input is bounded only by
-    /// the caller doing so.
+    /// Bytes that may still be fed without overflowing the buffer bound.
+    #[must_use]
+    pub fn room(&self) -> usize {
+        self.buf.room()
+    }
+
+    /// Appends received bytes. Input exceeding [`Probe::room`] is rejected
+    /// before copying and ends the probe with [`ProbeError::InputOverflow`].
+    /// Ignored once finished.
     pub fn feed(&mut self, data: &[u8]) {
-        if self.stage != Stage::Finished {
-            self.buf.extend_from_slice(data);
+        if self.stage == Stage::Finished {
+            return;
+        }
+        if let Err(e) = self.buf.push(data) {
+            self.finish(ProbeEnd::Error(ProbeError::InputOverflow(e)));
         }
     }
 
@@ -437,13 +396,8 @@ impl Probe {
         end
     }
 
-    fn fail(&mut self, error: ProbeError) -> Step {
-        Step::Finished(self.finish(ProbeEnd::Error(error)))
-    }
-
     fn step_identification(&mut self) -> Step {
-        let result = self.ident.feed(&self.buf);
-        match result {
+        match self.ident.feed(self.buf.as_slice()) {
             Ok(IdentStep::NeedMore) => Step::NeedMore,
             Ok(IdentStep::Prelude {
                 line,
@@ -454,116 +408,52 @@ impl Probe {
                     line: line.to_vec(),
                     terminator,
                 };
-                self.buf.drain(..consumed);
+                self.buf.consume(consumed);
                 Step::Event(event)
             }
             Ok(IdentStep::Identification { ident, consumed }) => {
                 let owned = OwnedIdentification::from(ident);
-                self.buf.drain(..consumed);
+                self.buf.consume(consumed);
                 self.stage = Stage::InitialPackets;
                 Step::Event(ProbeEvent::ServerIdentification(owned))
             }
-            Err(e) => self.fail(ProbeError::Ident(e)),
+            Err(e) => Step::Finished(self.finish(ProbeEnd::Error(ProbeError::Ident(e)))),
         }
     }
 
     fn step_packet(&mut self) -> Step {
-        let packet = match decode_initial_packet(&self.buf, &self.config.packet) {
-            Ok(PacketStep::NeedMore { .. }) => return Step::NeedMore,
-            Ok(PacketStep::Complete(p)) => p,
-            Err(e) => return self.fail(ProbeError::Packet(e)),
-        };
-        let total_len = packet.total_len;
-
-        // Budgets: count this packet before interpreting it.
-        if self.packets >= self.config.max_packets_before_kexinit {
-            let limit = self.config.max_packets_before_kexinit;
-            return self.fail(ProbeError::PacketBudgetExceeded { limit });
-        }
-        let bytes = self.bytes.saturating_add(total_len);
-        if bytes > self.config.max_bytes_before_kexinit {
-            let limit = self.config.max_bytes_before_kexinit;
-            return self.fail(ProbeError::ByteBudgetExceeded { limit });
-        }
-        self.packets += 1;
-        self.bytes = bytes;
-
-        let Some(&number) = packet.payload.first() else {
-            return self.fail(ProbeError::EmptyPayload);
-        };
-        let payload = packet.payload;
-
-        let outcome: Result<Option<ProbeEvent>, ProbeError> = match number {
-            msg::IGNORE => Ignore::decode(payload)
-                .map(|i| {
-                    Some(ProbeEvent::Ignored {
-                        data_len: i.data.len(),
-                    })
-                })
-                .map_err(|error| ProbeError::Message { number, error }),
-            msg::DEBUG => Debug::decode(payload)
-                .map(|d| {
-                    Some(ProbeEvent::Debug {
-                        always_display: d.always_display,
-                        message: d.message.to_vec(),
-                        language_tag: d.language_tag.to_vec(),
-                    })
-                })
-                .map_err(|error| ProbeError::Message { number, error }),
-            msg::UNIMPLEMENTED => Unimplemented::decode(payload)
-                .map(|u| {
-                    Some(ProbeEvent::Unimplemented {
-                        sequence_number: u.sequence_number,
-                    })
-                })
-                .map_err(|error| ProbeError::Message { number, error }),
-            msg::DISCONNECT => match Disconnect::decode(payload) {
-                Ok(d) => {
-                    let end = ProbeEnd::Disconnected {
-                        reason_code: d.reason_code,
-                        description: d.description.to_vec(),
-                        language_tag: d.language_tag.to_vec(),
-                    };
-                    self.buf.drain(..total_len);
-                    return Step::Finished(self.finish(end));
-                }
-                Err(error) => Err(ProbeError::Message { number, error }),
-            },
-            msg::KEXINIT => match KexInit::decode(payload) {
-                Ok(k) => {
-                    let mut anomalies = Vec::new();
-                    if k.reserved != 0 {
-                        anomalies.push(ProposalAnomaly::NonzeroReserved(k.reserved));
-                    }
-                    anomalies.extend(
-                        k.empty_algorithm_lists()
-                            .map(ProposalAnomaly::EmptyAlgorithmList),
-                    );
-                    let end = ProbeEnd::Proposal(Box::new(Proposal {
-                        kexinit: k.to_owned(),
-                        raw_payload: payload.to_vec(),
-                        anomalies,
-                        unexamined_bytes: self.buf.len() - total_len,
-                    }));
-                    self.buf.drain(..total_len);
-                    return Step::Finished(self.finish(end));
-                }
-                Err(error) => Err(ProbeError::Message { number, error }),
-            },
-            msg::NEWKEYS => Err(ProbeError::UnsupportedTransition { number }),
-            n if msg::is_kex_method_specific(n) => {
-                Err(ProbeError::UnsupportedTransition { number })
+        let step = self.packets.step(self.buf.as_slice());
+        let (end, consumed): (Option<ProbeEnd>, usize) = match step {
+            InitialStep::NeedMore => return Step::NeedMore,
+            InitialStep::Skipped { message, consumed } => {
+                self.buf.consume(consumed);
+                return Step::Event(message.into());
             }
-            _ => Err(ProbeError::UnexpectedMessage { number }),
-        };
-
-        match outcome {
-            Ok(Some(event)) => {
-                self.buf.drain(..total_len);
-                Step::Event(event)
+            InitialStep::KexInit {
+                kexinit,
+                payload,
+                consumed,
+            } => {
+                let proposal = Proposal::from_kexinit(&kexinit, payload, self.buf.len() - consumed);
+                (Some(ProbeEnd::Proposal(Box::new(proposal))), consumed)
             }
-            Ok(None) => unreachable!("every continuing message yields an event"),
-            Err(e) => self.fail(e),
+            InitialStep::Disconnect {
+                disconnect,
+                consumed,
+            } => (
+                Some(ProbeEnd::Disconnected {
+                    reason_code: disconnect.reason_code,
+                    description: disconnect.description.to_vec(),
+                    language_tag: disconnect.language_tag.to_vec(),
+                }),
+                consumed,
+            ),
+            InitialStep::Error(e) => (Some(ProbeEnd::Error(e)), 0),
+        };
+        self.buf.consume(consumed);
+        match end {
+            Some(end) => Step::Finished(self.finish(end)),
+            None => unreachable!(),
         }
     }
 }
@@ -571,8 +461,10 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::encode_initial_packet;
-    use tatami_wire::Writer;
+    use crate::ident::{IdentError, is_version_token};
+    use crate::packet::{PacketError, encode_initial_packet};
+    use alloc::vec;
+    use tatami_wire::{MessageError, Writer};
 
     fn kexinit_payload() -> Vec<u8> {
         let mut buf = [0u8; 256];
@@ -628,12 +520,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_software_version() {
+    fn rejects_bad_or_overlong_software_version() {
         let config = ProbeConfig {
             software_version: String::from("0.2.0-alpha"),
             ..ProbeConfig::default()
         };
-        assert!(Probe::new(config).is_err());
+        assert_eq!(
+            Probe::new(config).err(),
+            Some(InvalidLocalIdentification::BadSoftwareVersion)
+        );
+        let config = ProbeConfig {
+            software_version: "x".repeat(246),
+            ..ProbeConfig::default()
+        };
+        assert_eq!(
+            Probe::new(config).err(),
+            Some(InvalidLocalIdentification::TooLong { len: 256 })
+        );
     }
 
     #[test]
@@ -739,42 +642,28 @@ mod tests {
                 pending_bytes: 3
             }
         );
-        // Stable after finish.
         assert!(matches!(p.step(), Step::Finished(ProbeEnd::Eof { .. })));
     }
 
     #[test]
     fn unexpected_and_unsupported_messages() {
-        let mut p = probe();
-        p.feed(b"SSH-2.0-x\r\n");
-        p.feed(&packet(&[21])); // NEWKEYS
-        let (_, end) = drain(&mut p);
-        assert_eq!(
-            end,
-            Some(ProbeEnd::Error(ProbeError::UnsupportedTransition {
-                number: 21
-            }))
-        );
-
-        let mut p = probe();
-        p.feed(b"SSH-2.0-x\r\n");
-        p.feed(&packet(&[31, 0])); // KEX method-specific
-        let (_, end) = drain(&mut p);
-        assert_eq!(
-            end,
-            Some(ProbeEnd::Error(ProbeError::UnsupportedTransition {
-                number: 31
-            }))
-        );
-
-        let mut p = probe();
-        p.feed(b"SSH-2.0-x\r\n");
-        p.feed(&packet(&[6, 0, 0, 0, 0])); // SERVICE_ACCEPT
-        let (_, end) = drain(&mut p);
-        assert_eq!(
-            end,
-            Some(ProbeEnd::Error(ProbeError::UnexpectedMessage { number: 6 }))
-        );
+        for (payload, expected) in [
+            (vec![21], ProbeError::UnsupportedTransition { number: 21 }),
+            (
+                vec![31, 0],
+                ProbeError::UnsupportedTransition { number: 31 },
+            ),
+            (
+                vec![6, 0, 0, 0, 0],
+                ProbeError::UnexpectedMessage { number: 6 },
+            ),
+        ] {
+            let mut p = probe();
+            p.feed(b"SSH-2.0-x\r\n");
+            p.feed(&packet(&payload));
+            let (_, end) = drain(&mut p);
+            assert_eq!(end, Some(ProbeEnd::Error(expected)));
+        }
     }
 
     #[test]
@@ -796,7 +685,6 @@ mod tests {
             }))
         ));
 
-        // packet_length 12, padding 11 -> empty payload.
         let mut p = probe();
         p.feed(b"SSH-2.0-x\r\n");
         p.feed(&[0, 0, 0, 12, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -810,7 +698,7 @@ mod tests {
         p.feed(b"SSH-2.0-x\r\n");
         let mut k = kexinit_payload();
         let n = k.len();
-        k[n - 1] = 1; // reserved = 1
+        k[n - 1] = 1;
         p.feed(&packet(&k));
         let (_, end) = drain(&mut p);
         match end {
@@ -847,8 +735,8 @@ mod tests {
         };
         let mut p = Probe::new(config).unwrap();
         p.feed(b"SSH-2.0-x\r\n");
-        p.feed(&packet(&[2, 0, 0, 0, 0])); // 16 bytes
-        p.feed(&packet(&[2, 0, 0, 0, 0])); // 32 > 20
+        p.feed(&packet(&[2, 0, 0, 0, 0]));
+        p.feed(&packet(&[2, 0, 0, 0, 0]));
         let (_, end) = drain(&mut p);
         assert_eq!(
             end,
@@ -868,6 +756,31 @@ mod tests {
             Some(ProbeEnd::Error(ProbeError::Packet(
                 PacketError::TooLarge { .. }
             )))
+        ));
+    }
+
+    #[test]
+    fn single_oversized_feed_is_rejected_before_copy() {
+        let config = ProbeConfig {
+            packet: PacketLimits {
+                max_packet_length: 64,
+            },
+            ident: IdentLimits {
+                max_prelude_line: 32,
+                max_identification_line: 32,
+                ..IdentLimits::default()
+            },
+            ..ProbeConfig::default()
+        };
+        let mut p = Probe::new(config).unwrap();
+        let cap = p.room();
+        assert_eq!(cap, 64 + HEADER_LEN + 32);
+        let too_much = vec![b'A'; cap + 1];
+        p.feed(&too_much);
+        assert_eq!(p.pending_bytes(), 0, "nothing copied");
+        assert!(matches!(
+            p.step(),
+            Step::Finished(ProbeEnd::Error(ProbeError::InputOverflow(_)))
         ));
     }
 

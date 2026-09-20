@@ -203,10 +203,10 @@ pub enum KexName {
     /// Not a key-exchange method (RFC 8308 §2.1).
     ExtInfoServer,
     /// `kex-strict-c-v00@openssh.com`: client signals OpenSSH strict key
-    /// exchange (OpenSSH `PROTOCOL` §1.10). Not a key-exchange method.
+    /// exchange (OpenSSH `PROTOCOL`, "strict key exchange extension" section). Not a key-exchange method.
     StrictKexClient,
     /// `kex-strict-s-v00@openssh.com`: server signals OpenSSH strict key
-    /// exchange (OpenSSH `PROTOCOL` §1.10). Not a key-exchange method.
+    /// exchange (OpenSSH `PROTOCOL`, "strict key exchange extension" section). Not a key-exchange method.
     StrictKexServer,
 }
 

@@ -21,7 +21,8 @@
 //!
 //! `tatami-client` and `tatami-server` are built only with `std,tcp`. The
 //! client currently offers the TCP initial-offer probe
-//! ([`client::probe`]); the server is an entry-point stub.
+//! ([`client::probe`]); the server offers the TCP diagnostic observer
+//! ([`server::observe`]). Neither performs key exchange or authentication.
 //!
 //! # Portability
 //!
@@ -46,6 +47,7 @@ pub use tatami_quic as quic;
 pub use tatami_tcp as tcp;
 
 pub mod client;
+pub mod json;
 pub mod server;
 pub mod text;
 

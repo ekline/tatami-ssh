@@ -97,15 +97,22 @@ locally; CI installs it and requires the step.
 | `crates/tatami-wire/src/{primitives,namelist}.rs` | Checked `Reader`/`Writer` and borrowed name lists; no `alloc` |
 | `crates/tatami-wire/src/{kexinit,transport,channel}.rs` | `KEXINIT`, `DISCONNECT`/`IGNORE`/`DEBUG`/`UNIMPLEMENTED`, and channel-opening payload codecs |
 | `crates/tatami-tcp/src/{ident,packet}.rs` | Identification exchange and initial unprotected packet framing |
-| `crates/tatami-tcp/src/probe.rs` | Portable initial-offer probe state machine |
+| `crates/tatami-tcp/src/initial.rs` | Bounded `InputBuffer`; shared pre-`KEXINIT` packet handling and error codes |
+| `crates/tatami-tcp/src/probe.rs` | Portable client-side initial-offer probe |
+| `crates/tatami-tcp/src/observer.rs` | Portable server-side observer (no server `KEXINIT`) |
 | `crates/tatami-tcp/src/io.rs` | Blocking TCP connect/read adapter with phase deadlines (`std`) |
-| `crates/tatami-tcp/tests/` | Loopback fixture-peer tests for the adapter |
+| `crates/tatami-tcp/src/io/listener.rs` | Bounded diagnostic listener: accept loop, worker pool, record channel (`std`) |
+| `crates/tatami-tcp/tests/` | Loopback fixture-peer tests for the probe adapter and the listener |
 | `crates/tatami-quic/src/io.rs` | Future optional socket/runtime adapters |
 | `crates/tatami-connection/src/opening.rs` | Channel-opening lifecycle engine |
 | `crates/tatami/src/client.rs` | `client::probe`: options, structured report, text rendering (`std,tcp`) |
-| `crates/tatami/src/text.rs` | Escaping of untrusted bytes for display |
+| `crates/tatami/src/server.rs` | `server::observe`: listener options, JSON Lines encoder, RFC 3339 time (`std,tcp`) |
+| `crates/tatami/src/json.rs` | Small RFC 8259 serializer used for JSON Lines |
+| `crates/tatami/src/text.rs` | Escaping of untrusted bytes for terminal display (not JSON) |
 | `crates/tatami/src/bin/` | `tatami-client` and `tatami-server` executables (`std,tcp`) |
-| `crates/tatami/tests/cli.rs` | End-to-end binary tests against a loopback fixture |
+| `crates/tatami/tests/` | End-to-end binary tests; JSON validated with `serde_json` (dev-dependency only) |
+| `docs/specification-inventory.md` | Which specifications touch which layer, and their status |
+| `docs/quic-observer-readiness.md` | Proposed QUIC handshake-observer slice and backend audit |
 | `crates/tatami/src/host/` | Future environment, process and PTY adapters |
 | `docs/` | Architecture, decisions, protocol checkpoint and existing Draft 00 |
 | `scripts/check-workspace.sh` | Local and CI build/feature verification |
@@ -146,17 +153,45 @@ as violations. Incoming opens beyond the pending limit are refused with
 refusal and local cancellation. Window/max-packet fields are retained
 verbatim with no accounting.
 
+**TCP observer (round 2).** `initial.rs` factors the role-neutral parts out
+of the probe: an `InputBuffer` that rejects over-capacity input before
+copying, and `InitialPackets`, which applies the packet/byte budgets and
+classifies pre-`KEXINIT` messages identically for both roles. `observer.rs`
+is the server-side state machine: it emits `SSH-2.0-tatami_observer_0.1.0`
+(validated for token characters and the 255-byte line limit via
+`ident::build_identification`, now shared with the probe), treats any
+non-`SSH-` client input as `unexpected_input` with a bounded sample, reports
+`1.99` and LF-only as anomalies, and stops at the client's first `KEXINIT`
+or after the identification in banner-only mode. `io/listener.rs` is the
+host side: non-blocking accept polled at 25 ms, capacity acquired before a
+detached worker thread is spawned, excess connections closed without a
+banner and counted, one deadline per connection covering banner and reads
+with the remaining time recomputed per operation, a bounded record channel
+to a single sink thread with `try_send` drop accounting, and a stop policy
+that lets in-flight observations finish within the grace period before
+cancelling them. `StopHandle` and finite-run limits stop the loop without
+another client connecting.
+
 **Facade.** `client::probe::run` returns a `Report`; `write_text` renders it
 with every peer string escaped, lists in advertised order and both directions
-printed separately. Exit statuses: 0 complete, 1 incomplete/failure, 2 usage.
+printed separately. `server::observe::prepare` binds and returns the actual
+address; `run_jsonl` writes schema-1 JSON Lines through `tatami::json`, with
+raw bytes as lossy text plus bounded hex and oversized records re-emitted
+truncated. Exit statuses per W-16.
 
-### Next implementation slice
+### Next implementation slices
 
-A real selected key-exchange method, host-key signature verification and
-trust validation, then protected packets and service negotiation. That
-requires algorithm and cryptographic-provider selection with a capability
-audit; nothing in the probe pre-empts that choice. On the connection side,
-the channel close lifecycle must define when a local number may be released.
+Two tracks, neither started here:
+
+1. **TCP:** a real selected key-exchange method, host-key signature
+   verification and trust validation, then protected packets and service
+   negotiation. Requires algorithm and provider selection with a capability
+   audit (`specification-inventory.md` §4). On the connection side, the
+   channel close lifecycle must define when a local number may be released.
+2. **QUIC:** a TLS/QUIC handshake observer after the backend audit in
+   `quic-observer-readiness.md`; an SSH-over-QUIC observer only once ALPN,
+   identity, control-stream association and identification placement are
+   settled in the mapping. No `--quic` option exists.
 
 The workspace still deliberately does not define QUIC record framing, window
 mapping, stream association, session-binding construction or a crypto

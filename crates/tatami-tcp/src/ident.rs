@@ -30,7 +30,12 @@
 //!   [`Identification::line`], which is the form a future exchange hash
 //!   needs (`V_S` excludes CR and LF).
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
+
+/// Maximum identification line length including `CR LF` (RFC 4253 §4.2).
+pub const MAX_IDENTIFICATION_LINE: usize = 255;
 
 /// Resource limits for the identification phase.
 ///
@@ -105,6 +110,138 @@ pub struct Identification<'a> {
     pub comments: Option<&'a [u8]>,
     /// Classification of `protocol_version`.
     pub support: VersionSupport,
+}
+
+/// Something about a syntactically valid identification that a conforming
+/// modern SSH-2 peer would not send. Reported, never silently normalised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentAnomaly {
+    /// Line ended with bare `LF`; RFC 4253 requires `CR LF`.
+    LfOnlyTerminator,
+    /// Protocol version `1.99`: an SSH-1-era compatibility indication, not
+    /// evidence of a normal SSH-2 peer.
+    CompatibilityVersion,
+}
+
+impl IdentAnomaly {
+    /// Stable, machine-readable code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            IdentAnomaly::LfOnlyTerminator => "lf_only_terminator",
+            IdentAnomaly::CompatibilityVersion => "compatibility_version_1_99",
+        }
+    }
+}
+
+impl fmt::Display for IdentAnomaly {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            IdentAnomaly::LfOnlyTerminator => {
+                "line terminated by LF only (RFC 4253 requires CR LF)"
+            }
+            IdentAnomaly::CompatibilityVersion => {
+                "protocol version 1.99 (SSH-1 compatibility indication)"
+            }
+        })
+    }
+}
+
+impl Identification<'_> {
+    /// Anomalies present in this identification.
+    pub fn anomalies(&self) -> impl Iterator<Item = IdentAnomaly> {
+        let lf = (self.terminator == LineTerminator::Lf).then_some(IdentAnomaly::LfOnlyTerminator);
+        let compat = (self.support == VersionSupport::Ssh2Compatibility)
+            .then_some(IdentAnomaly::CompatibilityVersion);
+        lf.into_iter().chain(compat)
+    }
+}
+
+/// Owned copy of an [`Identification`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedIdentification {
+    /// Exact bytes without the terminator.
+    pub line: Vec<u8>,
+    /// Terminator observed.
+    pub terminator: LineTerminator,
+    /// `protoversion` (always printable ASCII).
+    pub protocol_version: String,
+    /// `softwareversion` (always printable ASCII).
+    pub software_version: String,
+    /// Raw comment bytes, if present. Untrusted.
+    pub comments: Option<Vec<u8>>,
+    /// Version classification.
+    pub support: VersionSupport,
+}
+
+impl OwnedIdentification {
+    /// Anomalies present in this identification.
+    pub fn anomalies(&self) -> impl Iterator<Item = IdentAnomaly> {
+        let lf = (self.terminator == LineTerminator::Lf).then_some(IdentAnomaly::LfOnlyTerminator);
+        let compat = (self.support == VersionSupport::Ssh2Compatibility)
+            .then_some(IdentAnomaly::CompatibilityVersion);
+        lf.into_iter().chain(compat)
+    }
+}
+
+impl From<Identification<'_>> for OwnedIdentification {
+    fn from(i: Identification<'_>) -> Self {
+        OwnedIdentification {
+            line: i.line.to_vec(),
+            terminator: i.terminator,
+            protocol_version: String::from_utf8_lossy(i.protocol_version).into_owned(),
+            software_version: String::from_utf8_lossy(i.software_version).into_owned(),
+            comments: i.comments.map(<[u8]>::to_vec),
+            support: i.support,
+        }
+    }
+}
+
+/// Why an outgoing identification could not be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidLocalIdentification {
+    /// The software version token is empty or contains whitespace, `-`, or
+    /// a non-printable/non-ASCII byte.
+    BadSoftwareVersion,
+    /// The complete line including `CR LF` would exceed
+    /// [`MAX_IDENTIFICATION_LINE`] bytes.
+    TooLong {
+        /// Length the line would have had.
+        len: usize,
+    },
+}
+
+impl fmt::Display for InvalidLocalIdentification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InvalidLocalIdentification::BadSoftwareVersion => {
+                f.write_str("software version must be printable ASCII without whitespace or '-'")
+            }
+            InvalidLocalIdentification::TooLong { len } => write!(
+                f,
+                "identification line would be {len} bytes; RFC 4253 allows at most {MAX_IDENTIFICATION_LINE} including CR LF"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for InvalidLocalIdentification {}
+
+/// Builds our own identification line `SSH-2.0-<software_version>\r\n`,
+/// validating both the token characters and the total length.
+pub fn build_identification(software_version: &str) -> Result<Vec<u8>, InvalidLocalIdentification> {
+    if !is_version_token(software_version.as_bytes()) {
+        return Err(InvalidLocalIdentification::BadSoftwareVersion);
+    }
+    let len = "SSH-2.0-".len() + software_version.len() + 2;
+    if len > MAX_IDENTIFICATION_LINE {
+        return Err(InvalidLocalIdentification::TooLong { len });
+    }
+    let mut line = Vec::with_capacity(len);
+    line.extend_from_slice(b"SSH-2.0-");
+    line.extend_from_slice(software_version.as_bytes());
+    line.extend_from_slice(b"\r\n");
+    Ok(line)
 }
 
 /// Reason an identification line was rejected.
@@ -276,8 +413,10 @@ impl IdentificationReader {
 }
 
 /// Returns `Some(true)` if `buf` starts with `SSH-`, `Some(false)` if it
-/// definitely does not, and `None` if fewer than four bytes are available.
-fn starts_identification(buf: &[u8]) -> Option<bool> {
+/// definitely does not, and `None` if fewer than four bytes are available
+/// and they are all consistent with that prefix.
+#[must_use]
+pub fn starts_identification(buf: &[u8]) -> Option<bool> {
     const PREFIX: &[u8] = b"SSH-";
     if buf.len() >= PREFIX.len() {
         Some(&buf[..PREFIX.len()] == PREFIX)
@@ -554,6 +693,55 @@ mod tests {
         assert_eq!(starts_identification(b"SSH-"), Some(true));
         assert_eq!(starts_identification(b"SSX"), Some(false));
         assert_eq!(starts_identification(b"Hello"), Some(false));
+    }
+
+    #[test]
+    fn build_identification_validates_token_and_total_length() {
+        assert_eq!(
+            build_identification("tatami_0.1.0").unwrap(),
+            b"SSH-2.0-tatami_0.1.0\r\n"
+        );
+        assert_eq!(
+            build_identification("0.2.0-alpha"),
+            Err(InvalidLocalIdentification::BadSoftwareVersion)
+        );
+        assert_eq!(
+            build_identification(""),
+            Err(InvalidLocalIdentification::BadSoftwareVersion)
+        );
+        // 8 + 245 + 2 = 255: accepted. 8 + 246 + 2 = 256: rejected.
+        let ok = "x".repeat(245);
+        assert_eq!(build_identification(&ok).unwrap().len(), 255);
+        let long = "x".repeat(246);
+        assert_eq!(
+            build_identification(&long),
+            Err(InvalidLocalIdentification::TooLong { len: 256 })
+        );
+    }
+
+    #[test]
+    fn anomalies_are_reported() {
+        let mut r = reader();
+        let IdentStep::Identification { ident, .. } = r.feed(b"SSH-1.99-x\n").unwrap() else {
+            panic!()
+        };
+        let a: Vec<IdentAnomaly> = ident.anomalies().collect();
+        assert_eq!(
+            a,
+            [
+                IdentAnomaly::LfOnlyTerminator,
+                IdentAnomaly::CompatibilityVersion
+            ]
+        );
+        let owned = OwnedIdentification::from(ident);
+        assert_eq!(owned.anomalies().count(), 2);
+        assert_eq!(owned.line, b"SSH-1.99-x");
+
+        let mut r = reader();
+        let IdentStep::Identification { ident, .. } = r.feed(b"SSH-2.0-x\r\n").unwrap() else {
+            panic!()
+        };
+        assert_eq!(ident.anomalies().count(), 0);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Host socket adapters for the TCP binding (requires `std`).
 //!
 //! This module owns everything the portable modules must not: name
-//! resolution, connecting, blocking reads and writes, OS deadlines and socket
-//! cleanup. It drives the portable [`Probe`] state machine.
+//! resolution, connecting, accepting, blocking reads and writes, OS
+//! deadlines, bounded concurrency and socket cleanup. It drives the
+//! portable [`Probe`] state machine (client side) and, through
+//! [`listener`], the portable observer (server side).
 //!
 //! # Deadlines
 //!
@@ -32,6 +34,12 @@ use std::time::{Duration, Instant};
 use std::vec::Vec;
 
 use crate::probe::{Probe, ProbeConfig, ProbeEnd, ProbeEvent, Stage, Step};
+
+pub mod listener;
+pub use listener::{
+    BindError, ConfigError, Listener, ListenerConfig, ListenerEvent, Observation, ObservationEnd,
+    Sink, SinkError, StopHandle, StopReason, Summary,
+};
 
 /// Host-side timing and connection policy for a probe run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,7 +252,10 @@ fn drive(
                 error,
             };
         }
-        match stream.read(&mut buf) {
+        // Never read more than the probe can hold; a zero-room read of one
+        // byte lets the probe report the overflow itself.
+        let want = buf.len().min(probe.room()).max(1);
+        match stream.read(&mut buf[..want]) {
             Ok(0) => return RunEnd::Probe(probe.input_ended()),
             Ok(n) => probe.feed(&buf[..n]),
             Err(e) if is_timeout(&e) => {
