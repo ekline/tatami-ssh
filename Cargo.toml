@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/ekline/tatami-ssh"
+publish = false
+
+# Every in-tree dependency is a path dependency with default features disabled.
+# Consumers opt into `tatami-wire/alloc` and the binding/facade `std` features
+# explicitly; see docs/architecture.md.
+[workspace.dependencies]
+tatami-wire = { path = "crates/tatami-wire", default-features = false }
+tatami-keys = { path = "crates/tatami-keys", default-features = false }
+tatami-auth = { path = "crates/tatami-auth", default-features = false }
+tatami-connection = { path = "crates/tatami-connection", default-features = false }
+tatami-tcp = { path = "crates/tatami-tcp", default-features = false }
+tatami-quic = { path = "crates/tatami-quic", default-features = false }

@@ -1,0 +1,21 @@
+[package]
+name = "tatami-tcp"
+description = "Conventional SSH transport (RFC 4253) binding for Tatami"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Exposes the `io` module: OS socket and runtime adapters. Portable binding
+# state does not require this feature.
+std = []
+
+[dependencies]
+tatami-wire = { workspace = true, features = ["alloc"] }
+tatami-keys = { workspace = true }
+tatami-auth = { workspace = true }
+tatami-connection = { workspace = true }

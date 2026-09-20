@@ -1,0 +1,15 @@
+[package]
+name = "tatami-keys"
+description = "SSH key and signature representations and provider contracts for Tatami"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+tatami-wire = { workspace = true, features = ["alloc"] }

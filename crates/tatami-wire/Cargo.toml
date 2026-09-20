@@ -1,0 +1,17 @@
+[package]
+name = "tatami-wire"
+description = "SSH primitive encodings and bounded message codecs for Tatami"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Owned helpers built on the `alloc` crate. Borrowed/caller-buffer codecs do
+# not require this feature.
+alloc = []
+
+[dependencies]
