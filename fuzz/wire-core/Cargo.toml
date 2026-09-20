@@ -1,0 +1,50 @@
+[package]
+name = "tatami-fuzz-wire-core"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "libFuzzer harnesses for tatami-wire with default features disabled (no alloc)"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Isolated workspace: not a member of the production workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tatami-wire = { path = "../../crates/tatami-wire", default-features = false }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "identification_content"
+path = "fuzz_targets/identification_content.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identification_encode"
+path = "fuzz_targets/identification_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_primitives"
+path = "fuzz_targets/wire_primitives.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_messages"
+path = "fuzz_targets/wire_messages.rs"
+test = false
+doc = false
+bench = false

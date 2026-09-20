@@ -135,6 +135,23 @@ Runs formatting, Clippy, the feature matrix, tests, docs and (when the
 `thumbv7em-none-eabi` target is installed) a core/alloc-only build. CI runs it
 on Rust 1.85.0 and stable.
 
+## Fuzzing
+
+Twelve coverage-guided libFuzzer targets live in isolated workspaces under
+`fuzz/` and cover every implemented parser, encoder and state machine with
+independent oracles. See `docs/fuzzing.md` for setup, commands, oracles,
+seeds, findings and CI policy. Quick start with rustup:
+
+```sh
+. fuzz/toolchain.env
+rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal --component rustfmt,clippy,llvm-tools-preview
+rustup run "$FUZZ_NIGHTLY" cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+scripts/fuzz.sh smoke 20
+scripts/fuzz.sh run tcp_observer -- -max_total_time=300
+```
+
+Ordinary `cargo test` never depends on nightly, cargo-fuzz or the corpora.
+
 ## Next milestones
 
 Two separate tracks, neither begun by the probe or the observer:

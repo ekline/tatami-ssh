@@ -38,9 +38,24 @@
 //! never interleave and a slow or blocked sink cannot hold sockets open:
 //! workers use a non-blocking send and count a dropped record instead of
 //! waiting. The final summary reports every drop counter.
+//!
+//! # Testing seam
+//!
+//! The per-connection driver (`drive`) is written against the crate-private
+//! `Conn`/`Clock` traits in `super::seam`; workers always pass the accepted
+//! `TcpStream` and the system clock. The unit tests in this module drive it
+//! with a scripted connection and a virtual clock and cover: the banner
+//! delivered across short writes, `Interrupted` on read and write, trickling
+//! reads that cannot extend the deadline, EOF at a boundary and mid-line/
+//! mid-packet, a zero-length write, a deadline that has already passed
+//! before the banner, deadline exhaustion inside a packet body, reads bounded
+//! by [`Observer::room`], a stop requested mid-observation, and a silent peer
+//! polled until the deadline. Sink failure, capacity saturation and stop
+//! handling at the listener level are covered by the loopback tests in
+//! `tests/observer_loopback.rs`, which remain the real-socket evidence.
 
 use std::boxed::Box;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::string::{String, ToString};
 use std::sync::Arc;
@@ -50,6 +65,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
+use super::seam::{Clock, Conn, SystemClock, remaining_until, write_all_by};
 use crate::ident::OwnedIdentification;
 use crate::initial::SkippedMessage;
 use crate::observer::{
@@ -642,7 +658,15 @@ fn observe_connection(
     };
 
     let _ = stream.set_nodelay(true);
-    let end = drive(&mut stream, &mut observer, &mut obs, deadline, config, stop);
+    let end = drive(
+        &mut stream,
+        &SystemClock,
+        &mut observer,
+        &mut obs,
+        deadline,
+        config,
+        stop,
+    );
     let _ = stream.shutdown(Shutdown::Both);
     drop(stream);
 
@@ -651,8 +675,9 @@ fn observe_connection(
     obs
 }
 
-fn drive(
-    stream: &mut TcpStream,
+fn drive<C: Conn, K: Clock>(
+    conn: &mut C,
+    clock: &K,
     observer: &mut Observer,
     obs: &mut Observation,
     deadline: Instant,
@@ -661,7 +686,7 @@ fn drive(
 ) -> ObservationEnd {
     // Banner first, before any read.
     let banner = observer.server_identification().to_vec();
-    match write_all_by(stream, &banner, deadline) {
+    match write_all_by(conn, clock, &banner, deadline) {
         Ok(()) => obs.bytes_written += banner.len() as u64,
         Err(e) if e.kind() == io::ErrorKind::TimedOut => return ObservationEnd::TimedOut,
         Err(e) => return ObservationEnd::Io(e),
@@ -690,18 +715,15 @@ fn drive(
         if stop.load(Ordering::SeqCst) {
             return ObservationEnd::Shutdown;
         }
-        let Some(remaining) = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-        else {
+        let Some(remaining) = remaining_until(clock, deadline) else {
             return ObservationEnd::TimedOut;
         };
         let slice = remaining.min(config.poll_interval.max(Duration::from_millis(1)));
-        if let Err(e) = stream.set_read_timeout(Some(slice)) {
+        if let Err(e) = conn.set_read_timeout(Some(slice)) {
             return ObservationEnd::Io(e);
         }
         let want = buf.len().min(observer.room()).max(1);
-        match stream.read(&mut buf[..want]) {
+        match conn.read(&mut buf[..want]) {
             Ok(0) => {
                 let outcome = observer.input_ended();
                 obs.stage = ObserverStage::Finished;
@@ -723,28 +745,528 @@ fn drive(
     }
 }
 
-fn write_all_by(stream: &mut TcpStream, data: &[u8], deadline: Instant) -> io::Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline passed"))?;
-        stream.set_write_timeout(Some(remaining))?;
-        match stream.write(&data[written..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "peer stopped reading",
-                ));
-            }
-            Ok(n) => written += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out"));
-            }
-            Err(e) => return Err(e),
+/// Deterministic fault tests for the per-connection driver, on a scripted
+/// connection and a virtual clock. No sockets, threads or sleeps; see
+/// `super::seam::scripted`. Listener-level behaviour (admission, sink
+/// failure, stop handling across workers) is covered by the loopback tests.
+#[cfg(test)]
+mod tests {
+    use super::super::seam::scripted::{ReadEvent, ScriptedConn, VirtualClock, WriteEvent};
+    use super::*;
+    use crate::initial::InitialLimits;
+    use crate::packet::{HEADER_LEN, PacketLimits, encode_initial_packet};
+    use tatami_wire::Writer;
+
+    const CLIENT_IDENT: &[u8] = b"SSH-2.0-Fixture_1.0\r\n";
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn data(bytes: &[u8]) -> ReadEvent {
+        ReadEvent::Data(bytes.to_vec())
+    }
+
+    fn kexinit_packet() -> Vec<u8> {
+        let mut buf = [0u8; 512];
+        let mut w = Writer::new(&mut buf);
+        w.write_u8(20).unwrap();
+        w.write_bytes(&[0xAB; 16]).unwrap();
+        w.write_string(b"curve25519-sha256,ext-info-c").unwrap();
+        w.write_string(b"ssh-ed25519").unwrap();
+        w.write_string(b"aes128-ctr").unwrap();
+        w.write_string(b"aes256-ctr").unwrap();
+        w.write_string(b"hmac-sha2-256").unwrap();
+        w.write_string(b"hmac-sha2-512").unwrap();
+        w.write_string(b"none").unwrap();
+        w.write_string(b"zlib@openssh.com").unwrap();
+        w.write_string(b"").unwrap();
+        w.write_string(b"").unwrap();
+        w.write_bool(false).unwrap();
+        w.write_u32(0).unwrap();
+        let payload = w.written().to_vec();
+        let mut out = std::vec![0u8; payload.len() + 64];
+        let n = encode_initial_packet(&payload, 0x11, &mut out).unwrap();
+        out.truncate(n);
+        out
+    }
+
+    /// A packet header claiming a small body that never fully arrives.
+    fn partial_header() -> Vec<u8> {
+        std::vec![0, 0, 0, 60, 4]
+    }
+
+    fn config(poll_ms: u64, read_chunk: usize) -> ListenerConfig {
+        ListenerConfig {
+            poll_interval: ms(poll_ms),
+            read_chunk,
+            ..ListenerConfig::default()
         }
     }
-    stream.flush()
+
+    /// An observer configuration whose buffer is smaller than a 4 KiB chunk.
+    fn tiny_observer() -> ObserverConfig {
+        ObserverConfig {
+            initial: InitialLimits {
+                packet: PacketLimits {
+                    max_packet_length: 64,
+                },
+                ..InitialLimits::default()
+            },
+            max_identification_line: 64,
+            ..ObserverConfig::default()
+        }
+    }
+
+    struct Outcome {
+        end: ObservationEnd,
+        obs: Observation,
+        observer: Observer,
+        conn: ScriptedConn,
+        clock: VirtualClock,
+        deadline: Duration,
+        poll: Duration,
+    }
+
+    impl Outcome {
+        fn banner_len(&self) -> u64 {
+            self.observer.server_identification().len() as u64
+        }
+
+        /// Every read timeout is at most the poll interval and never reaches
+        /// past the deadline; every write timeout is exactly the time then
+        /// remaining; the virtual clock never passes the deadline.
+        fn assert_deadline_discipline(&self) {
+            for (at, timeout) in &self.conn.read_timeouts {
+                assert!(
+                    *timeout <= self.poll,
+                    "read timeout {timeout:?} exceeds the poll"
+                );
+                assert!(
+                    *at + *timeout <= self.deadline,
+                    "read timeout {timeout:?} at {at:?} reaches past the deadline"
+                );
+            }
+            for (at, timeout) in &self.conn.write_timeouts {
+                assert_eq!(*at + *timeout, self.deadline);
+            }
+            assert!(self.clock.elapsed() <= self.deadline);
+        }
+
+        fn outcome(&self) -> &ObservationOutcome {
+            match &self.end {
+                ObservationEnd::Observer(o) => o,
+                other => panic!("expected an observer outcome, got {other:?}"),
+            }
+        }
+    }
+
+    fn run_with(
+        config: &ListenerConfig,
+        reads: Vec<ReadEvent>,
+        writes: Vec<WriteEvent>,
+        deadline: Duration,
+        stop: &AtomicBool,
+    ) -> Outcome {
+        let clock = VirtualClock::new();
+        let mut conn = ScriptedConn::new(&clock, reads, writes);
+        let mut observer = Observer::new(&config.observer).unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let mut obs = Observation {
+            id: 1,
+            local: addr,
+            peer: addr,
+            accepted_unix: Duration::ZERO,
+            elapsed: Duration::ZERO,
+            bytes_read: 0,
+            bytes_written: 0,
+            server_identification: observer.server_identification_line().to_vec(),
+            client_identification: None,
+            messages: Vec::new(),
+            proposal: None,
+            stage: ObserverStage::ClientIdentification,
+            end: ObservationEnd::TimedOut,
+        };
+        let end = drive(
+            &mut conn,
+            &clock,
+            &mut observer,
+            &mut obs,
+            clock.now() + deadline,
+            config,
+            stop,
+        );
+        Outcome {
+            end,
+            obs,
+            observer,
+            conn,
+            clock,
+            deadline,
+            poll: config.poll_interval,
+        }
+    }
+
+    fn run(reads: Vec<ReadEvent>, writes: Vec<WriteEvent>, deadline: Duration) -> Outcome {
+        run_with(
+            &config(25, 4096),
+            reads,
+            writes,
+            deadline,
+            &AtomicBool::new(false),
+        )
+    }
+
+    #[test]
+    fn banner_is_written_across_short_writes() {
+        let out = run(
+            std::vec![data(CLIENT_IDENT), data(&kexinit_packet())],
+            std::vec![
+                WriteEvent::Accept(3),
+                WriteEvent::Accept(5),
+                WriteEvent::Accept(1),
+            ],
+            ms(1_000),
+        );
+        assert!(matches!(
+            out.outcome(),
+            ObservationOutcome::Proposal(p) if p.anomalies.is_empty()
+        ));
+        assert_eq!(out.conn.written, out.observer.server_identification());
+        assert_eq!(out.obs.bytes_written, out.banner_len());
+        // 3 + 5 + 1, then the rest in one write; a timeout set before each.
+        assert_eq!(out.conn.write_calls, 4);
+        assert_eq!(out.conn.write_timeouts.len(), 4);
+        assert_eq!(
+            out.obs.bytes_read,
+            (CLIENT_IDENT.len() + kexinit_packet().len()) as u64
+        );
+        assert!(out.obs.proposal.is_some());
+        assert_eq!(out.obs.stage, ObserverStage::Finished);
+        out.assert_deadline_discipline();
+    }
+
+    #[test]
+    fn interrupted_read_and_write_are_retried_without_resetting_the_deadline() {
+        let out = run(
+            std::vec![
+                ReadEvent::Elapse(ms(10)),
+                data(CLIENT_IDENT),
+                ReadEvent::Err(io::ErrorKind::Interrupted),
+                ReadEvent::Elapse(ms(10)),
+                data(&kexinit_packet()),
+            ],
+            std::vec![
+                WriteEvent::Err(io::ErrorKind::Interrupted),
+                WriteEvent::Elapse(ms(50)),
+                WriteEvent::Accept(4),
+                WriteEvent::Err(io::ErrorKind::Interrupted),
+            ],
+            ms(1_000),
+        );
+        assert!(matches!(out.outcome(), ObservationOutcome::Proposal(_)));
+        assert_eq!(out.obs.bytes_written, out.banner_len());
+        assert_eq!(out.clock.elapsed(), ms(70));
+        assert_eq!(
+            out.conn.write_timeouts,
+            [
+                (ms(0), ms(1_000)),
+                (ms(0), ms(1_000)),
+                (ms(50), ms(950)),
+                (ms(50), ms(950)),
+            ]
+        );
+        // Reads are sliced to the poll interval; an Interrupted read does
+        // not move the clock and the next slice is identical.
+        assert_eq!(
+            out.conn.read_timeouts,
+            [(ms(50), ms(25)), (ms(60), ms(25)), (ms(60), ms(25))]
+        );
+        out.assert_deadline_discipline();
+    }
+
+    #[test]
+    fn trickling_client_cannot_extend_the_deadline() {
+        // One byte of a valid identification prefix every 300 ms against a
+        // 1 s deadline: three bytes arrive, the fourth silence hits it. The
+        // silence is consumed in 25 ms poll slices.
+        let mut reads = Vec::new();
+        for b in b"SSH-2.0-" {
+            reads.push(ReadEvent::Elapse(ms(300)));
+            reads.push(data(&[*b]));
+        }
+        let out = run(reads, Vec::new(), ms(1_000));
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(
+            out.clock.elapsed(),
+            ms(1_000),
+            "ended exactly at the deadline"
+        );
+        assert_eq!(out.obs.bytes_read, 3);
+        assert_eq!(out.observer.pending_bytes(), 3);
+        assert_eq!(out.obs.stage, ObserverStage::ClientIdentification);
+        assert!(out.obs.client_identification.is_none());
+        // 3 x 12 empty polls, 3 data reads, 4 empty polls to the deadline.
+        assert_eq!(out.conn.read_requests.len(), 43);
+        assert!(out.conn.unread_events() > 0, "the line was never completed");
+        out.assert_deadline_discipline();
+    }
+
+    #[test]
+    fn eof_at_boundary_and_mid_stream() {
+        let k = kexinit_packet();
+        let half = k.len() / 2;
+        let cases: [(Vec<ReadEvent>, ObserverStage, usize, bool); 4] = [
+            (
+                std::vec![ReadEvent::Eof],
+                ObserverStage::ClientIdentification,
+                0,
+                false,
+            ),
+            (
+                std::vec![data(b"SSH-2.0-Tru"), ReadEvent::Eof],
+                ObserverStage::ClientIdentification,
+                11,
+                false,
+            ),
+            (
+                std::vec![data(CLIENT_IDENT), ReadEvent::Eof],
+                ObserverStage::InitialPackets,
+                0,
+                true,
+            ),
+            (
+                std::vec![data(CLIENT_IDENT), data(&k[..half]), ReadEvent::Eof],
+                ObserverStage::InitialPackets,
+                half,
+                true,
+            ),
+        ];
+        for (reads, stage, pending, ident_seen) in cases {
+            let out = run(reads, Vec::new(), ms(1_000));
+            assert_eq!(
+                out.outcome(),
+                &ObservationOutcome::Eof {
+                    stage,
+                    pending_bytes: pending
+                }
+            );
+            assert_eq!(out.obs.stage, ObserverStage::Finished);
+            assert_eq!(out.obs.client_identification.is_some(), ident_seen);
+            assert_eq!(out.obs.bytes_written, out.banner_len());
+            assert_eq!(out.clock.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn zero_length_banner_write_is_an_io_error() {
+        let out = run(Vec::new(), std::vec![WriteEvent::Zero], ms(1_000));
+        match &out.end {
+            ObservationEnd::Io(e) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(out.obs.bytes_written, 0);
+        assert!(
+            out.conn.read_requests.is_empty(),
+            "no read after a failed banner"
+        );
+
+        let out = run(
+            Vec::new(),
+            std::vec![WriteEvent::Err(io::ErrorKind::BrokenPipe)],
+            ms(1_000),
+        );
+        assert!(matches!(&out.end, ObservationEnd::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
+        assert_eq!(out.obs.bytes_written, 0);
+    }
+
+    #[test]
+    fn deadline_already_passed_before_the_banner() {
+        let out = run(
+            std::vec![data(CLIENT_IDENT), data(&kexinit_packet())],
+            Vec::new(),
+            Duration::ZERO,
+        );
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.conn.write_calls, 0, "no write was attempted");
+        assert_eq!(out.obs.bytes_written, 0);
+        assert!(out.conn.read_requests.is_empty());
+
+        // A banner write that blocks until the deadline is also a timeout.
+        let out = run(
+            std::vec![data(CLIENT_IDENT)],
+            std::vec![WriteEvent::Elapse(ms(5_000))],
+            ms(1_000),
+        );
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.clock.elapsed(), ms(1_000));
+        assert_eq!(out.obs.bytes_written, 0);
+        assert!(out.conn.read_requests.is_empty());
+    }
+
+    #[test]
+    fn deadline_exhausted_inside_a_packet_body() {
+        let k = kexinit_packet();
+        let mut reads = std::vec![data(CLIENT_IDENT), data(&k[..HEADER_LEN])];
+        for b in &k[HEADER_LEN..HEADER_LEN + 6] {
+            reads.push(ReadEvent::Elapse(ms(200)));
+            reads.push(data(&[*b]));
+        }
+        let out = run(reads, Vec::new(), ms(1_000));
+        // Header at t=0, one body byte at 200/400/600/800 ms, deadline at
+        // 1000 ms while waiting for the fifth.
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.obs.stage, ObserverStage::InitialPackets);
+        assert_eq!(out.observer.pending_bytes(), HEADER_LEN + 4);
+        assert_eq!(
+            out.obs.bytes_read,
+            (CLIENT_IDENT.len() + HEADER_LEN + 4) as u64
+        );
+        assert!(out.obs.client_identification.is_some());
+        assert!(out.obs.proposal.is_none());
+        assert_eq!(out.clock.elapsed(), ms(1_000));
+        out.assert_deadline_discipline();
+    }
+
+    #[test]
+    fn reads_never_exceed_chunk_or_room() {
+        // Chunk smaller than room: every read asks for exactly the chunk.
+        let out = run_with(
+            &config(25, 7),
+            std::vec![data(CLIENT_IDENT), data(&kexinit_packet())],
+            Vec::new(),
+            ms(1_000),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(out.outcome(), ObservationOutcome::Proposal(_)));
+        assert!(out.conn.read_requests.len() > 10);
+        assert!(out.conn.read_requests.iter().all(|&n| n == 7));
+
+        // Chunk larger than room: reads shrink as unconsumed bytes pile up.
+        let mut c = config(25, 4096);
+        c.observer = tiny_observer();
+        let cap = c.observer.buffer_capacity();
+        assert!(cap < 4096);
+        let out = run_with(
+            &c,
+            std::vec![
+                data(CLIENT_IDENT),
+                data(&partial_header()),
+                data(&[1]),
+                data(&[2]),
+            ],
+            Vec::new(),
+            ms(1_000),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.observer.pending_bytes(), 7);
+        // Four data reads, then 40 empty polls until the deadline, all
+        // bounded by the room left in the observer buffer.
+        assert_eq!(out.conn.read_requests.len(), 44);
+        assert_eq!(
+            out.conn.read_requests[..5],
+            [cap, cap, cap - 5, cap - 6, cap - 7]
+        );
+        assert!(out.conn.read_requests.iter().all(|&n| n <= cap));
+        assert!(out.conn.read_requests[4..].iter().all(|&n| n == cap - 7));
+    }
+
+    #[test]
+    fn stop_requested_mid_observation_yields_shutdown() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let k = kexinit_packet();
+        let out = run_with(
+            &config(25, 4096),
+            std::vec![
+                data(CLIENT_IDENT),
+                ReadEvent::Hook(Box::new(move || flag.store(true, Ordering::SeqCst))),
+                data(&k[..HEADER_LEN]),
+            ],
+            Vec::new(),
+            ms(1_000),
+            &stop,
+        );
+        assert!(matches!(out.end, ObservationEnd::Shutdown));
+        // The identification was recorded before the stop was noticed; the
+        // partial packet read alongside the stop is left undecoded.
+        assert!(out.obs.client_identification.is_some());
+        assert!(out.obs.proposal.is_none());
+        assert_eq!(out.obs.stage, ObserverStage::InitialPackets);
+        assert_eq!(out.obs.bytes_read, (CLIENT_IDENT.len() + HEADER_LEN) as u64);
+        assert_eq!(out.observer.pending_bytes(), HEADER_LEN);
+        assert_eq!(out.obs.bytes_written, out.banner_len());
+        assert_eq!(out.conn.read_requests.len(), 2, "no read after the stop");
+
+        // The stop is checked only once the observer needs more input: an
+        // outcome already in hand is never discarded by a stop.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let out = run_with(
+            &config(25, 4096),
+            std::vec![
+                data(CLIENT_IDENT),
+                ReadEvent::Hook(Box::new(move || flag.store(true, Ordering::SeqCst))),
+                data(&k),
+            ],
+            Vec::new(),
+            ms(1_000),
+            &stop,
+        );
+        assert!(matches!(out.outcome(), ObservationOutcome::Proposal(_)));
+        assert!(stop.load(Ordering::SeqCst));
+
+        // A stop already requested is honoured after the banner, before the
+        // first read.
+        let out = run_with(
+            &config(25, 4096),
+            std::vec![data(CLIENT_IDENT)],
+            Vec::new(),
+            ms(1_000),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(out.end, ObservationEnd::Shutdown));
+        assert_eq!(out.obs.bytes_written, out.banner_len());
+        assert!(out.conn.read_requests.is_empty());
+        assert_eq!(out.obs.stage, ObserverStage::ClientIdentification);
+    }
+
+    #[test]
+    fn silent_client_is_polled_until_the_deadline_not_spun_on() {
+        // An empty script is a connected, silent peer: each poll consumes
+        // its slice; the scripted connection's call cap would panic on a spin.
+        let out = run(Vec::new(), Vec::new(), ms(1_000));
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.clock.elapsed(), ms(1_000));
+        assert_eq!(out.conn.read_requests.len(), 40);
+        assert!(out.conn.read_timeouts.iter().all(|(_, t)| *t == ms(25)));
+        assert_eq!(out.obs.bytes_written, out.banner_len());
+        out.assert_deadline_discipline();
+
+        // Explicit WouldBlock results behave the same way.
+        let reads = (0..100)
+            .map(|_| ReadEvent::Err(io::ErrorKind::WouldBlock))
+            .collect();
+        let out = run(reads, Vec::new(), ms(1_000));
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.clock.elapsed(), ms(1_000));
+        assert_eq!(out.conn.read_requests.len(), 40);
+        assert_eq!(out.conn.unread_events(), 60);
+
+        // A poll interval that does not divide the deadline: the last slice
+        // is the shorter remainder, never an overshoot.
+        let out = run_with(
+            &config(30, 4096),
+            Vec::new(),
+            Vec::new(),
+            ms(1_000),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(out.end, ObservationEnd::TimedOut));
+        assert_eq!(out.clock.elapsed(), ms(1_000));
+        assert_eq!(out.conn.read_requests.len(), 34);
+        assert_eq!(out.conn.read_timeouts.last(), Some(&(ms(990), ms(10))));
+        out.assert_deadline_discipline();
+    }
 }

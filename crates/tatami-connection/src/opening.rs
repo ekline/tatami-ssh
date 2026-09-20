@@ -561,10 +561,11 @@ impl OpeningEngine {
         let local_number = *local_number;
         self.remove(handle);
         self.pending_outgoing -= 1;
-        if self.tombstones.len() >= self.limits.max_tombstones {
+        // Push, then trim to the limit, so `max_tombstones == 0` keeps none.
+        self.tombstones.push_back(local_number);
+        while self.tombstones.len() > self.limits.max_tombstones {
             self.tombstones.pop_front();
         }
-        self.tombstones.push_back(local_number);
         Ok(())
     }
 
@@ -1222,6 +1223,30 @@ mod tests {
             e.handle_open_failure(&failure(1, 1)),
             Ok(Event::LateReply { .. })
         ));
+    }
+
+    #[test]
+    fn zero_tombstones_forgets_cancelled_numbers_immediately() {
+        // Regression: found by the `channel_opening` fuzz target. With
+        // `max_tombstones == 0` the engine used to evict before pushing and
+        // therefore always kept one tombstone, classifying a late reply as
+        // `LateReply` instead of `UnknownRecipient`.
+        let mut e = OpeningEngine::new(OpeningLimits {
+            max_tombstones: 0,
+            ..OpeningLimits::default()
+        });
+        let h = e.open(session(1)).unwrap();
+        let _ = e.next_outgoing();
+        e.cancel(h).unwrap();
+        assert_eq!(
+            e.handle_open_confirmation(&confirmation(0, 1)),
+            Err(Violation::UnknownRecipient { recipient: 0 })
+        );
+        assert_eq!(
+            e.handle_open_failure(&failure(0, 1)),
+            Err(Violation::UnknownRecipient { recipient: 0 })
+        );
+        assert_eq!(e.live_channels(), 0);
     }
 
     #[test]

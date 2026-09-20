@@ -1,0 +1,83 @@
+[package]
+name = "tatami-fuzz-protocol"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "libFuzzer harnesses for tatami-tcp, tatami-connection and the tatami facade"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Isolated workspace: not a member of the production workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# Independent JSON parser used only as an oracle.
+serde_json = "1"
+tatami-wire = { path = "../../crates/tatami-wire", default-features = false, features = ["alloc"] }
+tatami-tcp = { path = "../../crates/tatami-tcp", default-features = false, features = ["std"] }
+tatami-connection = { path = "../../crates/tatami-connection", default-features = false }
+tatami = { path = "../../crates/tatami", default-features = false, features = ["std", "tcp"] }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "tcp_identification"
+path = "fuzz_targets/tcp_identification.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_initial_packets"
+path = "fuzz_targets/tcp_initial_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_probe"
+path = "fuzz_targets/tcp_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_observer"
+path = "fuzz_targets/tcp_observer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_buffer"
+path = "fuzz_targets/input_buffer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel_opening"
+path = "fuzz_targets/channel_opening.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_values"
+path = "fuzz_targets/json_values.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observation_records"
+path = "fuzz_targets/observation_records.rs"
+test = false
+doc = false
+bench = false

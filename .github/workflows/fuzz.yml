@@ -1,0 +1,148 @@
+name: Fuzz
+
+# Two jobs share one implementation:
+#   * fuzz (push/PR): build every target, replay all committed seeds, run each
+#     target for FUZZ_PR_SECONDS with a recorded seed, upload artifacts on
+#     failure. Read-only permissions; no cache writes from PR forks reach the
+#     corpus cache.
+#   * fuzz-scheduled (nightly cron / manual): FUZZ_SCHEDULED_SECONDS per target
+#     with the evolved corpus restored from cache, then minimized and saved.
+# Toolchain versions come from fuzz/toolchain.env only.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        default: "300"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fuzz:
+    name: fuzz (${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'pr' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load fuzz toolchain configuration
+        run: |
+          set -eu
+          . ./fuzz/toolchain.env
+          {
+            echo "FUZZ_NIGHTLY=$FUZZ_NIGHTLY"
+            echo "CARGO_FUZZ_VERSION=$CARGO_FUZZ_VERSION"
+            echo "FUZZ_HOST_TRIPLE=$FUZZ_HOST_TRIPLE"
+            echo "FUZZ_PR_SECONDS=$FUZZ_PR_SECONDS"
+            echo "FUZZ_SCHEDULED_SECONDS=$FUZZ_SCHEDULED_SECONDS"
+          } >> "$GITHUB_ENV"
+
+      - name: Install nightly toolchain and cargo-fuzz
+        run: |
+          set -eu
+          rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal \
+            --component rustfmt,clippy,llvm-tools-preview
+          # Explicitly pinned; never changes the default toolchain.
+          rustup run "$FUZZ_NIGHTLY" cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+          rustup run "$FUZZ_NIGHTLY" cargo fuzz --version
+          rustup run "$FUZZ_NIGHTLY" rustc --version
+
+      - name: Cache fuzz build directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/wire-core/target
+            fuzz/protocol/target
+          key: fuzz-build-${{ env.FUZZ_NIGHTLY }}-${{ env.CARGO_FUZZ_VERSION }}-${{ hashFiles('fuzz/*/Cargo.lock', 'fuzz/*/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            fuzz-build-${{ env.FUZZ_NIGHTLY }}-${{ env.CARGO_FUZZ_VERSION }}-
+
+      # Evolved corpora are only restored/saved for trusted runs (push to
+      # main, schedule, manual), never from pull requests.
+      - name: Restore evolved corpora
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            fuzz/wire-core/corpus
+            fuzz/protocol/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      - name: Lint fuzz harnesses (fmt, clippy -D warnings)
+        run: |
+          set -eu
+          # scripts/fuzz.sh lint uses the default cargo; select the pinned nightly
+          # for the harness crates only via RUSTUP_TOOLCHAIN for this step.
+          RUSTUP_TOOLCHAIN="$FUZZ_NIGHTLY" scripts/fuzz.sh lint
+
+      - name: Build all targets (AddressSanitizer)
+        run: scripts/fuzz.sh build
+
+      - name: Replay committed seeds through every target
+        run: scripts/fuzz.sh replay
+
+      - name: Bounded campaign
+        run: |
+          set -eu
+          case "${{ github.event_name }}" in
+            schedule) secs="$FUZZ_SCHEDULED_SECONDS" ;;
+            workflow_dispatch) secs="${{ github.event.inputs.seconds }}" ;;
+            *) secs="$FUZZ_PR_SECONDS" ;;
+          esac
+          seed=${{ github.run_id }}
+          echo "campaign: ${secs}s per target, libFuzzer -seed=$seed"
+          status=0
+          for t in $(scripts/fuzz.sh list | awk '{print $1}'); do
+            echo "==> $t"
+            if ! scripts/fuzz.sh run "$t" -- -max_total_time="$secs" -seed="$seed" -print_final_stats=1; then
+              echo "::error::target $t failed"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Minimize corpora
+        if: github.event_name != 'pull_request' && always()
+        run: |
+          set -eu
+          . ./fuzz/toolchain.env
+          for t in $(scripts/fuzz.sh list | awk '{print $1}'); do
+            ws=$(scripts/fuzz.sh list | awk -v t="$t" '$1==t {print $2}')
+            [ -d "fuzz/$ws/corpus/$t" ] || continue
+            rustup run "$FUZZ_NIGHTLY" cargo fuzz cmin --fuzz-dir "fuzz/$ws" "$t" "fuzz/$ws/corpus/$t" || true
+          done
+
+      - name: Save evolved corpora
+        if: github.event_name != 'pull_request' && always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            fuzz/wire-core/corpus
+            fuzz/protocol/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: |
+            fuzz/wire-core/artifacts
+            fuzz/protocol/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

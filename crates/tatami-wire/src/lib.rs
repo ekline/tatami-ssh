@@ -26,7 +26,9 @@
 //! # Not implemented
 //!
 //! `mpint` has no consumer yet and is deliberately absent. Packet envelopes
-//! (TCP binary packets, QUIC records) belong to the transport bindings.
+//! (TCP binary packets, QUIC records) belong to the transport bindings, as
+//! does the *framing* of the identification exchange: [`ident`] parses and
+//! encodes identification content only.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -37,6 +39,7 @@ extern crate alloc;
 
 pub mod channel;
 pub mod error;
+pub mod ident;
 pub mod kexinit;
 mod message;
 pub mod msg;

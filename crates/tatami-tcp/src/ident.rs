@@ -29,10 +29,21 @@
 //! - The exact identification bytes without the terminator are exposed as
 //!   [`Identification::line`], which is the form a future exchange hash
 //!   needs (`V_S` excludes CR and LF).
+//!
+//! # Division of responsibility
+//!
+//! Identification *content* syntax (`SSH-proto-software [comments]`) is
+//! parsed and encoded by [`tatami_wire::ident`], which is shared with any
+//! future binding. This module owns everything TCP-specific: terminator
+//! scanning across read boundaries, server pre-identification lines, the
+//! 255-byte line limit measured with the observed terminator, LF-only
+//! acceptance, and the supported-version policy (`2.0` and `1.99` only).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+
+use tatami_wire::ident as wire;
 
 /// Maximum identification line length including `CR LF` (RFC 4253 §4.2).
 pub const MAX_IDENTIFICATION_LINE: usize = 255;
@@ -227,20 +238,25 @@ impl fmt::Display for InvalidLocalIdentification {
 
 impl core::error::Error for InvalidLocalIdentification {}
 
-/// Builds our own identification line `SSH-2.0-<software_version>\r\n`,
-/// validating both the token characters and the total length.
+/// Builds our own identification line `SSH-2.0-<software_version>\r\n`.
+///
+/// The content is encoded by [`tatami_wire::ident::encode`]; this function
+/// appends `CR LF` and validates the whole line against
+/// [`MAX_IDENTIFICATION_LINE`], which is the TCP binding's rule.
 pub fn build_identification(software_version: &str) -> Result<Vec<u8>, InvalidLocalIdentification> {
-    if !is_version_token(software_version.as_bytes()) {
-        return Err(InvalidLocalIdentification::BadSoftwareVersion);
-    }
-    let len = "SSH-2.0-".len() + software_version.len() + 2;
+    let content_len = wire::encoded_len(b"2.0", software_version.as_bytes(), None)
+        .ok_or(InvalidLocalIdentification::BadSoftwareVersion)?;
+    let len = content_len
+        .checked_add(2)
+        .ok_or(InvalidLocalIdentification::TooLong { len: usize::MAX })?;
     if len > MAX_IDENTIFICATION_LINE {
         return Err(InvalidLocalIdentification::TooLong { len });
     }
-    let mut line = Vec::with_capacity(len);
-    line.extend_from_slice(b"SSH-2.0-");
-    line.extend_from_slice(software_version.as_bytes());
-    line.extend_from_slice(b"\r\n");
+    let mut line = alloc::vec![0u8; len];
+    let written = wire::encode(b"2.0", software_version.as_bytes(), None, &mut line)
+        .map_err(|_| InvalidLocalIdentification::BadSoftwareVersion)?;
+    debug_assert_eq!(written, content_len);
+    line[content_len..].copy_from_slice(b"\r\n");
     Ok(line)
 }
 
@@ -417,10 +433,10 @@ impl IdentificationReader {
 /// and they are all consistent with that prefix.
 #[must_use]
 pub fn starts_identification(buf: &[u8]) -> Option<bool> {
-    const PREFIX: &[u8] = b"SSH-";
-    if buf.len() >= PREFIX.len() {
-        Some(&buf[..PREFIX.len()] == PREFIX)
-    } else if buf == &PREFIX[..buf.len()] {
+    let prefix = wire::PREFIX;
+    if buf.len() >= prefix.len() {
+        Some(&buf[..prefix.len()] == prefix)
+    } else if buf == &prefix[..buf.len()] {
         None
     } else {
         Some(false)
@@ -438,53 +454,43 @@ fn find_line(buf: &[u8]) -> Option<(usize, LineTerminator)> {
     }
 }
 
-/// Parses an identification line (without terminator) that is already known
-/// to start with `SSH-`.
+/// Parses an identification line (without terminator) with the shared
+/// syntax parser, then applies the TCP version policy.
 fn parse_identification(
     line: &[u8],
     terminator: LineTerminator,
 ) -> Result<Identification<'_>, IdentError> {
-    use InvalidIdentification as E;
-    if line.iter().any(|&b| b == b'\r' || b == 0) {
-        return Err(IdentError::InvalidIdentification(E::ControlCharacter));
-    }
-    let rest = &line[4..];
-    let dash = rest
-        .iter()
-        .position(|&b| b == b'-')
-        .ok_or(IdentError::InvalidIdentification(E::MissingSeparator))?;
-    let protocol_version = &rest[..dash];
-    if !is_version_token(protocol_version) {
-        return Err(IdentError::InvalidIdentification(E::BadProtocolVersion));
-    }
-    let after = &rest[dash + 1..];
-    let (software_version, comments) = match after.iter().position(|&b| b == b' ') {
-        Some(sp) => (&after[..sp], Some(&after[sp + 1..])),
-        None => (after, None),
-    };
-    if !is_version_token(software_version) {
-        return Err(IdentError::InvalidIdentification(E::BadSoftwareVersion));
-    }
-    let support = match protocol_version {
-        b"2.0" => VersionSupport::Ssh2,
-        b"1.99" => VersionSupport::Ssh2Compatibility,
-        _ => return Err(IdentError::UnsupportedVersion),
+    let content = wire::Identification::parse(line).map_err(|e| {
+        IdentError::InvalidIdentification(match e {
+            // The reader only calls this for lines that start with `SSH-`.
+            wire::IdentSyntaxError::MissingPrefix | wire::IdentSyntaxError::MissingSeparator => {
+                InvalidIdentification::MissingSeparator
+            }
+            wire::IdentSyntaxError::BadProtocolVersion => InvalidIdentification::BadProtocolVersion,
+            wire::IdentSyntaxError::BadSoftwareVersion => InvalidIdentification::BadSoftwareVersion,
+            wire::IdentSyntaxError::ControlCharacter => InvalidIdentification::ControlCharacter,
+        })
+    })?;
+    let support = match content.protocol_version_class() {
+        wire::ProtocolVersionClass::Ssh2 => VersionSupport::Ssh2,
+        wire::ProtocolVersionClass::Ssh2Compatibility => VersionSupport::Ssh2Compatibility,
+        wire::ProtocolVersionClass::Other => return Err(IdentError::UnsupportedVersion),
     };
     Ok(Identification {
-        line,
+        line: content.as_bytes(),
         terminator,
-        protocol_version,
-        software_version,
-        comments,
+        protocol_version: content.protocol_version(),
+        software_version: content.software_version(),
+        comments: content.comments(),
         support,
     })
 }
 
-/// Returns `true` if `token` is a valid `protoversion`/`softwareversion`:
-/// non-empty printable US-ASCII with no whitespace and no `-`.
+/// Returns `true` if `token` is a valid `protoversion`/`softwareversion`.
+/// Re-export of [`tatami_wire::ident::is_version_token`].
 #[must_use]
 pub fn is_version_token(token: &[u8]) -> bool {
-    !token.is_empty() && token.iter().all(|&b| b > 0x20 && b < 0x7f && b != b'-')
+    wire::is_version_token(token)
 }
 
 #[cfg(test)]

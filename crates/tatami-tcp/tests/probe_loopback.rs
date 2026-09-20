@@ -294,6 +294,9 @@ fn packet_budget_exhausted_by_ignore_flood() {
                 break;
             }
         }
+        // Consume the client identification so close() sends FIN, not RST;
+        // an RST can discard data the probe has not read yet.
+        let _ = read_client_ident(&mut s);
     });
     let run = run(port, &io_config(5_000));
     peer.join().unwrap();

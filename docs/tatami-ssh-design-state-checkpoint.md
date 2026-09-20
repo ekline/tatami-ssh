@@ -19,6 +19,8 @@ The Cargo workspace now exists with all seven packages (see `architecture.md`, d
 | TCP initial-offer probe and `tatami-client probe` | Implemented; sends no client `KEXINIT`; verified against OpenSSH_10.2p1 | `tatami-tcp::{probe,io}`, `tatami::client::probe` |
 | Opening lifecycle engine (§2.2 items 2, 3, 4, 7 for opening only) | Implemented; no data, window accounting, EOF or close | `tatami-connection::opening` |
 | `tatami-server observe` (round 2) | Implemented: TCP diagnostic listener sending only a server identification; records client identification and client `KEXINIT` as JSON Lines; verified against OpenSSH_10.2p1 (README). Not an SSH service. | `tatami-tcp::{initial,observer,io::listener}`, `tatami::server::observe` |
+| Identification content syntax (round 3) | Implemented in `tatami-wire::ident`, shared by bindings; TCP framing and version policy stay in `tatami-tcp` (W-12 revised). The QUIC binding's identification placement, record limits and session-binding construction remain open (AQ-020–AQ-023, P-04, P-05). | `tatami-wire::ident`, `tatami-tcp::ident` |
+| Fuzzing (round 3) | 12 libFuzzer targets with independent oracles over every implemented surface; one production finding fixed (tombstone capacity at 0). Nothing fuzzes KEX, crypto, QUIC/TLS, auth or SFTP because none exist. | `fuzz/`, `fuzzing.md` |
 | QUIC handshake observer | Designed only; backend audit and proposed slice in `quic-observer-readiness.md`; no code, no `--quic` | — |
 | SFTP / file transfer | Direction recorded (W-25); nothing implemented | — |
 | Key exchange, host-key verification, packet protection, userauth | Not started; next milestone | — |

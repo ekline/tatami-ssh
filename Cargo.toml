@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Fuzz harnesses are isolated Cargo workspaces with their own lockfiles and
+# nightly-only build flags; they are never part of the production graph.
+exclude = ["fuzz/wire-core", "fuzz/protocol"]
 
 [workspace.package]
 version = "0.1.0"

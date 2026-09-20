@@ -95,8 +95,10 @@ locally; CI installs it and requires the step.
 |---|---|
 | `crates/*/src/lib.rs` | Package documentation and portability gates |
 | `crates/tatami-wire/src/{primitives,namelist}.rs` | Checked `Reader`/`Writer` and borrowed name lists; no `alloc` |
+| `crates/tatami-wire/src/ident.rs` | Shared identification *content* syntax: borrowed parser, content encoder, version classification; `OwnedIdentification` behind `alloc` |
 | `crates/tatami-wire/src/{kexinit,transport,channel}.rs` | `KEXINIT`, `DISCONNECT`/`IGNORE`/`DEBUG`/`UNIMPLEMENTED`, and channel-opening payload codecs |
-| `crates/tatami-tcp/src/{ident,packet}.rs` | Identification exchange and initial unprotected packet framing |
+| `crates/tatami-tcp/src/{ident,packet}.rs` | Identification *exchange* (terminators, prelude, 255-byte rule, version policy) over the shared syntax; initial unprotected packet framing |
+| `crates/tatami-tcp/src/io/seam.rs` | Internal `Conn`/`Clock` seam with a scripted connection and virtual clock for deterministic adapter tests (`std`, `pub(crate)`) |
 | `crates/tatami-tcp/src/initial.rs` | Bounded `InputBuffer`; shared pre-`KEXINIT` packet handling and error codes |
 | `crates/tatami-tcp/src/probe.rs` | Portable client-side initial-offer probe |
 | `crates/tatami-tcp/src/observer.rs` | Portable server-side observer (no server `KEXINIT`) |
@@ -117,6 +119,8 @@ locally; CI installs it and requires the step.
 | `docs/` | Architecture, decisions, protocol checkpoint and existing Draft 00 |
 | `scripts/check-workspace.sh` | Local and CI build/feature verification |
 | `.github/workflows/ci.yml` | Minimum-version and stable checks |
+| `fuzz/wire-core/`, `fuzz/protocol/` | Isolated libFuzzer workspaces (12 targets, committed seeds); see `docs/fuzzing.md` |
+| `fuzz/toolchain.env`, `scripts/fuzz.sh`, `.github/workflows/fuzz.yml` | Pinned fuzz toolchain, wrapper and bounded CI campaigns |
 
 ### Implemented
 
@@ -130,8 +134,18 @@ trailing bytes where the message has no tail, and preserve unknown names and
 codes. `KEXINIT` parsing is syntactic; `classify_kex_name` separately
 annotates `ext-info-c/s` and OpenSSH `kex-strict-*` markers as non-methods.
 
+**Identification (round 3 split).** `tatami_wire::ident::Identification::parse`
+validates complete content without a terminator: the `SSH-` prefix, both
+separators, RFC 4253 token characters, and no CR/LF/NUL anywhere; fields are
+borrowed slices, absent and empty comments stay distinct, nothing is trimmed
+or lossily decoded, and any syntactically valid version parses.
+`tatami_wire::ident::encode` writes content only and never partially fills
+the buffer. `tatami_tcp::ident` wraps that with everything TCP-specific and
+applies the `2.0`/`1.99` policy (W-12 revised).
+
 **TCP.** Identification parsing survives any read boundary, bounds prelude
-lines/bytes separately from the 255-byte identification limit, accepts
+lines/bytes separately from the 255-byte identification limit (measured with
+the observed terminator: 254 content + LF fits, 254 + CRLF does not), accepts
 LF-only terminators (reported), treats `1.99` as SSH-2 compatibility and
 rejects SSH-1. Initial packet framing validates alignment, minimum size,
 padding and a configurable cap (default 64 KiB, above the RFC 4253 §6.1
@@ -178,6 +192,12 @@ printed separately. `server::observe::prepare` binds and returns the actual
 address; `run_jsonl` writes schema-1 JSON Lines through `tatami::json`, with
 raw bytes as lossy text plus bounded hex and oversized records re-emitted
 truncated. Exit statuses per W-16.
+
+**Fuzzing (round 3).** Twelve libFuzzer targets in two isolated workspaces
+cover every implemented parser, encoder and state machine with independent
+oracles; committed seeds reach the deep states; `scripts/fuzz.sh` wraps
+build/replay/run/reproduce/minimize/coverage; CI runs bounded campaigns.
+Details, execution evidence and findings are in `fuzzing.md`.
 
 ### Next implementation slices
 

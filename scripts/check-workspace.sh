@@ -28,6 +28,14 @@ step() {
     "$@"
 }
 
+# The fuzz harnesses must stay out of the production workspace; a stray
+# member would drag nightly-only build flags and harness deps into it.
+printf '\n==> verify fuzz workspaces are not production members\n'
+if cargo metadata --no-deps --format-version 1 | grep -q 'tatami-fuzz-'; then
+    echo "error: a fuzz harness package is a member of the production workspace" >&2
+    exit 1
+fi
+
 step cargo fmt --all -- --check
 step cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 step cargo clippy --workspace --all-targets --all-features -- -D warnings
