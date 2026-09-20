@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/tatami-guardian-512.png" width="256" height="256" alt="Tatami: a friendly green folding-armour guardian whose head preserves the complete 田 cross in 畳.">
+</p>
+
 # tatami-ssh
 Rust-based SSH experiment
 
