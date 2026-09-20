@@ -17,6 +17,12 @@
 //! is compiled. Bindings are independent; either, both or neither may be
 //! enabled.
 //!
+//! # Binaries
+//!
+//! `tatami-client` and `tatami-server` are built only with `std,tcp`. The
+//! client currently offers the TCP initial-offer probe
+//! ([`client::probe`]); the server is an entry-point stub.
+//!
 //! # Portability
 //!
 //! The crate is `#![no_std]` with `alloc`; `std` is linked only when the
@@ -41,6 +47,7 @@ pub use tatami_tcp as tcp;
 
 pub mod client;
 pub mod server;
+pub mod text;
 
 #[cfg(feature = "std")]
 pub mod host;

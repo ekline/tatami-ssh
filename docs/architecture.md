@@ -1,13 +1,14 @@
 # Workspace architecture
 
-Status: initial scaffold, 2026-09-20. Package boundaries are an implementation
-starting point; unresolved protocol choices remain unresolved and are tracked
-in `tatami-ssh-design-state-checkpoint.md`.
+Status: scaffold plus first implementation slice, 2026-09-20. Package
+boundaries are an implementation starting point; unresolved protocol choices
+remain unresolved and are tracked in `tatami-ssh-design-state-checkpoint.md`.
 
-All libraries are `no_std`. All seven proposed package boundaries are
-represented now as documentation-only scaffolds so that the layout, dependency
-direction and feature policy can be checked mechanically before functionality
-lands. They are not working protocol implementations.
+All libraries are `no_std`. All seven proposed package boundaries exist so
+that the layout, dependency direction and feature policy can be checked
+mechanically. `tatami-wire`, `tatami-tcp`, `tatami-connection` and the
+`tatami` facade now contain the first working code (see "Implemented" below);
+`tatami-keys`, `tatami-auth` and `tatami-quic` remain documentation-only.
 
 ## Portability layers
 
@@ -93,23 +94,75 @@ locally; CI installs it and requires the step.
 | Location | Contents |
 |---|---|
 | `crates/*/src/lib.rs` | Package documentation and portability gates |
-| `crates/tatami-{tcp,quic}/src/io.rs` | Future optional socket/runtime adapters |
-| `crates/tatami/src/{client,server}.rs` | Future reusable application composition |
+| `crates/tatami-wire/src/{primitives,namelist}.rs` | Checked `Reader`/`Writer` and borrowed name lists; no `alloc` |
+| `crates/tatami-wire/src/{kexinit,transport,channel}.rs` | `KEXINIT`, `DISCONNECT`/`IGNORE`/`DEBUG`/`UNIMPLEMENTED`, and channel-opening payload codecs |
+| `crates/tatami-tcp/src/{ident,packet}.rs` | Identification exchange and initial unprotected packet framing |
+| `crates/tatami-tcp/src/probe.rs` | Portable initial-offer probe state machine |
+| `crates/tatami-tcp/src/io.rs` | Blocking TCP connect/read adapter with phase deadlines (`std`) |
+| `crates/tatami-tcp/tests/` | Loopback fixture-peer tests for the adapter |
+| `crates/tatami-quic/src/io.rs` | Future optional socket/runtime adapters |
+| `crates/tatami-connection/src/opening.rs` | Channel-opening lifecycle engine |
+| `crates/tatami/src/client.rs` | `client::probe`: options, structured report, text rendering (`std,tcp`) |
+| `crates/tatami/src/text.rs` | Escaping of untrusted bytes for display |
+| `crates/tatami/src/bin/` | `tatami-client` and `tatami-server` executables (`std,tcp`) |
+| `crates/tatami/tests/cli.rs` | End-to-end binary tests against a loopback fixture |
 | `crates/tatami/src/host/` | Future environment, process and PTY adapters |
 | `docs/` | Architecture, decisions, protocol checkpoint and existing Draft 00 |
 | `scripts/check-workspace.sh` | Local and CI build/feature verification |
 | `.github/workflows/ci.yml` | Minimum-version and stable checks |
 
-Implement bounded SSH primitives and opening-message codecs in `wire`, then the
-pending/accepted/refused channel lifecycle in `connection`. Keep local/peer SSH
-numbers distinct from QUIC stream IDs. The connection engine must not equate
-stream readiness with channel acceptance. Allocation-free wire helpers should
-accept caller-provided buffers or borrowed inputs.
+### Implemented
 
-The scaffold deliberately does not define QUIC record framing, window mapping,
-stream association, session-binding construction or a crypto abstraction. Add
-protocol tests for actual behavior as it arrives. Future interoperability tests
-must belong to a Cargo package; a virtual workspace root is not a test package.
+**Wire.** `Reader`/`Writer` over borrowed slices with an atomic cursor
+contract (a failed call leaves the cursor unchanged). Primitives: byte,
+boolean (any nonzero decodes true, encodes 0/1), `uint32`, `uint64`, `string`
+(arbitrary bytes), `name-list` (validated, iterated without allocation; empty
+list valid at this layer). `mpint` is absent until something needs it.
+Message decoders consume a delimited payload, name the failing field, reject
+trailing bytes where the message has no tail, and preserve unknown names and
+codes. `KEXINIT` parsing is syntactic; `classify_kex_name` separately
+annotates `ext-info-c/s` and OpenSSH `kex-strict-*` markers as non-methods.
+
+**TCP.** Identification parsing survives any read boundary, bounds prelude
+lines/bytes separately from the 255-byte identification limit, accepts
+LF-only terminators (reported), treats `1.99` as SSH-2 compatibility and
+rejects SSH-1. Initial packet framing validates alignment, minimum size,
+padding and a configurable cap (default 64 KiB, above the RFC 4253 §6.1
+baseline) from the header alone, before buffering the body. The probe state
+machine sends only a client identification (`SSH-2.0-tatami_0.1.0`), handles
+`IGNORE`/`DEBUG`/`UNIMPLEMENTED`/`DISCONNECT`, stops at the first `KEXINIT`,
+and ends with an explicit unsupported-state result on `NEWKEYS` or a
+method-specific message. Deadlines are per phase (connect, read) and live
+only in `io`. Name resolution is synchronous `ToSocketAddrs` and is not
+covered by the deadlines; that is documented, not solved.
+
+**Connection.** `opening::OpeningEngine` keeps local numbers, peer numbers
+and generation-checked application handles distinct. Opens become channels
+only on a decoded confirmation or an explicit `accept`. Local numbers are
+allocated monotonically and never reused in this version; cancelled numbers
+are tombstoned (bounded) so late replies are classified rather than treated
+as violations. Incoming opens beyond the pending limit are refused with
+`SSH_OPEN_RESOURCE_SHORTAGE`. Transport loss is a distinct event from peer
+refusal and local cancellation. Window/max-packet fields are retained
+verbatim with no accounting.
+
+**Facade.** `client::probe::run` returns a `Report`; `write_text` renders it
+with every peer string escaped, lists in advertised order and both directions
+printed separately. Exit statuses: 0 complete, 1 incomplete/failure, 2 usage.
+
+### Next implementation slice
+
+A real selected key-exchange method, host-key signature verification and
+trust validation, then protected packets and service negotiation. That
+requires algorithm and cryptographic-provider selection with a capability
+audit; nothing in the probe pre-empts that choice. On the connection side,
+the channel close lifecycle must define when a local number may be released.
+
+The workspace still deliberately does not define QUIC record framing, window
+mapping, stream association, session-binding construction or a crypto
+abstraction. Interoperability tests belong to a Cargo package; the loopback
+fixtures in `tatami-tcp/tests` and `tatami/tests` are not SSH servers and do
+not substitute for the recorded OpenSSH smoke test in the README.
 
 ## Toolchain and publishing
 

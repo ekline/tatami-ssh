@@ -22,6 +22,11 @@
 //!   identifiable module here. QUIC byte and stream-count credit stay in the
 //!   QUIC binding. There is no switch to ignore windows.
 //!
+//! # Implemented so far
+//!
+//! [`opening`]: the channel-opening lifecycle engine. Data transfer,
+//! window accounting, requests, EOF and close are not implemented.
+//!
 //! # Portability
 //!
 //! Always `no_std` with `alloc`. There is no `std` feature.
@@ -33,3 +38,5 @@
 extern crate alloc;
 
 pub use tatami_wire as wire;
+
+pub mod opening;

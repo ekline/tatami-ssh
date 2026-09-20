@@ -10,8 +10,8 @@ publish.workspace = true
 
 [features]
 default = []
-# Exposes `host::{environment, process, pty}`. Forwards `std` to whichever
-# bindings are enabled without itself selecting a transport.
+# Exposes `host::{environment, process, pty}` and `client::probe`. Forwards
+# `std` to whichever bindings are enabled without itself selecting a transport.
 std = ["tatami-tcp?/std", "tatami-quic?/std"]
 tcp = ["dep:tatami-tcp"]
 quic = ["dep:tatami-quic"]
@@ -22,3 +22,13 @@ tatami-auth = { workspace = true }
 tatami-connection = { workspace = true }
 tatami-tcp = { workspace = true, optional = true }
 tatami-quic = { workspace = true, optional = true }
+
+[[bin]]
+name = "tatami-client"
+path = "src/bin/tatami-client.rs"
+required-features = ["std", "tcp"]
+
+[[bin]]
+name = "tatami-server"
+path = "src/bin/tatami-server.rs"
+required-features = ["std", "tcp"]

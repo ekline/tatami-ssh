@@ -33,7 +33,17 @@ step cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 step cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # tatami-wire is the only shared package with a feature; check both states.
+# The allocation-free path is checked in isolation: when other workspace
+# members are selected they enable `tatami-wire/alloc`, which would mask an
+# accidental alloc dependency. Verify the resolved feature set is empty.
 step cargo check -p tatami-wire --no-default-features
+step cargo test -p tatami-wire --no-default-features
+printf '\n==> verify tatami-wire resolves with no features when checked alone\n'
+wire_features=$(cargo tree -p tatami-wire --no-default-features -e features --depth 0 -f '{f}')
+if [ -n "$wire_features" ]; then
+    echo "error: tatami-wire unexpectedly has features enabled: $wire_features" >&2
+    exit 1
+fi
 step cargo check -p tatami-wire --no-default-features --features alloc
 
 # Bindings: portable state with and without host io modules.
@@ -50,6 +60,10 @@ for features in "" std tcp quic tcp,quic std,tcp std,quic std,tcp,quic; do
         step cargo check -p tatami --no-default-features --features "$features"
     fi
 done
+
+# Binaries exist only with std,tcp; cargo skips them otherwise. Build them
+# explicitly so a broken bin cannot hide behind required-features.
+step cargo build -p tatami --no-default-features --features std,tcp --bins
 
 step cargo test --workspace --all-features
 step env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps

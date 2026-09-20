@@ -6,6 +6,24 @@ This is the current design and implementation handoff. The historical checkpoint
 
 **Inputs:** the complete `tatami-ssh-design-state-checkpoint.md` through its 2026-09-13 channel-framing update, and the user's newer `Pasted markdown(1).md` handoff. The handoff controls current intent. Protocol claims below were checked against primary RFC text; recommendations are our analysis, not requirements imposed by those RFCs.
 
+## 0. Implementation status (added 2026-09-20, after the sections below were written)
+
+The Cargo workspace now exists with all seven packages (see `architecture.md`, decision W-01 supersedes the "create lazily" advice in §2). The first implementation slice is done and tested:
+
+| Area | State | Where |
+|---|---|---|
+| Bounded SSH primitives, name lists | Implemented, allocation-free | `tatami-wire::{primitives,namelist}` |
+| `KEXINIT`, `DISCONNECT`/`IGNORE`/`DEBUG`/`UNIMPLEMENTED` codecs | Implemented; syntactic only | `tatami-wire::{kexinit,transport}` |
+| `CHANNEL_OPEN` / `OPEN_CONFIRMATION` / `OPEN_FAILURE` codecs | Implemented; tails bounded and opaque (contract §2.2 item 1) | `tatami-wire::channel` |
+| Identification exchange, initial packet framing | Implemented for the TCP binding only (§4 first row: TCP keeps its own envelope) | `tatami-tcp::{ident,packet}` |
+| TCP initial-offer probe and `tatami-client probe` | Implemented; sends no client `KEXINIT`; verified against OpenSSH_10.2p1 | `tatami-tcp::{probe,io}`, `tatami::client::probe` |
+| Opening lifecycle engine (§2.2 items 2, 3, 4, 7 for opening only) | Implemented; no data, window accounting, EOF or close | `tatami-connection::opening` |
+| `tatami-server` | Entry-point stub only | `crates/tatami/src/bin/tatami-server.rs` |
+| Key exchange, host-key verification, packet protection, userauth | Not started; next milestone | — |
+| QUIC record framing, association, session binding (AQ-018, AQ-026, P-04) | Not started; no wire choice made | — |
+
+Item 1 of "Next concrete work" in §5 is complete. Validation rows "Message codecs" and "Opening state" in §5 now have executable evidence in package tests; "Interoperability" has one recorded manual smoke test (README), not a claim of interoperability.
+
 ## 1. Reconstructed decision ledger
 
 Status meanings: **accepted** means established project intent; **provisional** means the current hypothesis; **proposed** means a recommendation from this checkpoint; **open** means no wire behavior has been selected. A recommendation does not become accepted merely by being saved here.
