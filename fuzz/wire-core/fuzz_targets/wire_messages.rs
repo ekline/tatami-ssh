@@ -25,7 +25,8 @@
 //! slot); `reserved` preserved even if nonzero; `first_kex_packet_follows`
 //! true for any nonzero byte; `empty_algorithm_lists()` names exactly the
 //! empty required lists (never languages); `classify_kex_name` marks only
-//! the four exact marker names; unknown names/codes preserved verbatim and
+//! the six exact marker names (`ext-info-c/s`, `kex-strict-c/s-v00@openssh.com`,
+//! `kex-strict-c/s`); unknown names/codes preserved verbatim and
 //! `disconnect_reason::name` / `open_failure_reason::name` know exactly the
 //! registered codes.
 
@@ -70,9 +71,11 @@ fn expected_kex_name(name: &[u8]) -> KexName {
         KexName::ExtInfoClient
     } else if name == mref::KEX_MARKERS[1] {
         KexName::ExtInfoServer
-    } else if name == mref::KEX_MARKERS[2] {
+    } else if name == mref::KEX_MARKERS[2] || name == mref::KEX_MARKERS[4] {
+        // `kex-strict-c-v00@openssh.com` and the standard `kex-strict-c`.
         KexName::StrictKexClient
-    } else if name == mref::KEX_MARKERS[3] {
+    } else if name == mref::KEX_MARKERS[3] || name == mref::KEX_MARKERS[5] {
+        // `kex-strict-s-v00@openssh.com` and the standard `kex-strict-s`.
         KexName::StrictKexServer
     } else {
         KexName::Method

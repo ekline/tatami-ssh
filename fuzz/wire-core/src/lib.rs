@@ -378,12 +378,18 @@ pub mod messages_ref {
         (4, "SSH_OPEN_RESOURCE_SHORTAGE"),
     ];
 
-    /// The four `kex_algorithms` entries that are markers, not methods.
-    pub const KEX_MARKERS: [&[u8]; 4] = [
+    /// The six `kex_algorithms` entries that are markers, not methods:
+    /// RFC 8308 §2.1 `ext-info-*`, the pre-standard OpenSSH strict-KEX
+    /// names and the standard draft-ietf-sshm-strict-kex-02 §3.1 names.
+    /// Order: client/server pairs, ext-info, then pre-standard, then
+    /// standard strict.
+    pub const KEX_MARKERS: [&[u8]; 6] = [
         b"ext-info-c",
         b"ext-info-s",
         b"kex-strict-c-v00@openssh.com",
         b"kex-strict-s-v00@openssh.com",
+        b"kex-strict-c",
+        b"kex-strict-s",
     ];
 
     fn expect_number(c: &mut RefCursor<'_>, expected: u8) -> Result<(), MessageError> {
@@ -585,6 +591,327 @@ pub mod messages_ref {
             description,
             language_tag,
         })
+    }
+}
+
+pub mod mpint_ref {
+    //! RFC 4251 §5 `mpint`: two's-complement, network byte order, carried in
+    //! a `string`; zero is the empty string; "unnecessary leading bytes with
+    //! the value 0 or 255 MUST NOT be included".
+    //!
+    //! Written from the rule, not from the codec: canonicality is decided by
+    //! asking whether removing the first byte would change the value.
+
+    /// Positive `mpint` encoding of an unsigned big-endian magnitude,
+    /// including the 4-byte length prefix.
+    pub fn positive_encoding(magnitude: &[u8]) -> Vec<u8> {
+        let m = strip_zeros(magnitude);
+        let mut body = Vec::with_capacity(m.len() + 1);
+        // A set high bit would read as negative: prepend a sign byte.
+        if m.first().is_some_and(|&b| b >= 0x80) {
+            body.push(0x00);
+        }
+        body.extend_from_slice(m);
+        let mut out = Vec::with_capacity(4 + body.len());
+        crate::bytes::put_string(&mut out, &body);
+        out
+    }
+
+    /// Magnitude without leading zero bytes (empty for zero).
+    pub fn strip_zeros(magnitude: &[u8]) -> &[u8] {
+        let mut i = 0;
+        while i < magnitude.len() && magnitude[i] == 0 {
+            i += 1;
+        }
+        &magnitude[i..]
+    }
+
+    /// Sign of a two's-complement body: negative iff the top bit of the
+    /// first byte is set; the empty body is zero, not negative.
+    pub fn is_negative(body: &[u8]) -> bool {
+        body.first().is_some_and(|&b| b >= 0x80)
+    }
+
+    /// Canonical iff the first byte cannot be dropped without changing the
+    /// value. Dropping a leading `0x00` changes the value only when the next
+    /// byte would then read as negative (or when nothing remains: zero must
+    /// be empty). Dropping a leading `0xff` changes the value only when the
+    /// next byte would then read as positive (or nothing remains: `-1`).
+    pub fn is_canonical(body: &[u8]) -> bool {
+        match body.first() {
+            None => true,
+            Some(0x00) => body.get(1).is_some_and(|&next| next >= 0x80),
+            Some(0xff) => body.get(1).is_none_or(|&next| next < 0x80),
+            Some(_) => true,
+        }
+    }
+
+    /// Unsigned magnitude of a non-negative body with leading zeros removed;
+    /// `None` for a negative body.
+    pub fn positive_magnitude(body: &[u8]) -> Option<&[u8]> {
+        if is_negative(body) {
+            None
+        } else {
+            Some(strip_zeros(body))
+        }
+    }
+
+    /// The five worked examples of RFC 4251 §5 as `(encoding, value hex)`.
+    pub const RFC4251_EXAMPLES: [(&[u8], &str); 5] = [
+        (&[0, 0, 0, 0], "0"),
+        (
+            &[0, 0, 0, 8, 0x09, 0xa3, 0x78, 0xf9, 0xb2, 0xe3, 0x32, 0xa7],
+            "9a378f9b2e332a7",
+        ),
+        (&[0, 0, 0, 2, 0x00, 0x80], "80"),
+        (&[0, 0, 0, 2, 0xed, 0xcc], "-1234"),
+        (&[0, 0, 0, 5, 0xff, 0x21, 0x52, 0x41, 0x11], "-deadbeef"),
+    ];
+}
+
+pub mod kex_ref {
+    //! Reference layouts for the key-exchange, service and extension
+    //! messages: RFC 5656 §4 `KEX_ECDH_INIT` / `KEX_ECDH_REPLY`, RFC 4253
+    //! §7.3 `NEWKEYS`, RFC 4253 §10 `SERVICE_REQUEST` / `SERVICE_ACCEPT` and
+    //! RFC 8308 §2.3 `EXT_INFO`. Field names follow the RFC message
+    //! definitions and must match `MessageError::Field`.
+
+    use tatami_wire::ext_info::{ExtInfoError, KnownExtension};
+    use tatami_wire::{DecodeError, MessageError};
+
+    use crate::cursor::RefCursor;
+    use crate::namelist_ref;
+
+    // Message numbers restated from the IANA registry.
+    pub const SERVICE_REQUEST: u8 = 5;
+    pub const SERVICE_ACCEPT: u8 = 6;
+    pub const EXT_INFO: u8 = 7;
+    pub const NEWKEYS: u8 = 21;
+    pub const KEX_ECDH_INIT: u8 = 30;
+    pub const KEX_ECDH_REPLY: u8 = 31;
+
+    /// Every pair is at least two empty strings (RFC 8308 §2.3).
+    pub const MIN_PAIR_LEN: usize = 8;
+
+    /// The four extension names RFC 8308 §3 registers, with their kind.
+    pub const KNOWN_EXTENSIONS: [(&[u8], KnownExtension); 4] = [
+        (b"server-sig-algs", KnownExtension::ServerSigAlgs),
+        (b"delay-compression", KnownExtension::DelayCompression),
+        (b"no-flow-control", KnownExtension::NoFlowControl),
+        (b"elevation", KnownExtension::Elevation),
+    ];
+
+    /// Table lookup for [`KNOWN_EXTENSIONS`].
+    pub fn classify_extension(name: &[u8]) -> Option<KnownExtension> {
+        KNOWN_EXTENSIONS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, k)| *k)
+    }
+
+    fn expect_number(c: &mut RefCursor<'_>, expected: u8) -> Result<(), MessageError> {
+        match c.u8() {
+            Err(_) => Err(MessageError::Empty),
+            Ok(found) if found == expected => Ok(()),
+            Ok(found) => Err(MessageError::UnexpectedMessage { expected, found }),
+        }
+    }
+
+    fn field<'a, T>(
+        c: &mut RefCursor<'a>,
+        name: &'static str,
+        read: impl FnOnce(&mut RefCursor<'a>) -> Result<T, DecodeError>,
+    ) -> Result<T, MessageError> {
+        let offset = c.pos;
+        read(c).map_err(|error| MessageError::Field {
+            field: name,
+            offset,
+            error,
+        })
+    }
+
+    fn finish(c: &RefCursor<'_>) -> Result<(), MessageError> {
+        c.finish()
+            .map_err(|count| MessageError::TrailingBytes { count })
+    }
+
+    /// `byte 30, string Q_C`.
+    pub fn ecdh_init(payload: &[u8]) -> Result<&[u8], MessageError> {
+        let mut c = RefCursor::new(payload);
+        expect_number(&mut c, KEX_ECDH_INIT)?;
+        let q_c = field(&mut c, "Q_C", RefCursor::string)?;
+        finish(&c)?;
+        Ok(q_c)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RefEcdhReply<'a> {
+        pub k_s: &'a [u8],
+        pub q_s: &'a [u8],
+        pub signature: &'a [u8],
+    }
+
+    /// `byte 31, string K_S, string Q_S, string signature`.
+    pub fn ecdh_reply(payload: &[u8]) -> Result<RefEcdhReply<'_>, MessageError> {
+        let mut c = RefCursor::new(payload);
+        expect_number(&mut c, KEX_ECDH_REPLY)?;
+        let k_s = field(&mut c, "K_S", RefCursor::string)?;
+        let q_s = field(&mut c, "Q_S", RefCursor::string)?;
+        let signature = field(&mut c, "signature", RefCursor::string)?;
+        finish(&c)?;
+        Ok(RefEcdhReply {
+            k_s,
+            q_s,
+            signature,
+        })
+    }
+
+    /// `byte 21` and nothing else.
+    pub fn newkeys(payload: &[u8]) -> Result<(), MessageError> {
+        let mut c = RefCursor::new(payload);
+        expect_number(&mut c, NEWKEYS)?;
+        finish(&c)
+    }
+
+    /// `byte 5, string service_name`.
+    pub fn service_request(payload: &[u8]) -> Result<&[u8], MessageError> {
+        service(payload, SERVICE_REQUEST)
+    }
+
+    /// `byte 6, string service_name`.
+    pub fn service_accept(payload: &[u8]) -> Result<&[u8], MessageError> {
+        service(payload, SERVICE_ACCEPT)
+    }
+
+    fn service(payload: &[u8], number: u8) -> Result<&[u8], MessageError> {
+        let mut c = RefCursor::new(payload);
+        expect_number(&mut c, number)?;
+        let name = field(&mut c, "service_name", RefCursor::string)?;
+        finish(&c)?;
+        Ok(name)
+    }
+
+    /// The checked `EXT_INFO` header: the count as sent, the number of pairs
+    /// that can possibly fit, and where the pairs start.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RefExtInfoHeader {
+        pub claimed: u32,
+        pub count: usize,
+        pub body_offset: usize,
+    }
+
+    /// `byte 7, uint32 nr-extensions`; the count must fit in the remaining
+    /// bytes at eight per pair, else `Field { nr-extensions, offset 1,
+    /// LengthOverflow { claimed, available } }`.
+    pub fn ext_info_header(payload: &[u8]) -> Result<RefExtInfoHeader, MessageError> {
+        let mut c = RefCursor::new(payload);
+        expect_number(&mut c, EXT_INFO)?;
+        let offset = c.pos;
+        let claimed = field(&mut c, "nr-extensions", RefCursor::u32)?;
+        let available = c.remaining();
+        let max_pairs = available / MIN_PAIR_LEN;
+        if claimed as u64 > max_pairs as u64 {
+            return Err(MessageError::Field {
+                field: "nr-extensions",
+                offset,
+                error: DecodeError::LengthOverflow { claimed, available },
+            });
+        }
+        Ok(RefExtInfoHeader {
+            claimed,
+            count: claimed as usize,
+            body_offset: c.pos,
+        })
+    }
+
+    fn read_pair<'a>(c: &mut RefCursor<'a>) -> Result<(&'a [u8], &'a [u8]), MessageError> {
+        let name = field(c, "extension-name", RefCursor::string)?;
+        let value = field(c, "extension-value", RefCursor::string)?;
+        Ok((name, value))
+    }
+
+    /// What lazy iteration must yield: up to `count` pairs, stopping after
+    /// the first malformed one (which is yielded as the error).
+    #[allow(clippy::type_complexity)]
+    pub fn ext_info_pairs<'a>(
+        payload: &'a [u8],
+        h: &RefExtInfoHeader,
+    ) -> Vec<Result<(&'a [u8], &'a [u8]), MessageError>> {
+        let mut c = RefCursor::new(payload);
+        c.pos = h.body_offset;
+        let mut out = Vec::new();
+        for _ in 0..h.count {
+            match read_pair(&mut c) {
+                Ok(p) => out.push(Ok(p)),
+                Err(e) => {
+                    out.push(Err(e));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Whole-message check in the documented order: count over the caller's
+    /// limit; a malformed pair; the payload ending at a pair boundary before
+    /// `count` pairs; bytes after the last pair.
+    pub fn ext_info_validate(
+        payload: &[u8],
+        h: &RefExtInfoHeader,
+        max: usize,
+    ) -> Result<usize, ExtInfoError> {
+        if h.count > max {
+            return Err(ExtInfoError::TooManyExtensions {
+                claimed: h.claimed,
+                max,
+            });
+        }
+        let mut c = RefCursor::new(payload);
+        c.pos = h.body_offset;
+        for found in 0..h.count {
+            if c.remaining() == 0 {
+                return Err(ExtInfoError::CountMismatch {
+                    claimed: h.claimed,
+                    found,
+                });
+            }
+            read_pair(&mut c).map_err(ExtInfoError::Message)?;
+        }
+        finish(&c).map_err(ExtInfoError::Message)?;
+        Ok(h.count)
+    }
+
+    /// First `server-sig-algs` value parsed as a name-list; `None` when
+    /// absent, `Some(Err)` on a malformed earlier pair or invalid list.
+    #[allow(clippy::type_complexity)]
+    pub fn server_sig_algs<'a>(
+        payload: &'a [u8],
+        h: &RefExtInfoHeader,
+    ) -> Option<Result<Vec<&'a [u8]>, ExtInfoError>> {
+        for pair in ext_info_pairs(payload, h) {
+            match pair {
+                Err(e) => return Some(Err(ExtInfoError::Message(e))),
+                Ok((name, value)) if name == b"server-sig-algs" => {
+                    return Some(
+                        namelist_ref::parse(value).map_err(ExtInfoError::InvalidServerSigAlgs),
+                    );
+                }
+                Ok(_) => {}
+            }
+        }
+        None
+    }
+
+    /// Hand assembly of an `EXT_INFO` payload.
+    pub fn assemble_ext_info(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::bytes::put_u8(&mut out, EXT_INFO);
+        crate::bytes::put_u32(&mut out, u32::try_from(pairs.len()).expect("small"));
+        for (name, value) in pairs {
+            crate::bytes::put_string(&mut out, name);
+            crate::bytes::put_string(&mut out, value);
+        }
+        out
     }
 }
 

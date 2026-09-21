@@ -465,8 +465,17 @@ pub mod opening_model {
             }
         }
 
-        /// Where a reply naming `recipient` lands, per the contract.
-        fn reply_target(&mut self, recipient: u32) -> Result<ReplyTarget, Violation> {
+        /// The peer's live sender numbers: every pending incoming open and
+        /// every established channel owns exactly one. Independent of the
+        /// engine's slot structure; derived from the model's own sets.
+        fn peer_number_live(&self, peer: u32) -> bool {
+            self.pending_in.contains_key(&peer)
+                || self.established.values().any(|e| e.peer.0 == peer)
+        }
+
+        /// Where a reply naming `recipient` lands, per the contract. Does not
+        /// consume a tombstone; see [`Model::consume_reply`].
+        fn reply_target(&self, recipient: u32) -> Result<ReplyTarget, Violation> {
             if self.pending_out.contains_key(&recipient) {
                 return Ok(ReplyTarget::Pending);
             }
@@ -475,8 +484,7 @@ pub mod opening_model {
                     local_number: LocalNumber(recipient),
                 });
             }
-            if let Some(pos) = self.tombstones.iter().position(|&n| n == recipient) {
-                self.tombstones.remove(pos);
+            if self.tombstones.contains(&recipient) {
                 return Ok(ReplyTarget::Tombstone);
             }
             // A number we never allocated that names a pending incoming open
@@ -488,7 +496,24 @@ pub mod opening_model {
             Err(Violation::UnknownRecipient { recipient })
         }
 
+        /// A reply that is accepted consumes the tombstone it named.
+        fn consume_reply(&mut self, recipient: u32, target: ReplyTarget) {
+            if target == ReplyTarget::Tombstone {
+                let pos = self
+                    .tombstones
+                    .iter()
+                    .position(|&n| n == recipient)
+                    .expect("tombstone");
+                self.tombstones.remove(pos);
+            }
+        }
+
         /// Checks the result of `engine.handle_open_confirmation(msg)`.
+        ///
+        /// Invariant asserted independently: a confirmation (live or late)
+        /// whose `sender_channel` is already a live peer number is a
+        /// `DuplicatePeerNumber` violation and changes nothing, including
+        /// the tombstone list. Local and peer numbers may coincide.
         pub fn peer_confirm(
             &mut self,
             msg: &ChannelOpenConfirmation<'_>,
@@ -500,8 +525,25 @@ pub mod opening_model {
                 initial_window_size: msg.initial_window_size,
                 maximum_packet_size: msg.maximum_packet_size,
             };
-            match self.reply_target(r) {
-                Ok(ReplyTarget::Pending) => {
+            let target = match self.reply_target(r) {
+                Ok(t) => t,
+                Err(v) => {
+                    assert_eq!(*result, Err(v), "confirmation of {r}");
+                    return;
+                }
+            };
+            if self.peer_number_live(peer.0) {
+                assert_eq!(
+                    *result,
+                    Err(Violation::DuplicatePeerNumber { peer_number: peer }),
+                    "confirmation of {r} reused live peer number {}",
+                    peer.0
+                );
+                return;
+            }
+            self.consume_reply(r, target);
+            match target {
+                ReplyTarget::Pending => {
                     let p = self.pending_out.remove(&r).expect("pending");
                     let expected = Event::Established {
                         handle: p.handle,
@@ -516,7 +558,7 @@ pub mod opening_model {
                     self.live.insert(p.handle, Live::Est(r));
                     self.established.insert(r, Established { peer });
                 }
-                Ok(ReplyTarget::Tombstone) => assert_eq!(
+                ReplyTarget::Tombstone => assert_eq!(
                     *result,
                     Ok(Event::LateReply {
                         local_number: LocalNumber(r),
@@ -527,7 +569,6 @@ pub mod opening_model {
                     }),
                     "late confirmation of {r}"
                 ),
-                Err(v) => assert_eq!(*result, Err(v), "confirmation of {r}"),
             }
         }
 
@@ -538,7 +579,11 @@ pub mod opening_model {
             result: &Result<Event, Violation>,
         ) {
             let r = msg.recipient_channel;
-            match self.reply_target(r) {
+            let target = self.reply_target(r);
+            if let Ok(t) = target {
+                self.consume_reply(r, t);
+            }
+            match target {
                 Ok(ReplyTarget::Pending) => {
                     let p = self.pending_out.remove(&r).expect("pending");
                     self.live.remove(&p.handle);
@@ -606,6 +651,7 @@ pub mod opening_model {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum ReplyTarget {
         Pending,
         Tombstone,
@@ -1080,12 +1126,16 @@ pub mod record_ref {
     pub const PROPOSAL_ANOMALY_CODES: [&str; 2] =
         ["kexinit_nonzero_reserved", "kexinit_empty_algorithm_list"];
 
-    /// `kex_markers[].kind` values with the names that produce them.
-    pub const KEX_MARKERS: [(&str, &str); 4] = [
+    /// `kex_markers[].kind` values with the names that produce them. Both
+    /// spellings of a strict-KEX marker (pre-standard `-v00@openssh.com` and
+    /// standard draft-ietf-sshm-strict-kex-02) map to the same kind.
+    pub const KEX_MARKERS: [(&str, &str); 6] = [
         ("ext-info-c", "ext_info_client"),
         ("ext-info-s", "ext_info_server"),
         ("kex-strict-c-v00@openssh.com", "strict_kex_client"),
         ("kex-strict-s-v00@openssh.com", "strict_kex_server"),
+        ("kex-strict-c", "strict_kex_client"),
+        ("kex-strict-s", "strict_kex_server"),
     ];
 
     /// Registered `SSH_MSG_DISCONNECT` reason names (RFC 4253 §11.1), index

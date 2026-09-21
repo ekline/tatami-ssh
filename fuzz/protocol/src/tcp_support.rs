@@ -731,14 +731,16 @@ pub mod msg_ref {
     }
 
     /// Reference table for `kex_algorithms` entries that are markers, not
-    /// methods (RFC 8308 §2.1, OpenSSH PROTOCOL §1.10).
+    /// methods (RFC 8308 §2.1; draft-ietf-sshm-strict-kex-02 §3.1 in both
+    /// the standard and the pre-standard OpenSSH `-v00@openssh.com`
+    /// spellings).
     #[must_use]
     pub fn kex_name(name: &[u8]) -> KexName {
         match name {
             b"ext-info-c" => KexName::ExtInfoClient,
             b"ext-info-s" => KexName::ExtInfoServer,
-            b"kex-strict-c-v00@openssh.com" => KexName::StrictKexClient,
-            b"kex-strict-s-v00@openssh.com" => KexName::StrictKexServer,
+            b"kex-strict-c-v00@openssh.com" | b"kex-strict-c" => KexName::StrictKexClient,
+            b"kex-strict-s-v00@openssh.com" | b"kex-strict-s" => KexName::StrictKexServer,
             _ => KexName::Method,
         }
     }
@@ -1478,6 +1480,8 @@ pub mod stream_gen {
         b"en-US",
         b"en",
         b"made-up-name",
+        b"kex-strict-c",
+        b"kex-strict-s",
     ];
 
     /// Message numbers that are not valid before `KEXINIT`.
@@ -1692,10 +1696,13 @@ pub mod stream_gen {
         }
     }
 
-    /// Layout: flags u8 (bit0 add role markers to kex_algorithms; bit1 empty
-    /// a required list (index u8 mod 8); bit2 raw first_kex_packet_follows
-    /// byte follows; bit3 reserved u32 follows; bit4 truncate 1 + u8 mod 7
-    /// bytes), cookie 16 bytes, then ten lists: count u8 mod 4, names.
+    /// Layout: flags u8 (bit0 add role markers (`ext-info-*` and the
+    /// pre-standard `kex-strict-*-v00@openssh.com`) to kex_algorithms; bit1
+    /// empty a required list (index u8 mod 8); bit2 raw
+    /// first_kex_packet_follows byte follows; bit3 reserved u32 follows;
+    /// bit4 truncate 1 + u8 mod 7 bytes; bit5 add the standard role marker
+    /// `kex-strict-c` / `kex-strict-s`), cookie 16 bytes, then ten lists:
+    /// count u8 mod 4, names.
     pub fn gen_kexinit(cur: &mut Cursor<'_>, role: Role) -> GenKexInit {
         let flags = cur.u8();
         let cookie: [u8; 16] = cur.take_filled(16, 7).try_into().expect("exactly 16 bytes");
@@ -1710,6 +1717,13 @@ pub mod stream_gen {
                 Role::Client => [b"ext-info-c", b"kex-strict-c-v00@openssh.com"],
             };
             lists[0].extend(markers.iter().map(|m| m.to_vec()));
+        }
+        if flags & 32 != 0 {
+            let standard: &[u8] = match role {
+                Role::Server => b"kex-strict-s",
+                Role::Client => b"kex-strict-c",
+            };
+            lists[0].push(standard.to_vec());
         }
         if flags & 2 != 0 {
             let idx = usize::from(cur.u8()) % 8;

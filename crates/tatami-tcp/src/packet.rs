@@ -223,12 +223,28 @@ pub fn decode_initial_packet<'a>(
 /// padding, returning the number of bytes written.
 ///
 /// Padding is the minimum that satisfies alignment and `padding_length >= 4`,
-/// filled with `pad_byte`. Real senders must use random padding; this helper
-/// exists for tests and fixtures, which is why it is not randomised.
+/// filled with `pad_byte`. Real senders must use random padding (see
+/// [`encode_initial_packet_with`]); this helper exists for tests and
+/// fixtures, which is why it is not randomised.
 pub fn encode_initial_packet(
     payload: &[u8],
     pad_byte: u8,
     out: &mut [u8],
+) -> Result<usize, EncodeInitialError> {
+    encode_initial_packet_with(payload, out, |padding| padding.fill(pad_byte))
+}
+
+/// Encodes `payload` as an initial packet into `out`, letting `fill_padding`
+/// supply the padding bytes, and returns the number of bytes written.
+///
+/// The padding length is the minimum that satisfies alignment and
+/// `padding_length >= 4` (RFC 4253 §6); `fill_padding` is called exactly once
+/// with the padding region, already positioned in `out`, and is expected to
+/// fill it with random bytes. Nothing is written when an error is returned.
+pub fn encode_initial_packet_with(
+    payload: &[u8],
+    out: &mut [u8],
+    fill_padding: impl FnOnce(&mut [u8]),
 ) -> Result<usize, EncodeInitialError> {
     // total = 4 + 1 + payload + padding, padding >= 4, total % 8 == 0
     let base = HEADER_LEN
@@ -253,7 +269,7 @@ pub fn encode_initial_packet(
     out[..4].copy_from_slice(&packet_length.to_be_bytes());
     out[4] = padding as u8;
     out[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
-    out[HEADER_LEN + payload.len()..total].fill(pad_byte);
+    fill_padding(&mut out[HEADER_LEN + payload.len()..total]);
     Ok(total)
 }
 

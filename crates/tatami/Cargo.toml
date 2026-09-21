@@ -15,6 +15,12 @@ default = []
 std = ["tatami-tcp?/std", "tatami-quic?/std"]
 tcp = ["dep:tatami-tcp"]
 quic = ["dep:tatami-quic"]
+# Portable TCP key exchange, host-key verification and packet protection
+# (first interoperability profile; see docs/crypto-provider-audit.md).
+kex = ["tcp", "tatami-tcp?/kex", "tatami-keys/ed25519"]
+# Host-only QUIC/TLS diagnostic handshake backend (quinn-proto + rustls).
+# Requires std; pulls ring (C/asm). Enables the tatami-quic-* binaries.
+quic-diag = ["std", "quic", "tatami-quic?/quinn-backend"]
 
 [dependencies]
 tatami-keys = { workspace = true }
@@ -37,3 +43,13 @@ required-features = ["std", "tcp"]
 name = "tatami-server"
 path = "src/bin/tatami-server.rs"
 required-features = ["std", "tcp"]
+
+[[bin]]
+name = "tatami-quic-client"
+path = "src/bin/tatami-quic-client.rs"
+required-features = ["quic-diag"]
+
+[[bin]]
+name = "tatami-quic-server"
+path = "src/bin/tatami-quic-server.rs"
+required-features = ["quic-diag"]

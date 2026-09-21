@@ -17,9 +17,21 @@ arbitrary = { version = "1", features = ["derive"] }
 # Independent JSON parser used only as an oracle.
 serde_json = "1"
 tatami-wire = { path = "../../crates/tatami-wire", default-features = false, features = ["alloc"] }
-tatami-tcp = { path = "../../crates/tatami-tcp", default-features = false, features = ["std"] }
+tatami-keys = { path = "../../crates/tatami-keys", default-features = false, features = ["ed25519"] }
+tatami-tcp = { path = "../../crates/tatami-tcp", default-features = false, features = ["std", "kex"] }
 tatami-connection = { path = "../../crates/tatami-connection", default-features = false }
-tatami = { path = "../../crates/tatami", default-features = false, features = ["std", "tcp"] }
+tatami = { path = "../../crates/tatami", default-features = false, features = ["std", "tcp", "kex"] }
+# Harness-only cryptographic providers, used as INDEPENDENT oracles: the
+# harness plays the server (X25519 agreement, Ed25519 signing over its own
+# exchange-hash computation, AES-GCM sealing, RFC 4253 §7.2 derivation with
+# `sha2` directly). Versions equal the production lockfile; none of these is
+# a dependency of a production package through this manifest. There is no
+# private key in any seed: keys are derived from fuzz bytes at run time.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
+sha2 = { version = "0.10.9", default-features = false }
+rand_core = { version = "0.6.4", default-features = false }
 
 [profile.release]
 debug = 1
@@ -78,6 +90,41 @@ bench = false
 [[bin]]
 name = "observation_records"
 path = "fuzz_targets/observation_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_blobs"
+path = "fuzz_targets/key_blobs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_negotiation"
+path = "fuzz_targets/tcp_negotiation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_gcm_packets"
+path = "fuzz_targets/tcp_gcm_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_handshake"
+path = "fuzz_targets/tcp_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_report_json"
+path = "fuzz_targets/handshake_report_json.rs"
 test = false
 doc = false
 bench = false

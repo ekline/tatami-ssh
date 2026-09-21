@@ -25,3 +25,9 @@ fuzz/*/target/
 fuzz/*/corpus/
 fuzz/*/artifacts/
 fuzz/*/coverage/
+
+# libFuzzer artifacts accidentally written to the repository root
+/crash-*
+/leak-*
+/timeout-*
+/oom-*

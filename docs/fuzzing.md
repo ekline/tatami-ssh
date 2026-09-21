@@ -1,9 +1,13 @@
 # Fuzzing
 
-Status: round 3, 2026-09-20. Coverage-guided libFuzzer harnesses exist for
-every implemented protocol surface. Nothing here fuzzes key exchange, crypto
-providers, QUIC/TLS, authentication or SFTP, because none of those exist yet
-(see [Future targets](#future-targets)).
+Status: rounds 3–4, 2026-09-20. Coverage-guided libFuzzer harnesses exist for
+every implemented protocol surface, including (round 4) the KEX/service/
+EXT_INFO codecs, key and signature blobs, algorithm negotiation, AES-GCM
+packet protection and the complete client handshake state machine. Nothing
+here fuzzes the upstream TLS/QUIC stack, authentication or SFTP (see
+[Future targets](#future-targets)); the QUIC diagnostic adapter is covered by
+deterministic in-memory tests rather than a libFuzzer target (see
+[QUIC](#quic-diagnostic-adapter)).
 
 ## Architecture
 
@@ -15,10 +19,11 @@ lockfile, `fuzz_targets/`, committed `seeds/` and ignored `corpus/`,
 | Workspace | Crate under test | Features | Why separate |
 |---|---|---|---|
 | `fuzz/wire-core` | `tatami-wire` | defaults off, **no `alloc`** | Proves the allocation-free configuration; the harness is `std` but the library is not. `cargo tree -e features` in that directory shows `tatami-wire` with no features. |
-| `fuzz/protocol` | `tatami-tcp` (`std`), `tatami-connection`, `tatami` (`std,tcp`), `tatami-wire` (`alloc`) | explicit | State machines, reports and owned helpers. `serde_json` is present only here, as an independent oracle. |
+| `fuzz/protocol` | `tatami-tcp` (`std,kex`), `tatami-keys` (`ed25519`), `tatami-connection`, `tatami` (`std,tcp,kex`), `tatami-wire` (`alloc`) | explicit | State machines, reports and owned helpers. `serde_json` and the harness-side crypto (`ed25519-dalek` with signing, `x25519-dalek`, `aes-gcm`, `sha2`, `rand_core`) are present only here, as independent oracles and as the fuzz "server". |
 
-Harness dependencies (`libfuzzer-sys`, `arbitrary`, `serde_json`) never
-appear in any production `Cargo.toml`. Fuzz-support code (reference grammars,
+Harness dependencies (`libfuzzer-sys`, `arbitrary`, `serde_json`, the
+harness-side crypto crates) never appear in any production `Cargo.toml`
+beyond the versions the production lockfile already pins. Fuzz-support code (reference grammars,
 models, byte assembly) lives in `fuzz/*/src/` and `fuzz_targets/`, not in the
 libraries; no production type derives `Arbitrary`; no `cfg(fuzzing)` path
 exists in `crates/`.
@@ -117,6 +122,12 @@ library's code structure.
 | `channel_opening` | protocol | ≤ 200 actions over `OpeningEngine` with small fuzz limits (tombstones 0–3) | Model keyed by local/peer numbers with opaque handle tokens (no slot/generation mirroring): counts and `phase(h)` for every handle ever issued after every action; each result/event/violation predicted; handles and wire local numbers never reissued; `LateReply` consumes the tombstone and changes nothing else; eviction → `UnknownRecipient`; `DuplicateReply`, `ReplyToIncoming`, `DuplicatePeerNumber`; `IncomingRefusedByLimit` with a queued `OpenFailure{4}`; `transport_lost` = one event per live channel, then empty with no outgoing; credits/tails verbatim including 0 and `u32::MAX`; every `Outgoing` round-trips through the wire codecs with exact length and fails with `InsufficientCapacity` at `n-1` |
 | `json_values` | protocol | `Value` tree ≤ 64 nodes / depth 6, strings via `lossy_text`, `hex`, class-generated UTF-8 | `to_json()` byte-exact with an independent serializer; `serde_json` parses and equals an independent semantic conversion; tokenizer verifies key order and rejects raw bytes < 0x20, non-RFC escapes (incl. `\x`) and lone surrogates; `lossy_text == from_utf8_lossy`; `hex` lowercase, 2×len, decodes; `escape_bytes`/`quoted` printable ASCII and invertible |
 | `observation_records` | protocol | all four `ListenerEvent`s with mutated untrusted fields ≤ 2000 B; budgets {0, 1, 64, 256, 1024, 2048, 4096, 65536, 262144, fuzz}; field bounds {0, 1, 8, 512, fuzz ≤ 4096} | Always a valid JSON object; `schema`, `event`, RFC 3339 `time`; `accepted_at` equals an independent civil-from-days formatter; both auth flags `false`; `stage`/`outcome`/`reason` from closed sets; `client_identification`/`messages`/`proposal`/`diagnostics` compared as expected values (`line_hex` decodes to the bounded prefix, `*_truncated` iff exceeded, directional lists distinct); `record_truncated` iff full > budget, then `messages: []`, `proposal: null`, strictly smaller; size bound below |
+| `wire_kex_codecs` (round 4) | wire-core | first byte selects mpint read/write, `KEX_ECDH_INIT`/`REPLY`, `NEWKEYS`, `SERVICE_REQUEST`/`ACCEPT`, `EXT_INFO`; raw and structured paths | Reference decoders with exact `MessageError` incl. field names; RFC 4251 §5 canonical rule ("drop first byte ⇒ value changes") for `is_canonical`; `write_mpint_positive` equals the reference encoding, atomic on capacity failure, round-trips iff canonical; EXT_INFO count must fail before iteration when `count > remaining/8` (huge count in 12 bytes), `validate(max)` for max ∈ {0,1,8,64}, `server_sig_algs` name-list validity, count+1 mismatch, trailing bytes; all five RFC 4251 examples and both RFC 8731 mpint edge cases seeded |
+| `key_blobs` (round 4) | protocol | raw bytes into the blob decoders, `HostKey::from_blob`, `Sha256Fingerprint::parse`; structured path from a fuzz-seeded Ed25519 signing key | Independent blob layouts; hand-built `ssh-ed25519` blob accepted; `of_blob` equals `sha2` over the hand blob and `Display` equals a harness base64 encoder (own strict 43-char decoder for the inverse); `verify_signature_blob` succeeds on the harness signature and fails exactly for signature/message bit flips, another key, `ssh-rsa` in either blob, a trailing byte, key length 31/33, signature length 63/65; `PinnedSha256` trusts iff fingerprints are equal; `NoTrustPolicy` never trusts |
+| `tcp_negotiation` (round 4) | protocol | client and server KEXINIT lists from pools of real methods, unknown names, all six markers and empty lists; `ClientProposal::encode` round trip | Independent RFC 4253 §7.1 model: first client name in the server list with markers excluded; MAC skipped when the selected cipher is an AEAD; `none` compression; strict-KEX pairing only for the same spelling (mixed spellings never enable); `ext_info` iff the server offered `ext-info-s`; guess correctness = first real method and first host-key algorithm equal; exact `Result` incl. `Direction` and every `StrictKex` field; `ClientProposal::encode` equals hand assembly; `check_profile` |
+| `tcp_gcm_packets` (round 4) | protocol | key/nonce from fuzz; sealed streams delivered under three chunk schedules; byte flips; truncation; huge/misaligned length claims; counters near `u64::MAX`; a 65 536-byte cap packet | Independent `Aes128Gcm` sealer in the harness (length prefix as AAD, padding to 16 with minimum 4, big-endian u64 nonce increment) agrees with `seal`; `open` round-trips payloads and counters; the four clear length bytes alone decide `TooLarge`/`TooSmall`/`Misaligned` (never `NeedMore`); any flipped byte → `TagMismatch`; truncated → `NeedMore`, never `Complete`; the buffer is byte-identical and no counter is spent on any failure; `CounterExhausted` exactly at the boundary. Characterised: a `BadPadding` rejection after a verified tag does spend one counter and is terminal |
+| `tcp_handshake` (round 4) | protocol | a harness *server* (its own X25519, exchange hash, mpint conversion, Ed25519 signing, RFC 4253 §7.2 derivation and AES-GCM) generates one transcript per input: identification ± prelude, KEXINIT from pools with markers/strict spellings and sometimes a wrong guess, optional IGNORE/DEBUG/UNIMPLEMENTED at chosen points, correct or corrupted `KEX_ECDH_REPLY` (bad signature, wrong `K_S` algorithm, all-zero `Q_S`, trailing bytes), `NEWKEYS`, then protected `EXT_INFO`/`SERVICE_ACCEPT` (right or wrong service)/`DISCONNECT`/`KEXINIT` (rekey), optional protected byte flip, EOF; fuzz-chosen trust decision; deterministic client RNG | The harness predicts the `HandshakeOutcome` code for every scenario (strict violation iff strict negotiated and a disallowed message precedes NEWKEYS; `SignatureInvalid` iff corrupted; `HostNotTrusted` iff `Untrusted`, and then no NEWKEYS bytes in the client output; `NegotiationFailed` per the negotiation model; `Completed` iff all valid and the accepted service is `ssh-userauth`; `RekeyNotSupported` iff server KEXINIT after NEWKEYS; `TagMismatch` iff a protected byte flipped); `user_authenticated` always false; protected packet counts vs the model; `session_id` equals the harness hash; the client's protected output is decrypted with the harness keys and its message numbers checked against the modelled sequence — message 50 (`USERAUTH_REQUEST`) never appears; byte-at-a-time ≡ chunked; `room()` respected; bounded driver panics on livelock |
+| `handshake_report_json` (round 4) | protocol | `tatami::client::handshake::Report` built from its public fields with mutated peer text and every `Completion` variant | `to_json` parses with `serde_json`; closed key set at every level with a fixed shape (`null`, never absent); closed `outcome_code`/phase/error-code sets; `user_authenticated` and `rekey_supported` false; fingerprint text form; `write_text` invariants (escaped peer text, fixed trailing lines) |
 
 Entry points covered by these targets or by deterministic tests:
 
@@ -128,6 +139,14 @@ Entry points covered by these targets or by deterministic tests:
 | `tatami_tcp::ident::{IdentificationReader, build_identification, starts_identification}` | `tcp_identification`, `tcp_probe`, `tcp_observer`, `tests/ident_characterization.rs` |
 | `tatami_tcp::packet::{decode_initial_packet, encode_initial_packet}`, `initial::{InputBuffer, InitialPackets}` | `tcp_initial_packets`, `input_buffer` |
 | `tatami_tcp::probe::Probe`, `observer::Observer` | `tcp_probe`, `tcp_observer` |
+| `tatami_wire::primitives::{read_mpint, write_mpint_positive}`, `kex::*`, `transport::{ServiceRequest, ServiceAccept}`, `ext_info::*` | `wire_kex_codecs` |
+| `tatami_keys::{blob, ed25519::HostKey, fingerprint, trust::PinnedSha256}` | `key_blobs`, unit tests with RFC 8032 vectors |
+| `tatami_tcp::negotiate::{negotiate, ClientProposal}` | `tcp_negotiation` |
+| `tatami_tcp::gcm::AeadDirection::{seal, open}` | `tcp_gcm_packets` |
+| `tatami_tcp::transcript::*`, `handshake::ClientHandshake` | `tcp_handshake` (plus deterministic scripted-I/O tests and the OpenSSH interoperability tests in `tatami-tcp/tests/openssh_handshake.rs`) |
+| `tatami_tcp::io::handshake::run_handshake` | scripted `Conn`/`Clock` tests; OpenSSH fixture; CLI tests (`tatami/tests/handshake_cli.rs`) |
+| `tatami::client::handshake::Report::{to_json, write_text}` | `handshake_report_json` |
+| `tatami_quic::diag::*`, `tatami::quic_diag::*` | deterministic in-memory endpoint pairs and loopback UDP tests (`tatami-quic/tests/*.rs`, `tatami/tests/quic_*.rs`); not a libFuzzer target (see below) |
 | `tatami_connection::opening::OpeningEngine`, `Outgoing::encode` | `channel_opening` |
 | `tatami::json::Value`, `tatami::text::{escape_bytes, quoted}` | `json_values` |
 | `tatami::server::observe::{Encoder, observation_record, summary_record, rfc3339}` | `observation_records` |
@@ -167,7 +186,7 @@ than truncated JSON.
 ## Seeds, corpora and artifacts
 
 `fuzz/<ws>/seeds/<target>/` holds small, individually named regression and
-deep-state fixtures (268 files, ~1.3 MB, including one 65 536-byte maximum
+deep-state fixtures (432 files across 18 targets, ~2 MB, including one 65 536-byte maximum
 packet). Provenance: hand-constructed from RFC layouts by the harness authors;
 the wire-core set is regenerable with `fuzz/wire-core/seeds/generate_seeds.py`.
 No traffic captures, keys or credentials. Seeds named `regression_*` come from
@@ -198,7 +217,8 @@ On a crash, timeout or oracle failure libFuzzer writes an artifact under
 | `OpeningEngine::cancel` with `max_tombstones == 0` kept one tombstone (evict-before-push), so a late reply to the last cancelled number was `LateReply` instead of `UnknownRecipient` | production | Fixed (push then trim); regression test `zero_tombstones_forgets_cancelled_numbers_immediately`; seed `channel_opening/regression_zero_tombstones_late_reply` |
 | `packet_ref::max_packet_length` underflowed for cap 0 in the `tcp_initial_packets` reference | harness | Fixed with `checked_sub` |
 | Probe driver reported a write-phase deadline as `RunEnd::Io` while the listener reported the same case as `TimedOut` | production (adapter) | Unified to `RunEnd::TimedOut`; the write path now recomputes its timeout between partial writes; scripted I/O tests cover both |
-| `handle_open_confirmation` does not reject a peer `sender_channel` already in use by another established channel | observation | Modelled as-is; recorded as a follow-up for the connection engine, not changed this round (no new lifecycle semantics) |
+| `handle_open_confirmation` did not reject a peer `sender_channel` already in use by another live channel | production (round-3 observation, fixed round 4) | `locate_reply`/`consume_reply` split; `DuplicatePeerNumber` rejected before any state change for live and late confirmations (tombstone kept); four regressions; the fuzz model now derives peer-number liveness from its own sets (`peer_number_live`) and asserts the invariant independently; seed `regression_duplicate_peer_number_on_confirmation` |
+| Round-4 harness bugs (all fixed, none production): `wire_kex_codecs` expected the lazy EXT_INFO iterator to stop before yielding its terminal error; `tcp_gcm_packets` seeded a counter at `u64::MAX` in the general path; `tcp_handshake` model omitted that `kexinit_was_first_packet` is recorded before the KEXINIT body decodes (minimized input kept as `seeds/tcp_handshake/regression_malformed_kexinit_first_recorded`); `handshake_report_json` assumed optional keys are absent rather than `null` | harness | Fixed; oracle sabotage checks (little-endian assembler, mpint sign-byte rule, mixed strict spellings) each made replay fail as intended |
 
 ## Deterministic host I/O tests
 
@@ -220,6 +240,19 @@ and none of this validates constant-time behaviour (there is no
 cryptography yet). No `adapter_events` fuzz target was added: the scripted
 seam is exercised by enumerated scenarios whose oracles are exact expected
 timelines, which a mutation engine adds little to.
+
+## QUIC diagnostic adapter
+
+The QUIC/TLS handshake experiment (`tatami-quic` `diag`, behind
+`quinn-backend`) is exercised by deterministic in-memory endpoint pairs
+(`inmem::Pair`: two sans-I/O cores exchanging datagrams through `Vec` queues
+under a virtual clock) and by loopback UDP tests: matching handshake,
+wrong pin, ALPN mismatch, no listener (timeout), Retry/validation, the
+exporter equality/inequality matrix and the raw-public-key path. No
+libFuzzer target wraps it: the state that Tatami owns is a thin driver over
+quinn-proto, and a mutation campaign over TLS records would be fuzzing the
+upstream stack, which this project does not claim to do. Tatami's own
+adapter states, deadlines and limits are covered by the enumerated tests.
 
 ## CI policy
 
@@ -259,8 +292,8 @@ Four different kinds of evidence, none substituting for another:
 ## Execution evidence (development machine)
 
 Host: Fedora, `rustc 1.98.1` via `RUSTC_BOOTSTRAP=1`, cargo-fuzz 0.13.1,
-sanitizer `none`, `-seed=1`. `scripts/fuzz.sh smoke 20` after building and
-replaying all 268 seeds:
+sanitizer `none`, `-seed=1`. Round 3: `scripts/fuzz.sh smoke 20` after
+building and replaying all 268 seeds:
 
 | Target | 20 s execs | exec/s | cov | ft | corpus | crashes |
 |---|---|---|---|---|---|---|
@@ -277,10 +310,26 @@ replaying all 268 seeds:
 | tcp_observer | 34 431 | 1 639 | 1471 | 3866 | 564 | 0 |
 | tcp_probe | 20 986 | 999 | 1533 | 4702 | 637 | 0 |
 
-Each target was additionally run for 60 s (and the five TCP targets for a
-further 150 s with `-seed=2`) by the harness authors during development with
-the same result: one production finding and one harness finding, both fixed
-above. Probe/observer throughput is bounded by libFuzzer comparison tracing
+Round 4, same host and configuration, 60 s per new target from the seeds
+(432 seeds across 18 targets now replay clean):
+
+| Target | 60 s execs | exec/s | cov | ft | corpus | crashes |
+|---|---|---|---|---|---|---|
+| wire_kex_codecs | 3 232 554 | 52 992 | 902 | 2418 | 384 | 0 |
+| key_blobs | 138 238 | 2 266 | 622 | 1198 | 195 | 0 |
+| tcp_negotiation | 1 787 993 | 29 311 | 696 | 2206 | 439 | 0 |
+| tcp_gcm_packets | 110 689 | 1 814 | 563 | 1584 | 183 | 0 |
+| tcp_handshake | 79 731 | 1 307 | 2742 | 5175 | 534 | 0 |
+| handshake_report_json | 190 479 | 3 122 | 1777 | 3743 | 542 | 0 |
+
+`tcp_handshake` additionally ran 120 s (`-seed=2`) and 150 s (`-seed=3`),
+379 k further executions, no findings. `channel_opening` ran 90 s after the
+duplicate-peer-number model change, clean.
+
+Each round-3 target was additionally run for 60 s (and the five TCP targets
+for a further 150 s with `-seed=2`) by the harness authors during development
+with the same result: one production finding and one harness finding, both
+fixed above. Probe/observer throughput is bounded by libFuzzer comparison tracing
 across three drivers plus the model, not by production code.
 
 Coverage was generated with `scripts/fuzz.sh coverage` over seeds plus the
@@ -298,6 +347,19 @@ smoke corpora and inspected with `llvm-cov show`:
   `numbers_exhaust_without_wrapping` covers it by setting the counter
   directly.
 - `observation_records`: the truncation branch was taken 605 of 1 780 times.
+- `tcp_handshake` (round 4, 897 inputs): `handshake.rs` 84.4 % lines /
+  81.5 % regions. `on_service_accept` 60 hits, `Completed` constructed 46
+  times, `ServiceMismatch` 6, NEWKEYS received 314, `HostNotTrusted` 302,
+  rekey `DISCONNECT` 32, wrong-guess discard 64, strict "KEXINIT not first"
+  16, `SignatureInvalid` 34. Misses are `Display`/`code()` helpers (covered
+  by `handshake_report_json`), padding-source trait methods production never
+  calls, the 2³² sequence-number wrap, and `expect`-guarded impossibilities.
+- `tcp_negotiation`: `negotiate.rs` 94 % of regions.
+
+`scripts/fuzz.sh coverage` now copies seeds and corpus into one input
+directory before the instrumented run: cargo-fuzz runs each directory as a
+separate process writing the same `default-<target>.profraw`, so a second
+directory used to overwrite the first profile.
 
 ASan runs and the pinned nightly were not executed locally (no rustup on the
 development machine); they run in CI. No coverage percentage is a goal in
@@ -309,8 +371,8 @@ Recorded so the next slices arrive with harnesses, not claimed as fuzzed:
 
 | Future surface | Target requirements |
 |---|---|
-| Keys, signatures, trust (`tatami-keys`, `known_hosts`/`authorized_keys` policy) | Key blob and signature blob decoders against independent layouts; SPKI→SSH conversion with algorithm/parameter validation; policy engine model with distinct host-trust vs user-authorization decisions; never a private key in a corpus |
-| Authenticated packet paths and rekey | Post-`NEWKEYS` framing with MAC/AEAD failure injection; sequence-number and rekey state model; length-before-MAC handling; must not parse ciphertext as plaintext |
+| `known_hosts`/`authorized_keys` policy, RSA/ECDSA/certificate blobs | Policy engine model with distinct host-trust vs user-authorization decisions; further blob layouts; never a private key in a corpus (Ed25519 blobs, signatures, fingerprints and the pinned policy are covered by `key_blobs`) |
+| Rekeying and general sessions | Rekey state model (second exchange hash distinct from the session id), sequence-number and counter behaviour across re-keys, key-usage limits; the diagnostic currently refuses rekey and is fuzzed only for that refusal |
 | Userauth (`tatami-auth`) | Method state machines with a model of allowed transitions; signature-input construction against hand-assembled bytes; session-identifier provenance preserved |
 | QUIC stream association and flow control | Association registry model (stream IDs vs SSH numbers), pending/refused stream reclamation, SSH-window vs QUIC-credit separation; only after the record format (AQ-018) exists |
 | SFTP | Path canonicalisation, handle lifetime per session, directory-dependency ordering across streams; only after the transport exists |

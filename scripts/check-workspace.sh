@@ -60,8 +60,28 @@ for crate in tatami-tcp tatami-quic; do
     step cargo check -p "$crate" --no-default-features --features std
 done
 
+# Portable crypto profile (round 4): must not pull std. The graph check
+# tolerates only the `semver` edge, which is curve25519-dalek's build script.
+step cargo check -p tatami-keys --no-default-features --features ed25519
+step cargo check -p tatami-tcp --no-default-features --features kex
+step cargo check -p tatami-tcp --no-default-features --features std,kex
+printf '\n==> verify the kex feature graph enables no std feature\n'
+if cargo tree -p tatami-tcp --no-default-features --features kex -e features -f '{p} {f}' \
+    | grep -E 'feature "std"' | grep -v semver; then
+    echo "error: a std feature is enabled in the portable kex graph" >&2
+    exit 1
+fi
+
+# Host-only QUIC diagnostic backend (needs a C compiler for ring).
+step cargo check -p tatami-quic --no-default-features --features quinn-backend
+printf '\n==> verify the QUIC backend is absent without its feature\n'
+if cargo tree -p tatami-quic --no-default-features --features std -e normal | grep -qE 'quinn|rustls|ring'; then
+    echo "error: QUIC backend crates present without quinn-backend" >&2
+    exit 1
+fi
+
 # Facade feature matrix from docs/architecture.md.
-for features in "" std tcp quic tcp,quic std,tcp std,quic std,tcp,quic; do
+for features in "" std tcp quic tcp,quic std,tcp std,quic std,tcp,quic kex std,tcp,kex quic-diag quic-diag,tcp std,tcp,kex,quic-diag; do
     if [ -z "$features" ]; then
         step cargo check -p tatami --no-default-features
     else
@@ -72,6 +92,8 @@ done
 # Binaries exist only with std,tcp; cargo skips them otherwise. Build them
 # explicitly so a broken bin cannot hide behind required-features.
 step cargo build -p tatami --no-default-features --features std,tcp --bins
+step cargo build -p tatami --no-default-features --features std,tcp,kex --bins
+step cargo build -p tatami --no-default-features --features quic-diag --bins
 
 step cargo test --workspace --all-features
 step env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
@@ -87,6 +109,10 @@ if [ "$run_embedded" -eq 1 ]; then
         step cargo check -p tatami-wire --no-default-features --target "$EMBEDDED_TARGET"
         step cargo check -p tatami-wire --no-default-features --features alloc --target "$EMBEDDED_TARGET"
         step cargo check -p tatami --no-default-features --features tcp,quic --target "$EMBEDDED_TARGET"
+        # Portable crypto profile on a target with no std at all.
+        step cargo check -p tatami-keys --no-default-features --features ed25519 --target "$EMBEDDED_TARGET"
+        step cargo check -p tatami-tcp --no-default-features --features kex --target "$EMBEDDED_TARGET"
+        step cargo check -p tatami --no-default-features --features kex --target "$EMBEDDED_TARGET"
     elif [ "${CHECK_EMBEDDED_REQUIRED:-0}" = 1 ]; then
         echo "error: target $EMBEDDED_TARGET is not installed" >&2
         exit 1

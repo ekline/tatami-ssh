@@ -2,9 +2,10 @@
 //!
 //! This module owns everything the portable modules must not: name
 //! resolution, connecting, accepting, blocking reads and writes, OS
-//! deadlines, bounded concurrency and socket cleanup. It drives the
-//! portable [`Probe`] state machine (client side) and, through
-//! [`listener`], the portable observer (server side).
+//! deadlines, OS entropy, bounded concurrency and socket cleanup. It drives
+//! the portable [`Probe`] state machine (client side), through [`listener`]
+//! the portable observer (server side) and, with the `kex` feature, through
+//! [`handshake`] the portable client key-exchange state machine.
 //!
 //! # Deadlines
 //!
@@ -51,6 +52,8 @@ use std::vec::Vec;
 
 use crate::probe::{Probe, ProbeConfig, ProbeEnd, ProbeEvent, Stage, Step};
 
+#[cfg(feature = "kex")]
+pub mod handshake;
 pub mod listener;
 mod seam;
 
@@ -307,7 +310,7 @@ fn drive<C: Conn, K: Clock>(
     }
 }
 
-fn is_timeout(e: &io::Error) -> bool {
+pub(crate) fn is_timeout(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut

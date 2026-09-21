@@ -1,15 +1,36 @@
-# QUIC observer readiness
+# QUIC observer readiness: status and corrections
 
-Status: proposal for a later backend milestone, 2026-09-20. Nothing here is
-implemented, no dependency is added, and every QUIC/TLS choice below is a
-*candidate* until the checkpoint ledger records it (P-03–P-08, AQ-015,
-AQ-018–AQ-023, AQ-026). `tatami-quic` remains documentation-only.
+Status: round 4, 2026-09-20. Observer **(a)** below — the TLS/QUIC handshake
+observer — is **implemented** as `tatami-quic::diag` behind the
+`quinn-backend` feature (W-31), with the `tatami-quic-server observe` and
+`tatami-quic-client handshake` binaries behind the facade feature
+`quic-diag`. Observer **(b)** — the SSH-over-QUIC observer — is **not
+started**; every mapping question it depends on remains open (P-03–P-05,
+AQ-015, AQ-018–AQ-023, AQ-026). Sections 1 and 2 are kept as written in
+round 3 because they still hold; §3 records the decision, §4 the corrections
+learned by compiling and testing against the backend, §5 what (b) requires.
 
-Delivered this round: the **TCP** server-side observer (sends
-`SSH-2.0-tatami_observer_0.1.0`, records the client identification and the
-client `KEXINIT`, sends no server `KEXINIT`). **There is no `--quic` option;
-none appears to work, and none should be added until a backend milestone
-exists.**
+## 0. What was built (evidence)
+
+| Claim | Evidence |
+|---|---|
+| Backend: `quinn-proto` 0.11.18 (`rustls-ring`, `ring`), `rustls` 0.23.45 (`ring`, `std`, `tls12`), `rcgen` 0.13.2 for test identities; MSRV stays 1.85 | `crates/tatami-quic/Cargo.toml`, `crypto-provider-audit.md`, `cargo tree -p tatami-quic --features quinn-backend` |
+| Sans-I/O cores (`ServerCore`, `ClientCore`) driven by a blocking UDP loop; no async runtime | `crates/tatami-quic/src/diag/{server,client,udp}.rs` |
+| Full handshake completes on both ends; offered vs negotiated ALPN and SNI consistent; exporter available after completion | `tests/inmem_handshake.rs::matching_identity_and_alpn_completes_on_both_sides`, `tests/loopback.rs::matching_handshake_over_loopback`, `tatami/tests/quic_cli.rs::end_to_end_handshake_with_pin_and_exporter_probe` |
+| Wrong certificate pin fails at the client with `certificate_unknown` (alert 46 via rustls `CertificateError::Other`); the server records `Failed`, `ConnectionLost`, still with the offered ClientHello and the negotiated ALPN | `tests/inmem_handshake.rs::wrong_pin_fails_with_certificate_error_on_both_sides`, `tests/loopback.rs::wrong_identity_over_loopback` |
+| ALPN mismatch fails with `no_application_protocol` (alert 120, "peer doesn't support any known protocol") | `tests/inmem_handshake.rs::alpn_mismatch_fails_with_no_application_protocol`, `tests/loopback.rs::wrong_alpn_over_loopback` |
+| No listener → `TimedOut` at the client deadline, `datagrams_received == 0` | `tests/loopback.rs::no_listener_times_out_within_the_deadline`, `tests/inmem_handshake.rs::client_into_blackhole_times_out_at_its_deadline` |
+| `require_validation` → one Retry, two `Incoming`, accepted connection reports `peer_address_validated: true`, `validation_method: retry_token` | `tests/loopback.rs::require_validation_sends_retry_and_reports_validated_peer`, `tatami/tests/quic_cli.rs::require_validation_is_visible_in_records` |
+| Exporter: fails before completion (buffer untouched), equal at both ends, differs by label, context, length and connection | `tests/exporter.rs` |
+| RFC 7250 raw public keys work end to end; `peer_identity()` is the 44-byte SPKI DER; wrong SPKI pin fails; no silent downgrade in either direction; three fingerprints of one Ed25519 key differ | `tests/rpk.rs` |
+| No SSH byte on the wire: every captured datagram checked for `SSH-` | `tests/inmem_handshake.rs::assert_no_ssh_bytes` |
+| 0-RTT never attempted (`zero_rtt_attempted: false` both ends) | `tests/inmem_handshake.rs` |
+
+All of the above passed on the development machine on 2026-09-20
+(`cargo test -p tatami-quic --features quinn-backend`; `cargo test -p tatami
+--features quic-diag --test quic_cli`). This is a loopback experiment with
+Tatami on both ends; **no interoperability with any other QUIC or TLS
+implementation is claimed**, and the ALPN value is unregistered.
 
 ## 1. What comes before any SSH byte over QUIC
 
@@ -49,14 +70,19 @@ Consequences that are fixed regardless of backend:
 | Must not | Reply on UDP outside the backend; treat Initial source as peer. | Inherit TCP packet framing (`tatami-tcp::packet` is the TCP envelope, W-12), or manufacture an SSH KEX / session ID. The QUIC record rule is AQ-018 and is unwritten. |
 | Prerequisite | A backend that compiles under an explicit `std`-enabling feature. | (a) plus the mapping decisions above. |
 
-Observer (a) is the proposed next QUIC slice. Observer (b) is blocked on
-design work, not on code.
+Observer (a) is implemented (§0). Observer (b) is blocked on design work,
+not on code (§5).
 
-## 3. Backend audit
+## 3. Backend audit and decision
 
-Facts below were read on 2026-09-20 from the linked primary sources.
-"Unverified" means the source was not fetched in this pass, not that the
-feature is absent. Project MSRV is 1.85 (W-07).
+**Decision (W-31):** `quinn-proto` + `rustls` on `ring`, selected after
+compiling and testing the exact releases in §0. The reasons in §3.1 held;
+the "unverified" items for that column are now verified and, where the
+round-3 expectation was wrong, corrected in §4. The other columns were not
+re-audited and remain as read on 2026-09-20 from the linked sources
+("Unverified" means the source was not fetched, not that the feature is
+absent). Project MSRV is 1.85 (W-07); `quinn-proto` 0.11.18 declares 1.85 and
+is pinned by `Cargo.lock`, so the MSRV-drift blocker is contained, not gone.
 
 | Property | quinn / quinn-proto (+ rustls) | quiche (Cloudflare) | s2n-quic (AWS) | neqo (Mozilla) | msquic (Microsoft) |
 |---|---|---|---|---|---|
@@ -70,64 +96,88 @@ feature is absent. Project MSRV is 1.85 (W-07).
 | TLS exporter (RFC 5705 / RFC 8446 §7.5) | `Session::export_keying_material(output, label, context)` ([trait](https://docs.rs/quinn-proto/latest/quinn_proto/crypto/trait.Session.html)); rustls `ConnectionCommon::export_keying_material` "does not use the early exporter" and fails before handshake completion. | Not on `Connection`; `AsMut<SslRef>` (feature `boringssl-boring-crate`) may reach BoringSSL's exporter — unverified. | `on_tls_exporter_ready` event exists; the accessor it provides is unverified. | Unverified. | Unverified. |
 | Feature isolation | Yes: `quinn-proto` with `default-features = false`, `rustls-ring` or `rustls-aws-lc-rs` chosen explicitly ([quinn-proto/Cargo.toml](https://raw.githubusercontent.com/quinn-rs/quinn/main/quinn-proto/Cargo.toml)); can sit behind `tatami-quic` feature `backend-quinn = ["std", …]`. | Yes in principle, but the BoringSSL build (cmake, C++ toolchain) is heavy and MSRV 1.88 already exceeds the project's. | Feature-gated, but tokio is unconditional and MSRV 1.92 exceeds the project's. | Git-only dependency plus NSS build; hard to isolate reproducibly (W-08 lockfile). | FFI + cmake; isolatable but pulls a C toolchain and vendor TLS. |
 
-## 4. Recommendation (proposed, not decided)
+### 3.1 Why this backend (confirmed)
 
-Try **`quinn-proto` + rustls** first for observer (a), for these reasons:
+1. Its current release matches MSRV 1.85 and its core is sans-I/O, so no
+   async runtime is committed (W-14) and the blocking, deadline-driven
+   adapter style of `tatami-tcp::io` is reused. The `quinn` convenience
+   crate is not used; it drags in tokio.
+2. Address validation is first-class: an `Incoming` exists *before* any
+   handshake state; `remote_address_validated()` and `may_retry()` are
+   recorded, then `Endpoint::retry`/`accept`/`refuse`. Every datagram on the
+   wire is a `Transmit` produced by the library, so anti-amplification (3×,
+   RFC 9000 §8.1) and Retry-token integrity stay inside quinn-proto.
+3. rustls exposes the offered ClientHello through `ResolvesServerCert`, the
+   negotiated result through `HandshakeData`, supports RFC 7250 raw public
+   keys, and provides the RFC 8446 §7.5 exporter.
 
-1. It is the only candidate whose current release matches MSRV 1.85 and
-   whose core is sans-IO. That matches W-14 (no async runtime commitment) and
-   lets the observer reuse the blocking, per-phase-deadline adapter style of
-   `tatami-tcp::io`. Note the `quinn` convenience crate is *not* proposed; it
-   drags in tokio.
-2. Address validation is first-class: the observer receives an `Incoming`
-   *before* any handshake state exists and can record
-   `remote_address_validated()` and `may_retry()`, then call
-   `Endpoint::retry` (if `may_retry()`), `accept`, `refuse` or `ignore`. All
-   datagrams come from `Transmit` values produced by the library, so
-   anti-amplification and Retry token integrity stay inside quinn-proto.
-3. rustls exposes both the offered ClientHello (`server::ClientHello`) and
-   the negotiated result, supports RFC 7250 raw public keys (P-06 candidate),
-   and provides the RFC 8446 §7.5 exporter needed later by P-04.
+## 4. Corrections learned in implementation
 
-### Telemetry the candidate exposes (observer (a) report fields)
+Each row replaces a round-3 expectation. "Handled" says what the code does
+about it.
+
+| # | Round-3 expectation | What the backend actually does | Handled |
+|---|---|---|---|
+| 1 | ALPN mismatch would surface as a failed `Connection` with `HandshakeData.protocol == None`. | rustls rejects the ClientHello while `Endpoint::accept` is processing it; `accept` returns `AcceptError { cause, response }` and **no `Connection` ever exists**. The `ResolvesServerCert` hook has already run, so the *offered* list is still captured. Error text: `error 120` / "peer doesn't support any known protocol". | Distinct outcome `HandshakeOutcome::AcceptFailed { reason }` carrying the offered ClientHello; the library's optional `response` transmit is sent unchanged; `stats.observed` is not incremented. |
+| 2 | Version Negotiation might be reported to the caller; "verify during the spike". | It is not. `quinn-proto` 0.11 answers an unsupported version itself and exposes neither a VN event nor the negotiated version. | Endpoint is v1-only (`EndpointConfig::supported_versions([1])`); `quic_version = 1` is reported *by construction*; VN responses are counted by classifying our **own** outgoing endpoint datagrams (long header, version `0x00000000`) as `EndpointResponse::VersionNegotiation`. |
+| 3 | "Validated" could be treated as one boolean. | Three different facts: `remote_address_validated()` (address), `may_retry()`/Retry sent (mechanism), and TLS identity. quinn-proto also validates via NEW_TOKEN tokens, but only when its `bloom` feature is on (default `ValidationTokenConfig::sent` is 2 with `bloom`, **0 without**); this workspace enables only `ring,rustls-ring`, so **no NEW_TOKEN frame is ever sent** and, without Retry, the peer is never validated before the handshake. | `validation_method` ∈ {`none`, `retry_token`, `validation_token`} derived from `(validated, may_retry)`; `validation_token` would indicate a token from elsewhere. Reports label the source "unvalidated" until Retry. Validation says nothing about identity; identity is the pin. |
+| 4 | "No 0-RTT work" was assumed to mean nothing to do. | quinn-proto's convenience constructors enable early data: `ServerConfig::with_single_cert` sets `max_early_data_size = u32::MAX` and `QuicClientConfig::new` / `with_platform_verifier` set `enable_early_data = true` (`crypto/rustls.rs`). Only the `TryFrom<rustls::*Config>` conversions keep what the caller set; rustls clients also resume by default. | Both rustls configs are built directly and converted with `TryFrom`: server `max_early_data_size = 0`, `send_tls13_tickets = 0`; client `enable_early_data = false`, `Resumption::disabled()`; nothing calls `into_0rtt`/`accept_0rtt`; `zero_rtt_attempted` reported and asserted `false`. |
+| 5 | `HandshakeData` is read at `Event::Connected`. | On the **server** it is available from `Event::HandshakeDataReady` (after the ClientHello is processed) and therefore also for handshakes that later fail, e.g. wrong pin: the server still reports the negotiated ALPN. On the **client**, ALPN arrives in EncryptedExtensions *before* the server is authenticated. | Server reads at `HandshakeDataReady` and again at `Connected`; client reads only at `Connected` so unauthenticated values are never reported as negotiated. |
+| 6 | Client timeout is just a deadline. | Two paths: the local deadline (idle timeout equals the handshake deadline) and `ConnectionError::TimedOut` from the library. Any other `ConnectionLost` reason is a failure, not a timeout. | Both map to `HandshakeResult::TimedOut`; `close_reason` distinguishes `local_close_handshake_deadline` from the library's reason text. |
+| 7 | Initial DCIDs are "8 bytes or so". | quinn-proto clients use `RandomConnectionIdGenerator::new(MAX_CID_SIZE)` — **20-byte** initial destination CIDs by default (RFC 9000 §7.2 requires ≥ 8). | `orig_dst_cid` is reported as hex and tested for 8–20 bytes; it identifies the *attempt*, not the peer. |
+| 8 | A pin mismatch would render as a readable rustls error. | rustls maps `CertificateError::Other` to the `certificate_unknown` alert (46) and renders the inner error with `Debug`, not `Display`. | `PinMismatch` implements `Debug` by delegating to `Display`, so both ends see "presented certificate/raw public key does not match the configured SHA-256 pin"; the server sees the crypto error code (`0x100 + alert`) with the client's reason phrase. |
+
+Also confirmed: the offered ClientHello values (SNI, ALPN list, cipher
+suites, signature schemes, named groups, certificate types) are recorded
+through the recording resolver with exact per-connection correlation
+(single-threaded core, slot drained after every call into quinn-proto);
+they are **untrusted peer metadata**. Path change remains observable only
+coarsely (no migration event in 0.11) and is not exercised.
+
+### Telemetry observer (a) reports today
 
 | Field | Source | Caveat |
 |---|---|---|
-| Datagram source address | `Endpoint::handle(now, remote, …)` | Report as "source address (unvalidated)" until validated. |
-| Original destination CID | `Incoming::orig_dst_cid()` | Identifies the attempt, not the peer. |
-| Address validated? / Retry permitted? / Retry sent? | `Incoming::remote_address_validated()`, `may_retry()`, result of `Endpoint::retry` | Validation via Retry means the client proved it can receive at that address, nothing more (RFC 9000 §8.1). |
-| Version handling | quinn-proto answers unsupported versions itself; the observer sees only the resulting `DatagramEvent` | Version Negotiation packets are not surfaced as an event; count them as "no `Incoming` produced" — verify during implementation. |
-| Offered ALPN list, SNI, cipher suites, signature schemes, named groups, certificate types | rustls `ClientHello` in a custom `ResolvesServerCert` | Wiring path through quinn-proto unverified; fallback is negotiated-only data. |
-| Negotiated ALPN, SNI | `HandshakeData` after `Event::HandshakeDataReady` | `protocol` is `None` if no ALPN matched; RFC 9001 §8.1 makes that a handshake failure in practice. |
-| Handshake outcome | `Event::Connected` or `Event::ConnectionLost { reason }` | Record the `ConnectionError` verbatim. |
-| Peer identity | `Session::peer_identity()` (rustls: certificate chain or raw public key) | Observer records; it does not decide trust (contract §2.2 item 7). |
-| Exporter available | `Session::export_keying_material` succeeds only after handshake | Observer (a) may confirm availability with a throwaway label; it must not persist output or call it a session binding (P-04 open). |
-| Path change | `Connection::remote_address()` changes between polls | No event in 0.11; migration is C-04 priority but only observable coarsely here. |
+| Source address, local address | `Endpoint::handle(now, remote, …)` | "Unvalidated" until Retry. |
+| `orig_dst_cid` | `Incoming::orig_dst_cid()` | Attempt identifier, up to 20 bytes. |
+| `peer_address_validated`, `may_retry`, `retry_sent`, `validation_method` | `Incoming` accessors, `Endpoint::retry` | Reachability, not identity (§4 row 3). |
+| `quic_version` | By construction (v1 only) | VN counted from our own datagrams (§4 row 2). |
+| `offered {server_name, alpn, cipher_suites, signature_schemes, named_groups, server_cert_types, hellos_seen}` | rustls `ClientHello` via `RecordingResolver` | Peer-supplied; bounded to 32 entries; rendered escaped. |
+| `negotiated_alpn`, `sni` | `HandshakeData` at `HandshakeDataReady` (server) / `Connected` (client) | §4 row 5. |
+| `outcome`: `completed` / `failed {reason}` / `timed_out` / `accept_failed {reason}` / `shutdown` | `Event::Connected`, `Event::ConnectionLost`, `AcceptError`, deadline | `ConnectionError` text recorded verbatim, peer phrases escaped. |
+| `exporter {available, len}` (client, `--exporter-probe`) | `Session::export_keying_material` after `Connected` | Output discarded; experimental label; **not** a session binding (P-04). |
+| `zero_rtt_attempted`, `unexpected_streams`, `unexpected_datagrams` | Events counted and ignored | Always 0 in tests. |
+| Certificate SHA-256 (server start), pin outcome (client) | `TestIdentity`, `PinnedCertificateVerifier` | Certificate fingerprint, not an SSH host-key fingerprint. |
 
-Not observed by design: 0-RTT, stream data, SSH identification, `KEXINIT`.
+Not observed by design: stream data, SSH identification, `KEXINIT`,
+migration.
 
-## 5. Unresolved blockers
+## 5. Observer (b): not started, and what it requires
 
-| Blocker | Why it matters | Owner / reference |
+| Requirement | Reference | State |
 |---|---|---|
-| `std` in `tatami-quic` | quinn-proto needs `std`; the backend must live behind an explicit feature that enables `std`, never in shared protocol code (`architecture.md` portability). Confirm the `thumbv7em-none-eabi` check still passes with the feature off. | W-02, W-09 |
-| MSRV drift | quinn `main` already requires 1.88; the next quinn-proto minor will exceed 1.85. Either pin `0.11.x` or raise the workspace MSRV deliberately (W-07 change). | W-07 |
-| Crypto provider choice | `rustls-ring` vs `rustls-aws-lc-rs` is a provider decision the project has not made; it also interacts with the later SSH algorithm audit (`specification-inventory.md` §5). | C-07, provider audit |
-| Offered-ALPN wiring | `ResolvesServerCert`/`ClientHello` inside quinn-proto's `ServerConfig` is unverified. | implementation spike |
-| Identity for the handshake | Even observer (a) must present something; a generated RPK or self-signed certificate is test material, not P-06. | P-06 |
-| ALPN value | Experimental, configurable; no registration. Absence is not a valid deployment (checkpoint §4.1). | AQ-019 / P-08 |
-| Version Negotiation visibility | Whether quinn-proto reports VN to the caller needs checking during the spike. | implementation spike |
-| Observer (b) design | Identification placement, control-stream association, record rule. Cannot start until AQ-015, AQ-018, AQ-020–AQ-023, AQ-026 have proposals. | checkpoint §1.3 |
-| Second-opinion backend | quiche is the natural comparison (sans-IO, Cloudflare interop history) once MSRV 1.88 is acceptable; s2n-quic's event model is richer but tokio-bound and MSRV 1.92. | later milestone |
+| Where the client and server identification strings go (control stream? first bytes? both directions?) and their canonical encoding for any binding | P-05, AQ-020–AQ-023 | open |
+| Control-stream bootstrap: initiator, direction, recognition, first record | P-03, AQ-015 | open |
+| Bounded enclosing record rule on QUIC streams (TCP's binary packet is **not** inherited, W-12) | P-02, AQ-018 | open |
+| Session-binding construction from the exporter (label, context, length, transcript inputs, identification strings) and its proof of authentication | P-04, AQ-003, AQ-024 | exporter *availability* shown; construction open |
+| Host identity: SPKI ↔ SSH key mapping and the fingerprint an operator pins | P-06 | RPK handshake shown; mapping open (three fingerprints differ) |
+| Channel-opening placement and stream association | AQ-026, AQ-001, AQ-004 | open |
+| ALPN value | AQ-019, P-08 | experimental `tatami-diag/0`; unregistered |
+| Interoperability partner other than Tatami itself | — | none |
 
-## 6. Staged delivery
+Until these have recorded proposals in the checkpoint, no SSH byte is sent
+over QUIC and no `--quic` option exists on `tatami-client`/`tatami-server`.
+The `tatami-quic-*` binaries state in their usage text that they are not SSH
+clients or servers (W-16 spirit: a stub must never look like a running
+service).
 
-| Stage | Content | State |
-|---|---|---|
-| This round | TCP observer: identification exchange and client `KEXINIT` capture over TCP. | implemented (see `architecture.md`) |
-| Next QUIC slice (proposed) | Observer (a) behind `tatami-quic` feature `backend-quinn`, reporting the §4 fields; loopback test with a real QUIC client library; no SSH bytes. | designed here; not scheduled |
-| Later | Observer (b) once the mapping questions are answered; then bootstrap, exporter binding and userauth over QUIC (checkpoint §5 items 3–4). | blocked on design |
+## 6. Remaining blockers
 
-No `--quic` flag, feature or module exists today. Adding one before stage
-two would advertise capability the workspace does not have (W-16 spirit: a
-stub must never look like a running server).
+| Blocker | Status |
+|---|---|
+| `std` in `tatami-quic` | Resolved as designed: `quinn-backend` enables `std`; `check-workspace.sh` verifies the backend is absent without the feature and that portable builds still pass. |
+| MSRV drift | Contained: `quinn-proto` pinned to 0.11.18 by `Cargo.lock`; 0.12 requires 1.88. Raising MSRV is a W-07 change. |
+| Crypto provider | `ring` selected for the experiment (W-31); the SSH side uses the pure-Rust set (W-29). Not unified, deliberately. |
+| Identity | rcgen test identities only; P-06 open. |
+| Second-opinion backend | Not done; quiche when MSRV 1.88 is acceptable. |
+| Observer (b) | Blocked on §5. |

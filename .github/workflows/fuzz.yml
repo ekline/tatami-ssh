@@ -53,10 +53,18 @@ jobs:
           set -eu
           rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal \
             --component rustfmt,clippy,llvm-tools-preview
-          # Explicitly pinned; never changes the default toolchain.
-          rustup run "$FUZZ_NIGHTLY" cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
-          rustup run "$FUZZ_NIGHTLY" cargo fuzz --version
-          rustup run "$FUZZ_NIGHTLY" rustc --version
+          rustup toolchain install stable --profile minimal
+          # cargo-fuzz is BUILT with stable and RUN under the nightly.
+          # Its locked dependency rustix 0.36.5 has a build script that
+          # detects a nightly compiler and enables `#[rustc_layout_scalar_
+          # valid_range_*]`, which 2026 nightlies reject (exit 101 at this
+          # step in run 35544196809). cargo-fuzz only needs the nightly for
+          # the *target* builds it spawns, and it inherits RUSTUP_TOOLCHAIN
+          # from `rustup run`. Neither install changes the default toolchain.
+          rustup run stable cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+          echo "cargo-fuzz: $(rustup run "$FUZZ_NIGHTLY" cargo fuzz --version)"
+          echo "nightly rustc: $(rustup run "$FUZZ_NIGHTLY" rustc --version)"
+          echo "stable rustc (builds cargo-fuzz only): $(rustup run stable rustc --version)"
 
       - name: Cache fuzz build directories
         uses: actions/cache@v4
@@ -105,15 +113,32 @@ jobs:
             *) secs="$FUZZ_PR_SECONDS" ;;
           esac
           seed=${{ github.run_id }}
-          echo "campaign: ${secs}s per target, libFuzzer -seed=$seed"
+          {
+            echo "## Fuzz campaign"
+            echo "- compiler: $(rustup run "$FUZZ_NIGHTLY" rustc --version)"
+            echo "- cargo-fuzz: $(rustup run "$FUZZ_NIGHTLY" cargo fuzz --version)"
+            echo "- sanitizer: address"
+            echo "- seconds per target: $secs; libFuzzer -seed=$seed"
+            echo "- per-input timeout: ${FUZZ_TIMEOUT_SECS:-2}s; rss limit: ${FUZZ_RSS_LIMIT_MB:-1024} MiB"
+            echo
+            echo "| target | workspace | status |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
           status=0
-          for t in $(scripts/fuzz.sh list | awk '{print $1}'); do
-            echo "==> $t"
-            if ! scripts/fuzz.sh run "$t" -- -max_total_time="$secs" -seed="$seed" -print_final_stats=1; then
+          scripts/fuzz.sh list | while read -r t ws _; do
+            echo "==> $t ($ws)"
+            if scripts/fuzz.sh run "$t" -- -max_total_time="$secs" -seed="$seed" -print_final_stats=1; then
+              echo "| $t | $ws | ok |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $t | $ws | FAILED |" >> "$GITHUB_STEP_SUMMARY"
               echo "::error::target $t failed"
-              status=1
+              echo "$t" >> failed-targets.txt
             fi
           done
+          if [ -s failed-targets.txt ]; then
+            echo "failed targets:"; cat failed-targets.txt
+            status=1
+          fi
           exit $status
 
       - name: Minimize corpora
@@ -126,6 +151,10 @@ jobs:
             [ -d "fuzz/$ws/corpus/$t" ] || continue
             rustup run "$FUZZ_NIGHTLY" cargo fuzz cmin --fuzz-dir "fuzz/$ws" "$t" "fuzz/$ws/corpus/$t" || true
           done
+
+      - name: Ensure corpus directories exist for the cache step
+        if: github.event_name != 'pull_request' && always()
+        run: mkdir -p fuzz/wire-core/corpus fuzz/protocol/corpus
 
       - name: Save evolved corpora
         if: github.event_name != 'pull_request' && always()

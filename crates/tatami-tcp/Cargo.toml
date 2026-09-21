@@ -10,12 +10,31 @@ publish.workspace = true
 
 [features]
 default = []
-# Exposes the `io` module: OS socket and runtime adapters. Portable binding
-# state does not require this feature.
-std = []
+# Exposes the `io` module: OS socket and runtime adapters, plus OS entropy.
+# Portable binding state does not require this feature.
+std = ["dep:getrandom"]
+# Portable key exchange and packet protection for the first interoperability
+# profile (curve25519-sha256, ssh-ed25519, aes128-gcm@openssh.com). Pure
+# Rust, no_std + alloc. See docs/crypto-provider-audit.md.
+kex = [
+    "dep:x25519-dalek",
+    "dep:sha2",
+    "dep:aes-gcm",
+    "dep:rand_core",
+    "dep:zeroize",
+    "dep:subtle",
+    "tatami-keys/ed25519",
+]
 
 [dependencies]
 tatami-wire = { workspace = true, features = ["alloc"] }
 tatami-keys = { workspace = true }
 tatami-auth = { workspace = true }
 tatami-connection = { workspace = true }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["zeroize", "static_secrets"], optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"], optional = true }
+rand_core = { version = "0.6.4", default-features = false, optional = true }
+zeroize = { version = "1.9.0", default-features = false, features = ["zeroize_derive"], optional = true }
+subtle = { version = "2.6.1", default-features = false, optional = true }
+getrandom = { version = "0.2.17", default-features = false, optional = true }

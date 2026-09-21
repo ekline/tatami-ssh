@@ -153,7 +153,7 @@ const SUMMARY_KEYS: [&str; 12] = [
     "error",
 ];
 
-const NAMES: [&str; 32] = [
+const NAMES: [&str; 34] = [
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
     "ecdh-sha2-nistp256",
@@ -186,6 +186,8 @@ const NAMES: [&str; 32] = [
     "back\\slash",
     "ctrl\u{1}char\u{1f}",
     "über-\u{1F600}",
+    "kex-strict-c",
+    "kex-strict-s",
 ];
 
 const LIST_NAMES: [&str; 8] = [

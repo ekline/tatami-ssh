@@ -1,8 +1,16 @@
 //! SSH message numbers used by this workspace.
 //!
 //! Values are from the IANA "SSH Protocol Parameters" registry as assigned by
-//! RFC 4253 §12, RFC 4254 §9 and RFC 8308 §2.3. Only numbers with a consumer
-//! in the workspace are listed; add others as codecs arrive.
+//! RFC 4253 §12, RFC 4254 §9, RFC 5656 §7.1 and RFC 8308 §2.3. Only numbers
+//! with a consumer in the workspace are listed; add others as codecs arrive.
+//!
+//! Numbers 30–49 are reserved for the negotiated key-exchange method
+//! (RFC 4253 §12). The two listed here carry the names RFC 5656 gives them
+//! for the ECDH family (which RFC 8731 `curve25519-sha256` reuses); under a
+//! finite-field DH method the same numbers are `SSH_MSG_KEXDH_INIT` /
+//! `SSH_MSG_KEXDH_REPLY`. [`name`] reports the ECDH names because that is
+//! the only KEX family this workspace implements; the number alone never
+//! identifies the message.
 
 /// `SSH_MSG_DISCONNECT` (RFC 4253 §11.1).
 pub const DISCONNECT: u8 = 1;
@@ -22,6 +30,12 @@ pub const EXT_INFO: u8 = 7;
 pub const KEXINIT: u8 = 20;
 /// `SSH_MSG_NEWKEYS` (RFC 4253 §7.3).
 pub const NEWKEYS: u8 = 21;
+/// `SSH_MSG_KEX_ECDH_INIT` (RFC 5656 §7.1; RFC 8731 §3). Method-specific
+/// number 30; see the module documentation.
+pub const KEX_ECDH_INIT: u8 = 30;
+/// `SSH_MSG_KEX_ECDH_REPLY` (RFC 5656 §7.1; RFC 8731 §3). Method-specific
+/// number 31; see the module documentation.
+pub const KEX_ECDH_REPLY: u8 = 31;
 /// `SSH_MSG_CHANNEL_OPEN` (RFC 4254 §5.1).
 pub const CHANNEL_OPEN: u8 = 90;
 /// `SSH_MSG_CHANNEL_OPEN_CONFIRMATION` (RFC 4254 §5.1).
@@ -50,6 +64,8 @@ pub const fn name(number: u8) -> Option<&'static str> {
         EXT_INFO => "SSH_MSG_EXT_INFO",
         KEXINIT => "SSH_MSG_KEXINIT",
         NEWKEYS => "SSH_MSG_NEWKEYS",
+        KEX_ECDH_INIT => "SSH_MSG_KEX_ECDH_INIT",
+        KEX_ECDH_REPLY => "SSH_MSG_KEX_ECDH_REPLY",
         CHANNEL_OPEN => "SSH_MSG_CHANNEL_OPEN",
         CHANNEL_OPEN_CONFIRMATION => "SSH_MSG_CHANNEL_OPEN_CONFIRMATION",
         CHANNEL_OPEN_FAILURE => "SSH_MSG_CHANNEL_OPEN_FAILURE",

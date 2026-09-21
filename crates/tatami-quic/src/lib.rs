@@ -32,6 +32,16 @@
 //! adapters will live. A QUIC/TLS stack that itself needs `std` must be
 //! introduced behind an explicit backend feature that enables `std`, not
 //! imported into shared code.
+//!
+//! # Diagnostic backend
+//!
+//! The `quinn-backend` feature (implies `std`; pulls `quinn-proto`, `rustls`
+//! on `ring`, `rcgen`) enables [`diag`], the QUIC/TLS **handshake observer**
+//! experiment described in `docs/quic-observer-readiness.md` §2 column (a).
+//! It completes TLS 1.3 handshakes over QUIC v1 with a generated test
+//! identity and reports what was offered and negotiated. It carries no SSH
+//! bytes, decides no trust beyond an explicit pin, and settles none of the
+//! SSH-over-QUIC mapping questions.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -46,5 +56,7 @@ pub use tatami_connection as connection;
 pub use tatami_keys as keys;
 pub use tatami_wire as wire;
 
+#[cfg(feature = "quinn-backend")]
+pub mod diag;
 #[cfg(feature = "std")]
 pub mod io;

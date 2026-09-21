@@ -48,3 +48,10 @@ path = "fuzz_targets/wire_messages.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wire_kex_codecs"
+path = "fuzz_targets/wire_kex_codecs.rs"
+test = false
+doc = false
+bench = false

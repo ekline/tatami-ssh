@@ -1,10 +1,14 @@
 //! Transport-layer generic messages (RFC 4253 §11): `DISCONNECT`, `IGNORE`,
-//! `UNIMPLEMENTED` and `DEBUG`.
+//! `UNIMPLEMENTED` and `DEBUG`; and service negotiation (RFC 4253 §10):
+//! `SERVICE_REQUEST` and `SERVICE_ACCEPT`.
 //!
 //! These are payload codecs only; they say nothing about the packet envelope
 //! that carries them. All string fields are returned as raw bytes. RFC 4253
 //! says descriptions and debug messages are ISO-10646 UTF-8, but a peer may
 //! not comply, so display code must escape them rather than trust them.
+//! Service names are typed `string` by the RFC even though the registered
+//! values (`ssh-userauth`, `ssh-connection`) look like names; they are kept
+//! as raw bytes and not restricted here.
 
 use crate::EncodeError;
 use crate::error::MessageError;
@@ -198,6 +202,68 @@ impl<'a> Debug<'a> {
     }
 }
 
+/// `SSH_MSG_SERVICE_REQUEST` (RFC 4253 §10).
+///
+/// ```text
+/// byte      SSH_MSG_SERVICE_REQUEST
+/// string    service name
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceRequest<'a> {
+    /// Requested service, e.g. `ssh-userauth`. Unknown names are preserved.
+    pub service_name: &'a [u8],
+}
+
+impl<'a> ServiceRequest<'a> {
+    /// Decodes a complete payload starting at the message number.
+    pub fn decode(payload: &'a [u8]) -> Result<Self, MessageError> {
+        let mut r = Reader::new(payload);
+        expect_message(&mut r, msg::SERVICE_REQUEST)?;
+        let service_name = field(&mut r, "service_name", Reader::read_string)?;
+        finish(&r)?;
+        Ok(ServiceRequest { service_name })
+    }
+
+    /// Encodes the message into `out`, returning the number of bytes written.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        let mut w = Writer::new(out);
+        w.write_u8(msg::SERVICE_REQUEST)?;
+        w.write_string(self.service_name)?;
+        Ok(w.position())
+    }
+}
+
+/// `SSH_MSG_SERVICE_ACCEPT` (RFC 4253 §10).
+///
+/// ```text
+/// byte      SSH_MSG_SERVICE_ACCEPT
+/// string    service name
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceAccept<'a> {
+    /// Accepted service; the requester checks it echoes the request.
+    pub service_name: &'a [u8],
+}
+
+impl<'a> ServiceAccept<'a> {
+    /// Decodes a complete payload starting at the message number.
+    pub fn decode(payload: &'a [u8]) -> Result<Self, MessageError> {
+        let mut r = Reader::new(payload);
+        expect_message(&mut r, msg::SERVICE_ACCEPT)?;
+        let service_name = field(&mut r, "service_name", Reader::read_string)?;
+        finish(&r)?;
+        Ok(ServiceAccept { service_name })
+    }
+
+    /// Encodes the message into `out`, returning the number of bytes written.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        let mut w = Writer::new(out);
+        w.write_u8(msg::SERVICE_ACCEPT)?;
+        w.write_string(self.service_name)?;
+        Ok(w.position())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +339,78 @@ mod tests {
             })
         );
         assert_eq!(Debug::decode(&[]), Err(MessageError::Empty));
+    }
+
+    // Hand-assembled: 5, string(12) "ssh-userauth".
+    const SERVICE_REQUEST_USERAUTH: [u8; 17] = [
+        5, 0, 0, 0, 12, b's', b's', b'h', b'-', b'u', b's', b'e', b'r', b'a', b'u', b't', b'h',
+    ];
+    // Hand-assembled: 6, string(14) "ssh-connection".
+    const SERVICE_ACCEPT_CONNECTION: [u8; 19] = [
+        6, 0, 0, 0, 14, b's', b's', b'h', b'-', b'c', b'o', b'n', b'n', b'e', b'c', b't', b'i',
+        b'o', b'n',
+    ];
+
+    #[test]
+    fn service_request_fixture() {
+        let m = ServiceRequest::decode(&SERVICE_REQUEST_USERAUTH).unwrap();
+        assert_eq!(m.service_name, b"ssh-userauth");
+        let mut out = [0u8; 17];
+        assert_eq!(m.encode(&mut out).unwrap(), 17);
+        assert_eq!(out, SERVICE_REQUEST_USERAUTH);
+    }
+
+    #[test]
+    fn service_accept_fixture() {
+        let m = ServiceAccept::decode(&SERVICE_ACCEPT_CONNECTION).unwrap();
+        assert_eq!(m.service_name, b"ssh-connection");
+        let mut out = [0u8; 19];
+        assert_eq!(m.encode(&mut out).unwrap(), 19);
+        assert_eq!(out, SERVICE_ACCEPT_CONNECTION);
+    }
+
+    #[test]
+    fn service_messages_reject_trailing_and_wrong_numbers() {
+        let mut trailing = [0u8; 18];
+        trailing[..17].copy_from_slice(&SERVICE_REQUEST_USERAUTH);
+        assert_eq!(
+            ServiceRequest::decode(&trailing),
+            Err(MessageError::TrailingBytes { count: 1 })
+        );
+        assert_eq!(
+            ServiceAccept::decode(&SERVICE_REQUEST_USERAUTH),
+            Err(MessageError::UnexpectedMessage {
+                expected: 6,
+                found: 5
+            })
+        );
+        assert_eq!(
+            ServiceRequest::decode(&SERVICE_ACCEPT_CONNECTION),
+            Err(MessageError::UnexpectedMessage {
+                expected: 5,
+                found: 6
+            })
+        );
+        assert_eq!(
+            ServiceRequest::decode(&[5, 0, 0, 0, 9, b'x']),
+            Err(MessageError::Field {
+                field: "service_name",
+                offset: 1,
+                error: DecodeError::LengthOverflow {
+                    claimed: 9,
+                    available: 1
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn service_names_are_not_restricted() {
+        // Typed `string` by RFC 4253 §10: arbitrary bytes are preserved so
+        // a peer's odd request can be reported rather than mis-parsed.
+        let m = ServiceRequest::decode(&[5, 0, 0, 0, 3, 0x00, 0xff, b' ']).unwrap();
+        assert_eq!(m.service_name, &[0x00, 0xff, b' ']);
+        let m = ServiceAccept::decode(&[6, 0, 0, 0, 0]).unwrap();
+        assert!(m.service_name.is_empty());
     }
 }

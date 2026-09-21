@@ -95,6 +95,13 @@ impl InputBuffer {
         &self.buf
     }
 
+    /// Buffered bytes, mutably. Exists so a protected-packet decoder can
+    /// decrypt in place before the caller consumes the packet.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
     /// Appends `data`, or fails before copying if it would not fit.
     pub fn push(&mut self, data: &[u8]) -> Result<(), InputOverflow> {
         if data.len() > self.room() {

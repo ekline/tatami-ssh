@@ -214,17 +214,23 @@ cmd_coverage() {
     ws=$(workspace_of "$t")
     seeds="fuzz/$ws/seeds/$t"
     corpus="fuzz/$ws/corpus/$t"
-    dirs="$seeds"
-    [ -d "$corpus" ] && dirs="$dirs $corpus"
-    echo "==> coverage $t over: $dirs"
-    # cargo-fuzz builds an instrumented binary, runs every corpus input once
-    # and merges the .profraw files with llvm-profdata (from the toolchain's
-    # llvm-tools, or LLVM_PROFDATA / PATH for a distribution toolchain).
     covdir="fuzz/$ws/coverage/$t"
     rm -rf "$covdir"
     profdata="$covdir/coverage.profdata"
-    # shellcheck disable=SC2086,SC2046
-    if ! run_cargo_fuzz coverage $(fuzz_dir_args "$ws") "$t" $dirs; then
+    # cargo-fuzz runs each corpus directory as a separate process and every
+    # process writes the same default-<target>.profraw, so a second directory
+    # would overwrite the first. Copy seeds and evolved corpus into one
+    # scratch directory and run that once.
+    inputs="$covdir/inputs"
+    mkdir -p "$inputs"
+    find "$seeds" -type f ! -name '*.py' -exec cp -t "$inputs" {} +
+    [ -d "$corpus" ] && find "$corpus" -type f -exec cp -t "$inputs" {} + 2>/dev/null
+    echo "==> coverage $t over $(find "$inputs" -type f | wc -l | tr -d ' ') inputs (seeds + corpus)"
+    # cargo-fuzz builds an instrumented binary, runs every input once and
+    # merges the .profraw files with llvm-profdata (from the toolchain's
+    # llvm-tools, or LLVM_PROFDATA / PATH for a distribution toolchain).
+    # shellcheck disable=SC2046
+    if ! run_cargo_fuzz coverage $(fuzz_dir_args "$ws") "$t" "$inputs"; then
         # cargo-fuzz only looks in the rustc sysroot for llvm-profdata. With a
         # distribution toolchain the raw profiles exist but the merge fails;
         # merge them with the llvm-profdata on PATH (or LLVM_PROFDATA).

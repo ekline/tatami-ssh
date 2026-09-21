@@ -167,6 +167,11 @@ PRIMS = {
         0,
         [op(R_NAMELIST), op(FINISH)],
     ),
+    "name_list_standard_strict_markers": prim_seed(
+        name_list([b"curve25519-sha256", b"kex-strict-c", b"kex-strict-s", b"ext-info-c"]),
+        0,
+        [op(R_NAMELIST), op(FINISH)],
+    ),
     "name_list_empty": prim_seed(u32be(0), 0, [op(R_NAMELIST), op(FINISH)]),
     "name_list_double_comma": prim_seed(
         string(b"a,,b"), 0, [op(R_NAMELIST), op(R_STRING), op(FINISH)]
@@ -259,6 +264,23 @@ CLIENT_LISTS = [
     [],
     [],
 ]
+# Both strict-KEX spellings on each side (draft-ietf-sshm-strict-kex-02 §3.1
+# recommends offering both).
+CLIENT_LISTS_STANDARD = [
+    [b"curve25519-sha256", b"ext-info-c", b"kex-strict-c-v00@openssh.com", b"kex-strict-c"]
+] + CLIENT_LISTS[1:]
+SERVER_LISTS_STANDARD_ONLY = [
+    [b"curve25519-sha256", b"kex-strict-s", b"ext-info-s"],
+    [b"ssh-ed25519"],
+    [b"aes128-gcm@openssh.com"],
+    [b"aes128-gcm@openssh.com"],
+    [b"hmac-sha2-256"],
+    [b"hmac-sha2-256"],
+    [b"none"],
+    [b"none"],
+    [],
+    [],
+]
 SERVER_LISTS = [
     [b"curve25519-sha256", b"ext-info-s", b"kex-strict-s-v00@openssh.com"],
     [b"ssh-ed25519"],
@@ -299,6 +321,14 @@ MESSAGES = {
     "empty_payload": RAW,
     "kexinit_client_markers": RAW + kexinit(CLIENT_LISTS),
     "kexinit_server_markers": RAW + server,
+    "kexinit_client_both_strict_spellings": RAW + kexinit(CLIENT_LISTS_STANDARD),
+    "kexinit_server_standard_strict_only": RAW + kexinit(SERVER_LISTS_STANDARD_ONLY),
+    # Near misses must stay methods: prefix, wrong version, wrong domain.
+    "kexinit_strict_near_misses": RAW
+    + kexinit(
+        [[b"kex-strict", b"kex-strict-c-v01@openssh.com", b"kex-strict-c@openssh.com", b"kex-strict-cs"]]
+        + CLIENT_LISTS[1:]
+    ),
     "kexinit_truncated_reserved": RAW + server[:-4],
     "kexinit_truncated_mid_reserved": RAW + server[:-2],
     "kexinit_truncated_cookie": RAW + u8(20) + COOKIE[:7],
@@ -332,7 +362,84 @@ MESSAGES = {
 for kind in range(8):
     MESSAGES[f"structured_{kind}"] = u8(0x80 + kind) + lcg_bytes(240, 100 + kind)
     MESSAGES[f"structured_{kind}_short"] = u8(0x88 + kind) + lcg_bytes(24, 200 + kind)
+# Structured KEXINIT (kind 0): 16 cookie bytes then the marker bit mask; bits
+# 4 and 5 add the standard strict names, 0x3F adds all six markers.
+MESSAGES["structured_0_all_six_markers"] = u8(0x80) + lcg_bytes(16, 300) + u8(0x3F) + lcg_bytes(200, 301)
+MESSAGES["structured_0_standard_strict_markers"] = u8(0x80) + lcg_bytes(16, 302) + u8(0x30) + lcg_bytes(200, 303)
 for name, data in MESSAGES.items():
     write("wire_messages", name, data)
+
+# ---------------------------------------------------------------------------
+# wire_kex_codecs: sel:u8 then payload (sel < 0x80: raw payload to all six
+# decoders and read_mpint; sel >= 0x80: structured case sel & 7).
+# ---------------------------------------------------------------------------
+
+ED25519_BLOB = string(b"ssh-ed25519") + string(bytes(range(32)))
+SIG_BLOB = string(b"ssh-ed25519") + string(bytes(range(64)))
+Q = bytes(range(0x40, 0x60))
+ecdh_reply = u8(31) + string(ED25519_BLOB) + string(Q) + string(SIG_BLOB)
+
+
+def ext_info(pairs):
+    out = u8(7) + u32be(len(pairs))
+    for n, v in pairs:
+        out += string(n) + string(v)
+    return out
+
+
+KEX = {
+    "empty_payload": RAW,
+    # RFC 4251 §5 mpint examples as raw strings (also fed to the decoders).
+    "mpint_rfc4251_zero": RAW + u32be(0),
+    "mpint_rfc4251_positive": RAW + u32be(8) + bytes.fromhex("09a378f9b2e332a7"),
+    "mpint_rfc4251_0x80": RAW + u32be(2) + bytes.fromhex("0080"),
+    "mpint_rfc4251_neg_1234": RAW + u32be(2) + bytes.fromhex("edcc"),
+    "mpint_rfc4251_neg_deadbeef": RAW + u32be(5) + bytes.fromhex("ff21524111"),
+    "mpint_noncanonical_zero_byte": RAW + u32be(1) + b"\x00",
+    "mpint_noncanonical_leading_zero": RAW + u32be(3) + bytes.fromhex("0009a3"),
+    "mpint_noncanonical_leading_ff": RAW + u32be(3) + bytes.fromhex("ffedcc"),
+    "mpint_minus_one": RAW + u32be(1) + b"\xff",
+    "mpint_x25519_high_bit": RAW + u32be(33) + b"\x00\x80" + b"\x11" * 31,
+    "mpint_length_overflow": RAW + u32be(3) + b"\x01",
+    "ecdh_init_x25519": RAW + u8(30) + string(Q),
+    "ecdh_init_empty_qc": RAW + u8(30) + u32be(0),
+    "ecdh_init_trailing": RAW + u8(30) + string(Q) + b"\x00",
+    "ecdh_init_truncated_prefix": RAW + u8(30) + b"\x00\x00",
+    "ecdh_reply_ed25519": RAW + ecdh_reply,
+    "ecdh_reply_truncated_ks": RAW + ecdh_reply[:5],
+    "ecdh_reply_truncated_qs": RAW + ecdh_reply[: 5 + len(ED25519_BLOB) + 2],
+    "ecdh_reply_truncated_signature": RAW + ecdh_reply[:-1],
+    "ecdh_reply_trailing": RAW + ecdh_reply + b"\x00",
+    "newkeys": RAW + u8(21),
+    "newkeys_trailing": RAW + u8(21) + u8(0),
+    "service_request_userauth": RAW + u8(5) + string(b"ssh-userauth"),
+    "service_accept_userauth": RAW + u8(6) + string(b"ssh-userauth"),
+    "service_accept_connection_trailing": RAW + u8(6) + string(b"ssh-connection") + b"\x00",
+    "service_request_length_overflow": RAW + u8(5) + u32be(20) + b"ssh",
+    "ext_info_server_sig_algs": RAW + ext_info([(b"server-sig-algs", b"ssh-ed25519,rsa-sha2-512")]),
+    "ext_info_zero": RAW + ext_info([]),
+    "ext_info_rfc8308_delay_compression": RAW
+    + ext_info([(b"delay-compression", string(b"zlib,none") + string(b"zlib,none"))]),
+    "ext_info_three_incl_unknown_binary": RAW
+    + ext_info(
+        [
+            (b"publickey-hostbound@openssh.com", b"0"),
+            (b"server-sig-algs", b"ssh-ed25519"),
+            (b"ping@openssh.com", b"\x00\x01"),
+        ]
+    ),
+    "ext_info_claims_two_has_one": RAW + u8(7) + u32be(2) + string(b"server-sig-algs") + string(b"") + b"\x00" * 8,
+    "ext_info_count_mismatch": RAW + u8(7) + u32be(2) + string(b"elevation") + string(b"y"),
+    "ext_info_huge_count_12_bytes": RAW + u8(7) + u32be(0xFFFFFFFF) + b"\x00" * 7,
+    "ext_info_invalid_server_sig_algs": RAW + ext_info([(b"server-sig-algs", b"a,,b")]),
+    "ext_info_truncated_value": RAW + u8(7) + u32be(1) + string(b"no-flow-control") + u32be(5) + b"p",
+    "ext_info_trailing": RAW + ext_info([(b"elevation", b"d")]) + b"\x00",
+    "unknown_number_50": RAW + u8(50) + b"\x00" * 8,
+}
+for kind in range(8):
+    KEX[f"structured_{kind}"] = u8(0x80 + kind) + lcg_bytes(200, 400 + kind)
+    KEX[f"structured_{kind}_short"] = u8(0x88 + kind) + lcg_bytes(20, 500 + kind)
+for name, data in KEX.items():
+    write("wire_kex_codecs", name, data)
 
 print("seeds written under", HERE)

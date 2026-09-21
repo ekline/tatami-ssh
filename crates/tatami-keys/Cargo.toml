@@ -10,6 +10,13 @@ publish.workspace = true
 
 [features]
 default = []
+# Ed25519 host-key verification (RFC 8709) and SHA-256 fingerprints via
+# maintained pure-Rust implementations; portable (no_std + alloc). See
+# docs/crypto-provider-audit.md before changing versions or features.
+ed25519 = ["dep:ed25519-dalek", "dep:sha2", "dep:base64ct"]
 
 [dependencies]
 tatami-wire = { workspace = true, features = ["alloc"] }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"], optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
+base64ct = { version = "1.6", default-features = false, features = ["alloc"], optional = true }

@@ -4,7 +4,10 @@
 //! every field boundary and borrows each name list from the payload. It
 //! attaches no meaning to any name and preserves unknown names verbatim.
 //! Recognition of extension markers that are *not* key-exchange methods
-//! lives separately in [`classify_kex_name`].
+//! lives separately in [`classify_kex_name`] (RFC 8308 `ext-info-*` and
+//! draft-ietf-sshm-strict-kex-02 `kex-strict-*`, in both the standard and
+//! the pre-standard `-v00@openssh.com` spellings) and
+//! [`classify_strict_kex_name`], which keeps the spelling.
 //!
 //! # Validation policy
 //!
@@ -191,6 +194,11 @@ impl<'a> KexInit<'a> {
 /// This is a recognition aid for reports. It does not authorise negotiation,
 /// and an unrecognised name is simply [`KexName::Method`] with no claim about
 /// whether it is a real method.
+///
+/// Both spellings of each strict-KEX marker map to the same variant here so
+/// that consumers matching on this enum keep working; use
+/// [`classify_strict_kex_name`] when the spelling matters (it does for
+/// negotiation: standard and pre-standard names must never be mixed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KexName {
     /// Presumed key-exchange method name (including any the workspace does
@@ -202,11 +210,13 @@ pub enum KexName {
     /// `ext-info-s`: server signals RFC 8308 extension negotiation support.
     /// Not a key-exchange method (RFC 8308 §2.1).
     ExtInfoServer,
-    /// `kex-strict-c-v00@openssh.com`: client signals OpenSSH strict key
-    /// exchange (OpenSSH `PROTOCOL`, "strict key exchange extension" section). Not a key-exchange method.
+    /// `kex-strict-c` or `kex-strict-c-v00@openssh.com`: client signals
+    /// strict key exchange (draft-ietf-sshm-strict-kex-02 §3.1). Not a
+    /// key-exchange method.
     StrictKexClient,
-    /// `kex-strict-s-v00@openssh.com`: server signals OpenSSH strict key
-    /// exchange (OpenSSH `PROTOCOL`, "strict key exchange extension" section). Not a key-exchange method.
+    /// `kex-strict-s` or `kex-strict-s-v00@openssh.com`: server signals
+    /// strict key exchange (draft-ietf-sshm-strict-kex-02 §3.1). Not a
+    /// key-exchange method.
     StrictKexServer,
 }
 
@@ -225,10 +235,100 @@ pub fn classify_kex_name(name: &[u8]) -> KexName {
     match name {
         b"ext-info-c" => KexName::ExtInfoClient,
         b"ext-info-s" => KexName::ExtInfoServer,
-        b"kex-strict-c-v00@openssh.com" => KexName::StrictKexClient,
-        b"kex-strict-s-v00@openssh.com" => KexName::StrictKexServer,
-        _ => KexName::Method,
+        _ => match classify_strict_kex_name(name) {
+            Some(StrictKexMarker {
+                role: StrictKexRole::Client,
+                ..
+            }) => KexName::StrictKexClient,
+            Some(StrictKexMarker {
+                role: StrictKexRole::Server,
+                ..
+            }) => KexName::StrictKexServer,
+            None => KexName::Method,
+        },
     }
+}
+
+/// Which side a strict-KEX marker is sent by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrictKexRole {
+    /// Sent by the client (`kex-strict-c*`).
+    Client,
+    /// Sent by the server (`kex-strict-s*`).
+    Server,
+}
+
+/// Spelling family of a strict-KEX marker (draft-ietf-sshm-strict-kex-02
+/// §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrictKexSpelling {
+    /// The standard names `kex-strict-c` / `kex-strict-s`.
+    Standard,
+    /// The deployed pre-standard names `kex-strict-c-v00@openssh.com` /
+    /// `kex-strict-s-v00@openssh.com`.
+    OpenSshV00,
+}
+
+/// A recognised strict-KEX marker: role plus spelling.
+///
+/// draft-ietf-sshm-strict-kex-02 §3.1 enables strict KEX only when the
+/// client's and server's markers belong to the *same* spelling family;
+/// [`StrictKexMarker::pairs_with`] encodes that rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrictKexMarker {
+    /// Sender side.
+    pub role: StrictKexRole,
+    /// Name family.
+    pub spelling: StrictKexSpelling,
+}
+
+impl StrictKexMarker {
+    /// The exact wire name of this marker.
+    #[must_use]
+    pub const fn name(self) -> &'static [u8] {
+        match (self.role, self.spelling) {
+            (StrictKexRole::Client, StrictKexSpelling::Standard) => b"kex-strict-c",
+            (StrictKexRole::Server, StrictKexSpelling::Standard) => b"kex-strict-s",
+            (StrictKexRole::Client, StrictKexSpelling::OpenSshV00) => {
+                b"kex-strict-c-v00@openssh.com"
+            }
+            (StrictKexRole::Server, StrictKexSpelling::OpenSshV00) => {
+                b"kex-strict-s-v00@openssh.com"
+            }
+        }
+    }
+
+    /// Returns `true` when `self` and `peer` are the two halves of one
+    /// enabling pair: opposite roles, identical spelling. Mixed spellings
+    /// never enable strict KEX (draft-ietf-sshm-strict-kex-02 §3.1).
+    #[must_use]
+    pub const fn pairs_with(self, peer: StrictKexMarker) -> bool {
+        let opposite = matches!(
+            (self.role, peer.role),
+            (StrictKexRole::Client, StrictKexRole::Server)
+                | (StrictKexRole::Server, StrictKexRole::Client)
+        );
+        let same_spelling = matches!(
+            (self.spelling, peer.spelling),
+            (StrictKexSpelling::Standard, StrictKexSpelling::Standard)
+                | (StrictKexSpelling::OpenSshV00, StrictKexSpelling::OpenSshV00)
+        );
+        opposite && same_spelling
+    }
+}
+
+/// Recognises the four strict-KEX marker names, preserving which spelling
+/// was used. Any other name returns `None`.
+#[must_use]
+pub fn classify_strict_kex_name(name: &[u8]) -> Option<StrictKexMarker> {
+    let (role, spelling) = match name {
+        b"kex-strict-c" => (StrictKexRole::Client, StrictKexSpelling::Standard),
+        b"kex-strict-s" => (StrictKexRole::Server, StrictKexSpelling::Standard),
+        b"kex-strict-c-v00@openssh.com" => (StrictKexRole::Client, StrictKexSpelling::OpenSshV00),
+        b"kex-strict-s-v00@openssh.com" => (StrictKexRole::Server, StrictKexSpelling::OpenSshV00),
+        _ => return None,
+    };
+    Some(StrictKexMarker { role, spelling })
 }
 
 #[cfg(feature = "alloc")]
@@ -505,6 +605,57 @@ mod tests {
         assert_eq!(classify_kex_name(b"totally-unknown"), KexName::Method);
         assert!(KexName::ExtInfoServer.is_marker());
         assert!(!KexName::Method.is_marker());
+    }
+
+    #[test]
+    fn standard_strict_kex_names_are_markers_too() {
+        assert_eq!(classify_kex_name(b"kex-strict-c"), KexName::StrictKexClient);
+        assert_eq!(classify_kex_name(b"kex-strict-s"), KexName::StrictKexServer);
+        assert!(classify_kex_name(b"kex-strict-c").is_marker());
+        // Near misses stay methods: no prefix matching.
+        assert_eq!(classify_kex_name(b"kex-strict"), KexName::Method);
+        assert_eq!(
+            classify_kex_name(b"kex-strict-c-v01@openssh.com"),
+            KexName::Method
+        );
+        assert_eq!(
+            classify_kex_name(b"kex-strict-c@openssh.com"),
+            KexName::Method
+        );
+    }
+
+    #[test]
+    fn strict_kex_spelling_is_preserved_and_pairing_forbids_mixing() {
+        let c_std = classify_strict_kex_name(b"kex-strict-c").unwrap();
+        let s_std = classify_strict_kex_name(b"kex-strict-s").unwrap();
+        let c_v00 = classify_strict_kex_name(b"kex-strict-c-v00@openssh.com").unwrap();
+        let s_v00 = classify_strict_kex_name(b"kex-strict-s-v00@openssh.com").unwrap();
+        assert_eq!(
+            c_std,
+            StrictKexMarker {
+                role: StrictKexRole::Client,
+                spelling: StrictKexSpelling::Standard
+            }
+        );
+        assert_eq!(
+            s_v00,
+            StrictKexMarker {
+                role: StrictKexRole::Server,
+                spelling: StrictKexSpelling::OpenSshV00
+            }
+        );
+        for m in [c_std, s_std, c_v00, s_v00] {
+            assert_eq!(classify_strict_kex_name(m.name()), Some(m));
+        }
+        assert!(c_std.pairs_with(s_std));
+        assert!(s_std.pairs_with(c_std));
+        assert!(c_v00.pairs_with(s_v00));
+        assert!(!c_std.pairs_with(s_v00), "mixed spellings never enable");
+        assert!(!c_v00.pairs_with(s_std));
+        assert!(!c_std.pairs_with(c_std), "same role is not a pair");
+        assert!(!c_std.pairs_with(c_v00));
+        assert_eq!(classify_strict_kex_name(b"ext-info-c"), None);
+        assert_eq!(classify_strict_kex_name(b"curve25519-sha256"), None);
     }
 
     #[cfg(feature = "alloc")]

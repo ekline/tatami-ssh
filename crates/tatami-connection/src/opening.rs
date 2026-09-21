@@ -35,6 +35,15 @@
 //! A stream or socket becoming available never creates a channel; only a
 //! decoded confirmation (outgoing) or an explicit `accept` (incoming) does.
 //!
+//! # Peer-number uniqueness
+//!
+//! The peer's `sender channel` must be unique among its live channels. Both
+//! an incoming `OPEN` and an `OPEN_CONFIRMATION` (live or late) that name a
+//! peer number already owned by a live established channel or a pending
+//! incoming open are rejected with [`Violation::DuplicatePeerNumber`]
+//! before any state changes. Local and peer number spaces stay distinct:
+//! the same integer appearing once in each is valid.
+//!
 //! # Local-number allocation and late replies
 //!
 //! Numbers are allocated from a monotonically increasing counter and are
@@ -740,7 +749,15 @@ impl OpeningEngine {
             initial_window_size: msg.initial_window_size,
             maximum_packet_size: msg.maximum_packet_size,
         };
-        match self.find_reply_target(msg.recipient_channel)? {
+        let target = self.locate_reply(msg.recipient_channel)?;
+        // The peer's sender number must be unique among its live channels,
+        // exactly as `handle_open` requires. Checked before any state change,
+        // for live and late confirmations alike, so a violation leaves the
+        // pending slot, counters and tombstones untouched.
+        if self.peer_number_in_use(peer_number) {
+            return Err(Violation::DuplicatePeerNumber { peer_number });
+        }
+        match self.consume_reply(target) {
             ReplyTarget::Pending(handle) => {
                 let Some(State::PendingOutgoing {
                     channel_type,
@@ -748,7 +765,7 @@ impl OpeningEngine {
                     local,
                 }) = self.get(handle).cloned()
                 else {
-                    unreachable!("find_reply_target returned a pending outgoing slot")
+                    unreachable!("locate_reply returned a pending outgoing slot")
                 };
                 self.set(
                     handle,
@@ -780,7 +797,8 @@ impl OpeningEngine {
         &mut self,
         msg: &ChannelOpenFailure<'_>,
     ) -> Result<Event, Violation> {
-        match self.find_reply_target(msg.recipient_channel)? {
+        let target = self.locate_reply(msg.recipient_channel)?;
+        match self.consume_reply(target) {
             ReplyTarget::Pending(handle) => {
                 self.remove(handle);
                 self.pending_outgoing -= 1;
@@ -802,7 +820,8 @@ impl OpeningEngine {
 
     // ----- internals -----------------------------------------------------------
 
-    fn find_reply_target(&mut self, recipient: u32) -> Result<ReplyTarget, Violation> {
+    /// Classifies the `recipient channel` of a reply without changing state.
+    fn locate_reply(&self, recipient: u32) -> Result<ReplyTarget, Violation> {
         let wanted = LocalNumber(recipient);
         for (index, slot) in self.slots.iter().enumerate() {
             match &slot.state {
@@ -820,8 +839,7 @@ impl OpeningEngine {
                 _ => {}
             }
         }
-        if let Some(pos) = self.tombstones.iter().position(|n| *n == wanted) {
-            self.tombstones.remove(pos);
+        if self.tombstones.contains(&wanted) {
             return Ok(ReplyTarget::Tombstone(wanted));
         }
         // A number we never allocated, or one belonging to a pending
@@ -833,6 +851,16 @@ impl OpeningEngine {
             return Err(Violation::ReplyToIncoming { recipient });
         }
         Err(Violation::UnknownRecipient { recipient })
+    }
+
+    /// Commits a located reply: a tombstone is consumed by its reply.
+    fn consume_reply(&mut self, target: ReplyTarget) -> ReplyTarget {
+        if let ReplyTarget::Tombstone(n) = target {
+            if let Some(pos) = self.tombstones.iter().position(|t| *t == n) {
+                self.tombstones.remove(pos);
+            }
+        }
+        target
     }
 
     fn peer_number_in_use(&self, peer_number: PeerNumber) -> bool {
@@ -1250,6 +1278,106 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_reusing_established_peer_number_is_rejected_unchanged() {
+        let mut e = engine();
+        let a = e.open(session(1)).unwrap();
+        let b = e.open(session(1)).unwrap();
+        e.handle_open_confirmation(&confirmation(0, 7)).unwrap();
+        assert_eq!(e.phase(a), Some(Phase::Established));
+        let snapshot = (
+            e.live_channels(),
+            e.pending_outgoing(),
+            e.pending_incoming(),
+        );
+
+        // Peer confirms our second open with the number it already uses.
+        assert_eq!(
+            e.handle_open_confirmation(&confirmation(1, 7)),
+            Err(Violation::DuplicatePeerNumber {
+                peer_number: PeerNumber(7)
+            })
+        );
+        assert_eq!(e.phase(b), Some(Phase::PendingOutgoing), "slot unchanged");
+        assert_eq!(
+            (
+                e.live_channels(),
+                e.pending_outgoing(),
+                e.pending_incoming()
+            ),
+            snapshot
+        );
+        // A non-colliding confirmation for the same open still works.
+        assert!(matches!(
+            e.handle_open_confirmation(&confirmation(1, 8)),
+            Ok(Event::Established { handle, peer_number: PeerNumber(8), .. }) if handle == b
+        ));
+    }
+
+    #[test]
+    fn confirmation_reusing_pending_incoming_peer_number_is_rejected() {
+        let mut e = engine();
+        let _ = e.handle_open(&peer_open(3, b"session")).unwrap();
+        let h = e.open(session(1)).unwrap();
+        assert_eq!(
+            e.handle_open_confirmation(&confirmation(0, 3)),
+            Err(Violation::DuplicatePeerNumber {
+                peer_number: PeerNumber(3)
+            })
+        );
+        assert_eq!(e.phase(h), Some(Phase::PendingOutgoing));
+        assert_eq!(e.pending_incoming(), 1);
+        assert_eq!(e.pending_outgoing(), 1);
+    }
+
+    #[test]
+    fn local_and_peer_numbers_may_coincide() {
+        // Our local 0 confirmed with peer 0: one integer in each space.
+        let mut e = engine();
+        let h = e.open(session(1)).unwrap();
+        assert!(matches!(
+            e.handle_open_confirmation(&confirmation(0, 0)),
+            Ok(Event::Established { handle, local_number: LocalNumber(0), peer_number: PeerNumber(0), .. })
+                if handle == h
+        ));
+        // Peer then opens its channel 1 while our next local is also 1.
+        let _ = e.handle_open(&peer_open(1, b"session")).unwrap();
+        let h2 = e.open(session(1)).unwrap();
+        assert!(matches!(
+            e.handle_open_confirmation(&confirmation(1, 2)),
+            Ok(Event::Established { handle, local_number: LocalNumber(1), .. }) if handle == h2
+        ));
+    }
+
+    #[test]
+    fn late_confirmation_with_duplicate_peer_number_is_rejected_and_keeps_tombstone() {
+        let mut e = engine();
+        let a = e.open(session(1)).unwrap();
+        e.handle_open_confirmation(&confirmation(0, 5)).unwrap();
+        assert_eq!(e.phase(a), Some(Phase::Established));
+        let b = e.open(session(1)).unwrap();
+        e.cancel(b).unwrap();
+        // Late confirmation for the cancelled open, claiming peer 5 again.
+        assert_eq!(
+            e.handle_open_confirmation(&confirmation(1, 5)),
+            Err(Violation::DuplicatePeerNumber {
+                peer_number: PeerNumber(5)
+            })
+        );
+        // Tombstone untouched: a well-formed late reply is still classified.
+        assert_eq!(
+            e.handle_open_confirmation(&confirmation(1, 6)).unwrap(),
+            Event::LateReply {
+                local_number: LocalNumber(1),
+                reply: LateReply::Confirmed {
+                    peer_number: PeerNumber(6),
+                    peer: credit(1000, 500),
+                },
+            }
+        );
+        assert_eq!(e.live_channels(), 1);
+    }
+
+    #[test]
     fn cancel_requires_pending_outgoing() {
         let mut e = engine();
         let Event::IncomingOpen { handle, .. } = e.handle_open(&peer_open(1, b"session")).unwrap()
@@ -1263,7 +1391,9 @@ mod tests {
             })
         );
         let h = e.open(session(1)).unwrap();
-        e.handle_open_confirmation(&confirmation(0, 1)).unwrap();
+        // Peer number 1 is taken by the pending incoming open above; the
+        // peer must confirm with a different one.
+        e.handle_open_confirmation(&confirmation(0, 2)).unwrap();
         assert_eq!(
             e.cancel(h),
             Err(HandleError::WrongPhase {

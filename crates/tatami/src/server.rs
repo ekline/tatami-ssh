@@ -11,11 +11,12 @@
 //!
 //! # Available today
 //!
-//! Only the TCP **diagnostic observer** ([`observe`], requires `std` and
-//! `tcp`). It sends a server identification, records what connecting
-//! clients send up to their first `KEXINIT`, and closes. It performs no key
-//! exchange, has no host key, and never authenticates anyone. It is not an
-//! SSH service.
+//! Only the TCP **diagnostic observer** (`observe`, requires `std` and
+//! `tcp`; referred to as a plain code span because the module exists only
+//! with those features). It sends a server identification, records what
+//! connecting clients send up to their first `KEXINIT`, and closes. It
+//! performs no key exchange, has no host key, and never authenticates
+//! anyone. It is not an SSH service.
 
 #[cfg(all(feature = "std", feature = "tcp"))]
 pub mod observe {

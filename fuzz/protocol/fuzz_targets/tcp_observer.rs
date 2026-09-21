@@ -23,7 +23,8 @@
 //! The client-role description has no prelude; instead an optional run of
 //! junk bytes (never starting with `SSH-`) precedes the identification to
 //! exercise the unexpected-input policy. KEXINITs carry client markers
-//! (`ext-info-c`, `kex-strict-c-v00@openssh.com`) when requested.
+//! (`ext-info-c`, `kex-strict-c-v00@openssh.com`, and the standard
+//! `kex-strict-c`) when requested.
 //!
 //! # Oracles
 //!
