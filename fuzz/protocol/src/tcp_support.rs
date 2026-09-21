@@ -142,7 +142,6 @@ impl ChunkMode {
     /// Infinite sequence of desired chunk sizes (each ≥ 1). Drivers clip
     /// every size to what remains of the stream (and to the machine's room)
     /// and stop when the stream is exhausted.
-    #[must_use]
     pub fn desired(&self) -> Box<dyn Iterator<Item = usize> + '_> {
         match self {
             ChunkMode::All => Box::new(iter::repeat(usize::MAX)),

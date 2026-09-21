@@ -24,7 +24,7 @@
 #   mismatch  Ciphers=aes256-ctr  (negotiation must fail: no common cipher)
 #
 # The fixture is a diagnostic aid for a loopback handshake only: no user can
-# log in (UsePAM=no, no authorized keys), and the key is deleted on `stop`.
+# log in (DenyUsers=*), and the key is deleted on `stop`.
 
 set -eu
 
@@ -83,6 +83,11 @@ print_commands() {
 launch() {
     want=$1
     profile=$2
+    # Probe capabilities rather than assuming the installed OpenSSH version.
+    if ! "$SSHD" -T -f /dev/null -h "$KEY" >"$DIR/sshd.config" 2>"$LOG"; then
+        cat "$LOG" >&2
+        die "sshd configuration query failed"
+    fi
     attempt=0
     while :; do
         attempt=$((attempt + 1))
@@ -97,7 +102,10 @@ launch() {
         set -- -D -e -f /dev/null -p "$port" \
             -o ListenAddress=127.0.0.1 -h "$KEY" \
             -o UsePAM=no -o PidFile=none -o LogLevel=VERBOSE \
-            -o MaxStartups=10 -o PerSourcePenalties=no
+            -o MaxStartups=10 -o 'DenyUsers=*'
+        if grep -q '^persourcepenalties[[:space:]]' "$DIR/sshd.config"; then
+            set -- "$@" -o PerSourcePenalties=no
+        fi
         case "$profile" in
             default) ;;
             matching)

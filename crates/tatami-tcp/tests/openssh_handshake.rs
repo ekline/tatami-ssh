@@ -109,6 +109,21 @@ impl Sshd {
             .expect("run ssh-keygen");
         assert!(status.success(), "ssh-keygen failed: {status}");
 
+        let config = Command::new(SSHD)
+            .args(["-T", "-f", "/dev/null", "-h"])
+            .arg(&key_path)
+            .output()
+            .expect("query sshd configuration");
+        assert!(
+            config.status.success(),
+            "sshd configuration query failed ({}):\n{}",
+            config.status,
+            String::from_utf8_lossy(&config.stderr)
+        );
+        let supports_penalties = String::from_utf8_lossy(&config.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("persourcepenalties"));
+
         // The operator's independent fingerprint source.
         let output = Command::new(SSH_KEYGEN)
             .arg("-lf")
@@ -151,14 +166,17 @@ impl Sshd {
             "LogLevel=VERBOSE",
             "-o",
             "MaxStartups=10",
-            // Keeps a second connection from the same source from being
-            // delayed by the "no authentication attempted" penalty.
             "-o",
-            "PerSourcePenalties=no",
+            "DenyUsers=*",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
+        // Avoid diagnostic disconnect penalties on newer OpenSSH releases;
+        // older releases do not recognize this option.
+        if supports_penalties {
+            args.extend(["-o".to_string(), "PerSourcePenalties=no".to_string()]);
+        }
         for opt in extra_options {
             args.push("-o".to_string());
             args.push(opt.to_string());
