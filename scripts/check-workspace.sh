@@ -93,7 +93,8 @@ done
 # explicitly so a broken bin cannot hide behind required-features.
 step cargo build -p tatami --no-default-features --features std,tcp --bins
 step cargo build -p tatami --no-default-features --features std,tcp,kex --bins
-step cargo build -p tatami --no-default-features --features quic-diag --bins
+step cargo build -p tatami --no-default-features --features std,tcp,quic-diag --bins
+step cargo build -p tatami --no-default-features --features std,tcp,kex,quic-diag --bins
 
 step cargo test --workspace --all-features
 step env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps

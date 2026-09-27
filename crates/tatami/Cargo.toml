@@ -19,7 +19,8 @@ quic = ["dep:tatami-quic"]
 # (first interoperability profile; see docs/crypto-provider-audit.md).
 kex = ["tcp", "tatami-tcp?/kex", "tatami-keys/ed25519"]
 # Host-only QUIC/TLS diagnostic handshake backend (quinn-proto + rustls).
-# Requires std; pulls ring (C/asm). Enables the tatami-quic-* binaries.
+# Requires std; pulls ring (C/asm). Adds `--transport quic` to the
+# tatami-client and tatami-server binaries (which also need `tcp`).
 quic-diag = ["std", "quic", "tatami-quic?/quinn-backend"]
 
 [dependencies]
@@ -43,13 +44,3 @@ required-features = ["std", "tcp"]
 name = "tatami-server"
 path = "src/bin/tatami-server.rs"
 required-features = ["std", "tcp"]
-
-[[bin]]
-name = "tatami-quic-client"
-path = "src/bin/tatami-quic-client.rs"
-required-features = ["quic-diag"]
-
-[[bin]]
-name = "tatami-quic-server"
-path = "src/bin/tatami-quic-server.rs"
-required-features = ["quic-diag"]

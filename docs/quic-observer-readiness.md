@@ -2,9 +2,10 @@
 
 Status: round 4, 2026-09-20. Observer **(a)** below — the TLS/QUIC handshake
 observer — is **implemented** as `tatami-quic::diag` behind the
-`quinn-backend` feature (W-31), with the `tatami-quic-server observe` and
-`tatami-quic-client handshake` binaries behind the facade feature
-`quic-diag`. Observer **(b)** — the SSH-over-QUIC observer — is **not
+`quinn-backend` feature (W-31), exposed as `tatami-server observe
+--transport quic` and `tatami-client handshake --transport quic` behind the
+facade feature `quic-diag` (W-35; originally separate `tatami-quic-*`
+binaries). Observer **(b)** — the SSH-over-QUIC observer — is **not
 started**; every mapping question it depends on remains open (P-03–P-05,
 AQ-015, AQ-018–AQ-023, AQ-026). Sections 1 and 2 are kept as written in
 round 3 because they still hold; §3 records the decision, §4 the corrections
@@ -28,7 +29,7 @@ learned by compiling and testing against the backend, §5 what (b) requires.
 
 All of the above passed on the development machine on 2026-09-20
 (`cargo test -p tatami-quic --features quinn-backend`; `cargo test -p tatami
---features quic-diag --test quic_cli`). This is a loopback experiment with
+--features std,tcp,quic-diag --test quic_cli`). This is a loopback experiment with
 Tatami on both ends; **no interoperability with any other QUIC or TLS
 implementation is claimed**, and the ALPN value is unregistered.
 

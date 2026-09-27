@@ -1,4 +1,4 @@
-//! `tatami-quic-client handshake`: options, name resolution, report and
+//! `tatami-client handshake --transport quic`: options, name resolution, report and
 //! text/JSON rendering over [`tatami_quic::diag::client`].
 //!
 //! [`run`] returns data and prints nothing. The report never contains

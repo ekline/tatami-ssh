@@ -9,7 +9,7 @@
 //!
 //! | Name | Input | Where it appears |
 //! |---|---|---|
-//! | [`CertificateSha256`] | the whole certificate DER | what `tatami-quic-server observe` prints and `--cert-sha256` pins |
+//! | [`CertificateSha256`] | the whole certificate DER | what `tatami-server observe --transport quic` prints and `--cert-sha256` pins |
 //! | SPKI SHA-256 ([`SpkiSha256`]) | the `SubjectPublicKeyInfo` DER (RFC 7250 raw public key) | the raw-public-key experiment |
 //! | SSH host-key fingerprint (`tatami_keys::Sha256Fingerprint`) | the `ssh-ed25519` public-key blob (`string "ssh-ed25519", string key`) | SSH `known_hosts`, `ssh-keygen -l` |
 //!

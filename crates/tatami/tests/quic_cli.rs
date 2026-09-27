@@ -1,5 +1,8 @@
-//! End-to-end tests for `tatami-quic-server observe` and
-//! `tatami-quic-client handshake` on loopback UDP.
+//! End-to-end tests for `tatami-server observe --transport quic` and
+//! `tatami-client handshake --transport quic` on loopback UDP.
+//!
+//! Compiled only with `tcp,quic-diag`, which is when the binaries exist
+//! with QUIC support.
 //!
 //! The server is spawned with `--listen 127.0.0.1:0`; the bound port and
 //! certificate fingerprint are read from its first stdout record. Every
@@ -8,7 +11,7 @@
 //! (the client opens no stream; see the library tests that inspect every
 //! datagram).
 
-#![cfg(feature = "quic-diag")]
+#![cfg(all(feature = "tcp", feature = "quic-diag"))]
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, UdpSocket};
@@ -19,8 +22,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tatami::quic_diag::server::SCHEMA_VERSION;
 
-const SERVER: &str = env!("CARGO_BIN_EXE_tatami-quic-server");
-const CLIENT: &str = env!("CARGO_BIN_EXE_tatami-quic-client");
+const SERVER: &str = env!("CARGO_BIN_EXE_tatami-server");
+const CLIENT: &str = env!("CARGO_BIN_EXE_tatami-client");
 const ALPN: &str = "tatami-diag/0";
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -46,7 +49,8 @@ struct Server {
 
 fn spawn_server(dir: &PathBuf, args: &[&str]) -> Server {
     let mut child = Command::new(SERVER)
-        .args(["observe", "--listen", "127.0.0.1:0", "--alpn", ALPN])
+        .args(["observe", "--transport", "quic"])
+        .args(["--listen", "127.0.0.1:0", "--alpn", ALPN])
         .arg("--identity-dir")
         .arg(dir)
         .args(args)
@@ -102,7 +106,8 @@ impl Server {
 
 fn client(addr: SocketAddr, args: &[&str]) -> (i32, Value, String) {
     let o = Command::new(CLIENT)
-        .args(["handshake", "127.0.0.1", "--port", &addr.port().to_string()])
+        .args(["handshake", "127.0.0.1", "--transport", "quic"])
+        .args(["--port", &addr.port().to_string()])
         .args(["--server-name", "localhost", "--json"])
         .args(args)
         .output()
@@ -127,23 +132,31 @@ fn help_version_and_usage_statuses() {
             "UNREGISTERED",
             "0-RTT",
             "no interoperability",
+            "--transport quic",
         ] {
             assert!(help.contains(word), "{bin} help lacks {word}");
         }
         assert!(help.contains("not an SSH"), "{bin}");
-        let o = Command::new(bin).args([cmd, "--help"]).output().unwrap();
+        let o = Command::new(bin)
+            .args([cmd, "--transport", "quic", "--help"])
+            .output()
+            .unwrap();
         assert_eq!(o.status.code(), Some(0));
         let o = Command::new(bin).arg("--version").output().unwrap();
         assert_eq!(o.status.code(), Some(0));
     }
     for args in [
-        &[][..],
-        &["serve"],
-        &["observe"],
-        &["observe", "--identity-dir", "/tmp/x"],
-        &["observe", "--alpn", ALPN],
+        &["observe", "--transport", "quic"][..],
+        &["observe", "--transport", "udp"],
+        &["observe", "--transport", "tcp", "--transport", "quic"],
+        &["observe", "--transport", "quic", "--identity-dir", "/tmp/x"],
+        &["observe", "--transport", "quic", "--alpn", ALPN],
+        // QUIC options without `--transport quic` go to the TCP observer.
+        &["observe", "--alpn", ALPN, "--identity-dir", "/tmp/x"],
         &[
             "observe",
+            "--transport",
+            "quic",
             "--alpn",
             ALPN,
             "--identity-dir",
@@ -153,11 +166,23 @@ fn help_version_and_usage_statuses() {
         ],
         &[
             "observe",
+            "--transport",
+            "quic",
             "--alpn",
             ALPN,
             "--identity-dir",
             "/tmp/x",
             "--ssh",
+        ],
+        &[
+            "observe",
+            "--transport",
+            "quic",
+            "--alpn",
+            ALPN,
+            "--identity-dir",
+            "/tmp/x",
+            "--banner-only",
         ],
     ] {
         let o = Command::new(SERVER).args(args).output().unwrap();
@@ -169,19 +194,36 @@ fn help_version_and_usage_statuses() {
         assert!(String::from_utf8_lossy(&o.stderr).contains("Usage:"));
     }
     for args in [
-        &[][..],
-        &["handshake"],
-        &["handshake", "127.0.0.1"],
-        &["handshake", "127.0.0.1", "--alpn", ALPN],
+        &["handshake", "--transport", "quic"][..],
+        &["handshake", "127.0.0.1", "--transport", "quic"],
+        &[
+            "handshake",
+            "127.0.0.1",
+            "--transport",
+            "quic",
+            "--alpn",
+            ALPN,
+        ],
+        &[
+            "handshake",
+            "127.0.0.1",
+            "--transport",
+            "quic",
+            "--alpn",
+            ALPN,
+            "--cert-sha256",
+            "nope",
+        ],
+        // QUIC options without `--transport quic` go to the TCP handshake.
         &[
             "handshake",
             "127.0.0.1",
             "--alpn",
             ALPN,
             "--cert-sha256",
-            "nope",
+            "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8",
         ],
-        &["probe", "127.0.0.1"],
+        &["probe", "127.0.0.1", "--transport", "quic"],
     ] {
         let o = Command::new(CLIENT).args(args).output().unwrap();
         assert_eq!(o.status.code(), Some(2), "{args:?}");
@@ -196,6 +238,8 @@ fn missing_identity_without_generate_flag_exits_1() {
     let o = Command::new(SERVER)
         .args([
             "observe",
+            "--transport",
+            "quic",
             "--listen",
             "127.0.0.1:0",
             "--alpn",
@@ -456,6 +500,8 @@ fn text_report_reuses_identity_and_finite_run_exits_0() {
         .args([
             "handshake",
             "127.0.0.1",
+            "--transport",
+            "quic",
             "--port",
             &second.addr.port().to_string(),
         ])

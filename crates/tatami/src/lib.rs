@@ -13,7 +13,7 @@
 //! | `quic` | Enables the `tatami-quic` binding, re-exported as `quic`. |
 //! | `std` | Enables `host` and forwards `std` to any enabled binding. |
 //! | `kex` | Enables the portable TCP key-exchange profile in `tatami-tcp` and `tatami-keys`, and with `std` the `client::handshake` module and the `tatami-client handshake` command. |
-//! | `quic-diag` | Enables the host-only QUIC/TLS diagnostic backend and the `tatami-quic-*` binaries. |
+//! | `quic-diag` | Enables the host-only QUIC/TLS diagnostic backend and, with `tcp`, the `--transport quic` mode of the `tatami-client handshake` and `tatami-server observe` commands. |
 //!
 //! `std` never selects a transport on its own: with `std` alone, no binding
 //! is compiled. Bindings are independent; either, both or neither may be
@@ -28,7 +28,10 @@
 //! which performs key exchange, verifies the host signature against an
 //! operator-supplied `SHA256:` pin and requests `ssh-userauth` but never
 //! authenticates a user. The server offers the TCP diagnostic observer
-//! (`server::observe`), which performs no key exchange.
+//! (`server::observe`), which performs no key exchange. When `quic-diag` is
+//! also enabled, both binaries accept `--transport quic` for the
+//! experimental QUIC/TLS handshake diagnostic (`quic_diag`); there are no
+//! separate QUIC binaries.
 //!
 //! # Portability
 //!

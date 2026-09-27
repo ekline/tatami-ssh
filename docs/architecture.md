@@ -19,7 +19,7 @@ documentation-only.
 | Allocation permitted, no OS | `tatami-keys`, `tatami-auth`, `tatami-connection` | Always `no_std` with `alloc`; no `std` feature. `tatami-keys/ed25519` adds pure-Rust verification and fingerprints, still `no_std`. |
 | Portable binding state with optional host integration | `tatami-tcp`, `tatami-quic` | Always `no_std` with `alloc`; `std` exposes `io` modules. `tatami-tcp/kex` is **portable `no_std` crypto** (pure Rust, entropy injected via `rand_core`; `getrandom` only under `std`). |
 | Host-only backend | `tatami-quic/quinn-backend` | Enables `std`; pulls `quinn-proto`, `rustls`, `ring` (C/assembly), `rcgen`. Never present in default, `tcp`-only or portable builds (`check-workspace.sh` verifies both directions). |
-| Application composition | `tatami` | Portable `client`/`server` modules; `std` exposes `host::{environment,process,pty}`; `kex` = `tcp` + portable crypto; `quic-diag` = `std` + `quic` + backend, enabling the `tatami-quic-*` binaries. |
+| Application composition | `tatami` | Portable `client`/`server` modules; `std` exposes `host::{environment,process,pty}`; `kex` = `tcp` + portable crypto; `quic-diag` = `std` + `quic` + backend, adding `--transport quic` to the `tatami-client`/`tatami-server` binaries (W-35). |
 
 `alloc` provides owned collections without requiring `std`. A final application
 that uses them needs an allocator; the libraries do not install one. Passing a
@@ -85,7 +85,9 @@ no-allocation mode for them.
 | `std,tcp,quic` | Both with `std` | Facade and both bindings |
 | `kex` (implies `tcp`) | TCP + `tatami-tcp/kex` + `tatami-keys/ed25519` | None; portable — `check-workspace.sh` checks it on `thumbv7em-none-eabi` (CI gate; first run not yet observed) |
 | `std,tcp,kex` | as above with `std` | `tatami-client handshake` |
-| `quic-diag` (implies `std,quic`) | QUIC + `tatami-quic/quinn-backend` | `tatami::quic_diag`, `tatami-quic-server`, `tatami-quic-client` |
+| `quic-diag` (implies `std,quic`) | QUIC + `tatami-quic/quinn-backend` | `tatami::quic_diag` (no binaries without `tcp`) |
+| `std,tcp,quic-diag` | TCP with `std` + QUIC backend | `tatami-client probe`, `tatami-client handshake --transport quic`, `tatami-server observe [--transport quic]` |
+| `std,tcp,kex,quic-diag` | everything above | every command of both binaries (W-35) |
 
 Weak dependency feature forwarding (`tatami-tcp?/std`, `tatami-quic?/std`) ensures
 that `std` does not itself select a transport. Cargo features are additive and
@@ -124,8 +126,8 @@ locally; CI installs it and requires the step.
 | `crates/tatami-tcp/tests/openssh_handshake.rs` | Interop against a locally spawned OpenSSH `sshd` (skips if absent) (round 4) |
 | `crates/tatami-quic/src/diag/{mod,identity,tls,server,client,inmem,udp}.rs` (`quinn-backend`) | QUIC/TLS diagnostic handshake observer: sans-I/O `ServerCore`/`ClientCore`, recording `ResolvesServerCert`, pinned certificate and RFC 7250 raw-public-key verifiers, rcgen test identities, in-memory pair for tests, UDP adapter (round 4) |
 | `crates/tatami-quic/tests/{inmem_handshake,loopback,exporter,rpk}.rs` | Evidence for the QUIC experiment (see `quic-observer-readiness.md`) (round 4) |
-| `crates/tatami/src/quic_diag/` (`quic-diag`) | Options, JSON Lines encoder and text reports for the `tatami-quic-*` binaries (round 4) |
-| `crates/tatami/src/bin/tatami-quic-{server,client}.rs` | `observe` and `handshake` executables (`quic-diag`) (round 4) |
+| `crates/tatami/src/quic_diag/` (`quic-diag`) | Options, JSON Lines encoder and text reports for `--transport quic` (round 4) |
+| `crates/tatami/src/bin/tatami-{server,client}.rs` | `observe` and `probe`/`handshake` executables; `--transport quic` with `quic-diag` (W-35) |
 | `scripts/openssh-fixture.sh` | Reproducible loopback `sshd` with an ephemeral Ed25519 key; prints the pin and the exact handshake command (round 4) |
 | `docs/crypto-provider-audit.md` | Provider versions, features, MSRV, `no_std` evidence, MAC-list policy, QUIC backend constraints (round 4) |
 | `crates/tatami-tcp/src/io/seam.rs` | Internal `Conn`/`Clock` seam with a scripted connection and virtual clock for deterministic adapter tests (`std`, `pub(crate)`) |

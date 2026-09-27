@@ -33,9 +33,10 @@ Early. What runs today (round 4, 2026-09-20):
   `SERVICE_ACCEPT` for `ssh-userauth`, then a protected `DISCONNECT`. It
   never authenticates a user and never rekeys. Verified against a local
   `OpenSSH_10.2p1` sshd (see below).
-- **`tatami-quic-server observe` / `tatami-quic-client handshake`** (feature
-  `quic-diag`) — a QUIC v1 + TLS 1.3 **handshake observer experiment** on
-  `quinn-proto` + `rustls`. It completes and reports handshakes; it carries
+- **`tatami-server observe --transport quic` / `tatami-client handshake
+  --transport quic`** (feature `quic-diag`) — a QUIC v1 + TLS 1.3
+  **handshake observer experiment** on `quinn-proto` + `rustls`, built into
+  the same two binaries. It completes and reports handshakes; it carries
   **no SSH bytes** and is not SSH over QUIC.
 
 Library pieces behind that: bounded SSH primitive codecs (including `mpint`)
@@ -215,16 +216,26 @@ on sshd's. No authentication attempt appears in any log.
 ```sh
 # Server: generates a self-signed Ed25519 test identity into DIR on first run
 # and prints its certificate SHA-256 to stderr.
-cargo run -p tatami --features quic-diag --bin tatami-quic-server -- \
-  observe --listen 127.0.0.1:4433 --alpn tatami-diag/0 \
+cargo run -p tatami --features std,tcp,quic-diag --bin tatami-server -- \
+  observe --transport quic --listen 127.0.0.1:4433 --alpn tatami-diag/0 \
   --identity-dir target/quic-identity --generate-identity \
   [--require-validation] [--timeout 5s] [--max-connections N] [--run-for 10m]
 
 # Client: pins that certificate fingerprint (not an SSH host-key fingerprint).
-cargo run -p tatami --features quic-diag --bin tatami-quic-client -- \
-  handshake 127.0.0.1 --port 4433 --server-name localhost --alpn tatami-diag/0 \
-  --cert-sha256 'SHA256:…' --exporter-probe [--json]
+cargo run -p tatami --features std,tcp,quic-diag --bin tatami-client -- \
+  handshake 127.0.0.1 --transport quic --port 4433 --server-name localhost \
+  --alpn tatami-diag/0 --cert-sha256 'SHA256:…' --exporter-probe [--json]
 ```
+
+QUIC is a mode of the ordinary `tatami-client` and `tatami-server`
+binaries, not a separate program. `--transport` defaults to `tcp`, so
+existing TCP command lines are unchanged. Each transport accepts only its
+own options (for example `--alpn` is rejected without `--transport quic`,
+`--banner-only` with it) and keeps its own defaults (QUIC: UDP port 4433,
+5 s handshake deadline). A build without `quic-diag` reports
+`--transport quic` as a usage error (exit 2), just as a build without `kex`
+does for the TCP handshake. Build with `--features std,tcp,kex,quic-diag`
+to get every command in one pair of binaries.
 
 This is **experimental**: `quinn-proto` 0.11.18 + `rustls` 0.23.45 on `ring`,
 host-only, behind `tatami-quic/quinn-backend` (`docs/decisions.md` W-31). The

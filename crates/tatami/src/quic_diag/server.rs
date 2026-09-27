@@ -1,4 +1,4 @@
-//! `tatami-quic-server observe`: options, identity loading, JSON Lines
+//! `tatami-server observe --transport quic`: options, identity loading, JSON Lines
 //! records and a blocking `run` over [`tatami_quic::diag::server`].
 //!
 //! # `quic_handshake_observation` record

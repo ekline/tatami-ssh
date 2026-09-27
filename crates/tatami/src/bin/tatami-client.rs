@@ -5,9 +5,11 @@
 //! an untrusted host key) or a network/protocol/output failure, 2 for usage
 //! errors or unsupported commands.
 //!
-//! The `handshake` command exists only in builds with the `kex` feature; in
-//! other builds it is reported as a usage error so scripts can tell the two
-//! situations apart.
+//! `handshake` selects its transport with `--transport tcp|quic` (default
+//! `tcp`). The TCP handshake exists only in builds with the `kex` feature and
+//! the experimental QUIC/TLS handshake only in builds with `quic-diag`; a
+//! transport missing from the build is reported as a usage error so scripts
+//! can tell the two situations apart.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -17,6 +19,8 @@ use tatami::client::probe::{Options, run};
 
 #[cfg(feature = "kex")]
 use tatami::client::handshake;
+#[cfg(feature = "quic-diag")]
+use tatami::quic_diag::client as quic_client;
 
 const NAME: &str = "tatami-client";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,29 +32,45 @@ Usage:
   tatami-client handshake HOST --host-key-sha256 'SHA256:...' [--port PORT]
                            [--connect-timeout DURATION] [--timeout DURATION]
                            [--no-ext-info] [--no-strict-kex] [--json]
+  tatami-client handshake HOST --transport quic --alpn PROTO
+                           (--cert-sha256 FINGERPRINT | --root-cert FILE)
+                           [--port PORT] [--server-name NAME]
+                           [--exporter-probe] [--timeout DURATION] [--json]
   tatami-client --help
   tatami-client --version
 
 Commands:
-  probe       Connect to HOST:PORT, send a client identification, and report
-              the server identification and its initial KEXINIT proposal. No
-              key exchange is performed and no client KEXINIT is sent; a
-              server that waits for the client's proposal will time out with
-              a partial result.
-  handshake   Connect to HOST:PORT and perform the first interoperability
-              profile's key exchange (curve25519-sha256, ssh-ed25519,
-              aes128-gcm@openssh.com, strict KEX): verify the host signature,
-              compare the host key's SHA-256 fingerprint with the pin given
-              by --host-key-sha256, exchange NEWKEYS, request the ssh-userauth
-              service and disconnect. No user is ever authenticated. Requires
-              a build with --features std,tcp,kex.
+  probe       Connect to HOST:PORT over TCP, send a client identification,
+              and report the server identification and its initial KEXINIT
+              proposal. No key exchange is performed and no client KEXINIT is
+              sent; a server that waits for the client's proposal will time
+              out with a partial result. TCP only.
+  handshake   With --transport tcp (the default): connect to HOST:PORT and
+              perform the first interoperability profile's key exchange
+              (curve25519-sha256, ssh-ed25519, aes128-gcm@openssh.com, strict
+              KEX): verify the host signature, compare the host key's SHA-256
+              fingerprint with the pin given by --host-key-sha256, exchange
+              NEWKEYS, request the ssh-userauth service and disconnect.
+              No user is ever authenticated. Requires a build with
+              --features std,tcp,kex.
+
+              With --transport quic: EXPERIMENTAL. Open a QUIC v1 connection
+              to HOST:PORT over UDP, complete a TLS 1.3 handshake, report the
+              outcome, negotiated ALPN and whether the TLS exporter is
+              available, then close with an application CONNECTION_CLOSE. No
+              stream is opened and no datagram is sent, so nothing SSH (no
+              identification, no KEXINIT) can be sent; this is
+              not an SSH client and not an SSH-over-QUIC client. 0-RTT and
+              session resumption are disabled. Requires a build with
+              --features std,tcp,quic-diag.
 
 Options (probe):
   --port PORT                TCP port (default 22)
   --connect-timeout DURATION Deadline for the whole connect phase (default 10s)
   --read-timeout DURATION    Deadline from connect to KEXINIT (default 10s)
 
-Options (handshake):
+Options (handshake, TCP):
+  --transport tcp            Select the SSH transport handshake (default)
   --host-key-sha256 'SHA256:...'
                              REQUIRED. The only host-key fingerprint that will
                              be trusted: 'SHA256:' followed by 43 unpadded
@@ -66,13 +86,40 @@ Options (handshake):
   --no-strict-kex            Do not offer the strict-KEX markers
   --json                     Print one JSON object instead of the text report
 
+Options (handshake --transport quic):
+  --transport quic           Select the experimental QUIC/TLS handshake
+  --alpn PROTO               ALPN value to offer (required; repeat for
+                             several, in preference order). Experimental,
+                             UNREGISTERED; no interoperability with any other
+                             implementation is claimed. There is no default.
+  --cert-sha256 FP           Accept only the server certificate whose DER
+                             hashes to FP ('SHA256:' + 43 unpadded base64
+                             chars, as printed by
+                             `tatami-server observe --transport quic`). FP is
+                             a certificate fingerprint,
+                             not an SSH host-key fingerprint. The TLS
+                             signature is still verified.
+  --root-cert FILE           Instead of a pin, trust certificates chaining to
+                             the single PEM certificate in FILE and valid for
+                             --server-name. No system trust store is used.
+  --port PORT                UDP port (default 4433)
+  --server-name NAME         TLS server name (default HOST). A DNS name is
+                             sent as SNI; an IP literal is not.
+  --exporter-probe           After completion, call the TLS exporter with an
+                             experimental label and report only whether it
+                             succeeded. Output is discarded; it is not a
+                             session binding.
+  --timeout DURATION         Handshake deadline (default 5s)
+  --json                     Print one JSON object instead of the text report
+
   DURATION                   e.g. 5s, 500ms, 2m; must be > 0
 
 HOST may be a name or a numeric IPv4/IPv6 address. IPv6 addresses are given
 bare (no brackets); the port is always a separate option.
 
-Exit status: 0 complete observation or handshake; 1 incomplete or failed
-(including an untrusted host key or a mismatched pin); 2 usage error.
+Exit status: 0 complete observation or handshake; 1 incomplete, failed or
+timed out (including an untrusted host key or a mismatched pin); 2 usage
+error.
 ";
 
 #[cfg(feature = "kex")]
@@ -89,10 +136,49 @@ enum Command {
         options: handshake::Options,
         json: bool,
     },
+    #[cfg(feature = "quic-diag")]
+    QuicHandshake {
+        options: quic_client::Options,
+        json: bool,
+    },
 }
 
 #[derive(Debug)]
 struct UsageError(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Quic,
+}
+
+fn parse_transport(v: &str) -> Result<Transport, UsageError> {
+    match v {
+        "tcp" => Ok(Transport::Tcp),
+        "quic" => Ok(Transport::Quic),
+        _ => Err(UsageError(format!(
+            "invalid --transport {v:?}; expected tcp or quic"
+        ))),
+    }
+}
+
+/// Finds the `--transport` choice before the transport-specific parse,
+/// because each transport accepts a different option set. Repeats must
+/// agree.
+fn select_transport(args: &[String]) -> Result<Transport, UsageError> {
+    let mut selected: Option<Transport> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--transport" {
+            let t = parse_transport(value(&mut it, "--transport")?)?;
+            if selected.is_some_and(|s| s != t) {
+                return Err(UsageError(String::from("conflicting --transport values")));
+            }
+            selected = Some(t);
+        }
+    }
+    Ok(selected.unwrap_or(Transport::Tcp))
+}
 
 fn parse_duration(s: &str) -> Result<Duration, UsageError> {
     let bad = || {
@@ -151,7 +237,10 @@ fn parse_args(args: &[String]) -> Result<Command, UsageError> {
         "--help" | "-h" | "help" => Ok(Command::Help),
         "--version" | "-V" | "version" => Ok(Command::Version),
         "probe" => parse_probe(it),
-        "handshake" => parse_handshake(it),
+        "handshake" => match select_transport(it.as_slice())? {
+            Transport::Tcp => parse_tcp_handshake(it),
+            Transport::Quic => parse_quic_handshake(it),
+        },
         other => Err(UsageError(format!("unsupported command {other:?}"))),
     }
 }
@@ -168,6 +257,13 @@ fn parse_probe(mut it: std::slice::Iter<'_, String>) -> Result<Command, UsageErr
             "--read-timeout" => {
                 options.io.read_timeout = parse_duration(value(&mut it, "--read-timeout")?)?;
             }
+            "--transport" => {
+                if parse_transport(value(&mut it, "--transport")?)? != Transport::Tcp {
+                    return Err(UsageError(String::from(
+                        "probe is TCP-only; for QUIC use `handshake --transport quic`",
+                    )));
+                }
+            }
             "--help" | "-h" => return Ok(Command::Help),
             s if s.starts_with('-') => return Err(UsageError(format!("unknown option {s:?}"))),
             s => {
@@ -183,14 +279,14 @@ fn parse_probe(mut it: std::slice::Iter<'_, String>) -> Result<Command, UsageErr
 }
 
 #[cfg(not(feature = "kex"))]
-fn parse_handshake(_it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
+fn parse_tcp_handshake(_it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
     Err(UsageError(String::from(
         "handshake requires a build with --features std,tcp,kex (this build lacks the kex feature)",
     )))
 }
 
 #[cfg(feature = "kex")]
-fn parse_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
+fn parse_tcp_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
     use tatami::keys::fingerprint::Sha256Fingerprint;
 
     let mut host: Option<String> = None;
@@ -220,6 +316,10 @@ fn parse_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, Usag
             "--no-ext-info" => config.advertise_ext_info = false,
             "--no-strict-kex" => config.offer_strict_kex = false,
             "--json" => json = true,
+            // Already validated by `select_transport`.
+            "--transport" => {
+                value(&mut it, "--transport")?;
+            }
             "--help" | "-h" => return Ok(Command::Help),
             s if s.starts_with('-') => return Err(UsageError(format!("unknown option {s:?}"))),
             s => {
@@ -240,6 +340,116 @@ fn parse_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, Usag
     options.io = io;
     options.config = config;
     Ok(Command::Handshake { options, json })
+}
+
+#[cfg(not(feature = "quic-diag"))]
+fn parse_quic_handshake(_it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
+    Err(UsageError(String::from(
+        "handshake --transport quic requires a build with --features std,tcp,quic-diag (this build lacks the quic-diag feature)",
+    )))
+}
+
+#[cfg(feature = "quic-diag")]
+fn parse_alpn(s: &str) -> Result<Vec<u8>, UsageError> {
+    if s.is_empty() || s.len() > 255 {
+        return Err(UsageError(format!(
+            "--alpn value must be 1-255 bytes, got {} bytes",
+            s.len()
+        )));
+    }
+    Ok(s.as_bytes().to_vec())
+}
+
+#[cfg(feature = "quic-diag")]
+fn read_root_cert(path: &str) -> Result<Vec<u8>, UsageError> {
+    use tatami::quic::diag::rustls::pki_types::CertificateDer;
+    use tatami::quic::diag::rustls::pki_types::pem::PemObject as _;
+    let pem = std::fs::read(path)
+        .map_err(|e| UsageError(format!("cannot read --root-cert {path:?}: {e}")))?;
+    let der = CertificateDer::from_pem_slice(&pem).map_err(|e| {
+        UsageError(format!(
+            "--root-cert {path:?} does not contain one CERTIFICATE PEM block: {e}"
+        ))
+    })?;
+    Ok(der.as_ref().to_vec())
+}
+
+#[cfg(feature = "quic-diag")]
+fn parse_quic_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
+    use tatami::quic::diag::identity::CertificateSha256;
+    use tatami::quic::diag::tls::ClientTrust;
+
+    const ONE_TRUST: &str = "give exactly one of --cert-sha256 or --root-cert";
+
+    let mut host: Option<String> = None;
+    let mut port: u16 = 4433;
+    let mut server_name: Option<String> = None;
+    let mut alpn: Vec<Vec<u8>> = Vec::new();
+    let mut trust: Option<ClientTrust> = None;
+    let mut timeout = Duration::from_secs(5);
+    let mut exporter_probe = false;
+    let mut json = false;
+
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--port" => port = parse_port(value(&mut it, "--port")?)?,
+            "--server-name" => {
+                let v = value(&mut it, "--server-name")?;
+                if v.is_empty() {
+                    return Err(UsageError(String::from("--server-name must not be empty")));
+                }
+                server_name = Some(v.clone());
+            }
+            "--alpn" => alpn.push(parse_alpn(value(&mut it, "--alpn")?)?),
+            "--cert-sha256" => {
+                let v = value(&mut it, "--cert-sha256")?;
+                let fp = CertificateSha256::parse(v)
+                    .map_err(|e| UsageError(format!("invalid --cert-sha256 {v:?}: {e}")))?;
+                if trust.is_some() {
+                    return Err(UsageError(String::from(ONE_TRUST)));
+                }
+                trust = Some(ClientTrust::PinnedCertificateSha256(fp));
+            }
+            "--root-cert" => {
+                let v = value(&mut it, "--root-cert")?;
+                if trust.is_some() {
+                    return Err(UsageError(String::from(ONE_TRUST)));
+                }
+                trust = Some(ClientTrust::RootCertificate(read_root_cert(v)?));
+            }
+            "--exporter-probe" => exporter_probe = true,
+            "--timeout" => timeout = parse_duration(value(&mut it, "--timeout")?)?,
+            "--json" => json = true,
+            // Already validated by `select_transport`.
+            "--transport" => {
+                value(&mut it, "--transport")?;
+            }
+            "--help" | "-h" => return Ok(Command::Help),
+            s if s.starts_with('-') => return Err(UsageError(format!("unknown option {s:?}"))),
+            s => {
+                if host.is_some() {
+                    return Err(UsageError(format!("unexpected extra argument {s:?}")));
+                }
+                host = Some(String::from(s));
+            }
+        }
+    }
+    let host = check_host(host, "handshake")?;
+    if alpn.is_empty() {
+        return Err(UsageError(String::from(
+            "--alpn is required: the value is experimental and must be chosen explicitly",
+        )));
+    }
+    let trust = trust.ok_or_else(|| {
+        UsageError(String::from(
+            "a trust anchor is required: --cert-sha256 FINGERPRINT (from the server's stderr) or --root-cert FILE",
+        ))
+    })?;
+    let mut options = quic_client::Options::new(host, port, alpn, trust);
+    options.server_name = server_name;
+    options.handshake_timeout = timeout;
+    options.exporter_probe = exporter_probe;
+    Ok(Command::QuicHandshake { options, json })
 }
 
 /// Writes the whole report to stdout; a failure here (for example a closed
@@ -287,6 +497,45 @@ fn run_handshake(options: &handshake::Options, json: bool) -> ExitCode {
     }
 }
 
+#[cfg(feature = "quic-diag")]
+fn run_quic_handshake(options: &quic_client::Options, json: bool) -> ExitCode {
+    eprintln!(
+        "{NAME}: EXPERIMENTAL QUIC v1/TLS 1.3 handshake to {}:{} (server name {}, ALPN {}, unregistered; timeout {:?}); 0-RTT disabled; no application data; not an SSH client",
+        options.host,
+        options.port,
+        options.effective_server_name(),
+        options
+            .alpn
+            .iter()
+            .map(|a| tatami::text::escape_bytes(a))
+            .collect::<Vec<_>>()
+            .join(","),
+        options.handshake_timeout
+    );
+    let report = quic_client::run(options);
+    let mut text = if json {
+        report.to_json().to_json()
+    } else {
+        let mut s = String::new();
+        // Writing into a String cannot fail.
+        let _ = report.write_text(&mut s);
+        s
+    };
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if let Err(e) = emit(&text) {
+        eprintln!("{NAME}: failed to write the report to stdout: {e}");
+        return ExitCode::from(1);
+    }
+    if report.is_complete() {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("{NAME}: QUIC handshake not completed");
+        ExitCode::from(1)
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
@@ -330,6 +579,8 @@ fn main() -> ExitCode {
         }
         #[cfg(feature = "kex")]
         Command::Handshake { options, json } => run_handshake(&options, json),
+        #[cfg(feature = "quic-diag")]
+        Command::QuicHandshake { options, json } => run_quic_handshake(&options, json),
     }
 }
 
@@ -512,5 +763,205 @@ mod tests {
             e.contains("requires a build with --features std,tcp,kex"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn transport_selection() {
+        let t = |a: &[&str]| select_transport(&args(a));
+        assert_eq!(t(&["h"]).unwrap(), Transport::Tcp);
+        assert_eq!(t(&["h", "--transport", "tcp"]).unwrap(), Transport::Tcp);
+        assert_eq!(t(&["--transport", "quic", "h"]).unwrap(), Transport::Quic);
+        assert_eq!(
+            t(&["--transport", "quic", "h", "--transport", "quic"]).unwrap(),
+            Transport::Quic
+        );
+        assert!(t(&["h", "--transport", "udp"]).is_err());
+        assert!(t(&["h", "--transport"]).is_err());
+        let e = t(&["--transport", "tcp", "--transport", "quic"])
+            .err()
+            .unwrap()
+            .0;
+        assert!(e.contains("conflicting"), "{e}");
+
+        assert!(parse_args(&args(&["probe", "h", "--transport", "tcp"])).is_ok());
+        let e = parse_args(&args(&["probe", "h", "--transport", "quic"]))
+            .err()
+            .unwrap()
+            .0;
+        assert!(e.contains("TCP-only"), "{e}");
+    }
+
+    #[cfg(feature = "kex")]
+    #[test]
+    fn explicit_tcp_transport_and_quic_options_rejected_for_tcp() {
+        assert!(matches!(
+            parse_args(&args(&[
+                "handshake",
+                "h",
+                "--transport",
+                "tcp",
+                "--host-key-sha256",
+                PIN
+            ])),
+            Ok(Command::Handshake { .. })
+        ));
+        assert!(
+            parse_args(&args(&[
+                "handshake",
+                "h",
+                "--host-key-sha256",
+                PIN,
+                "--alpn",
+                "x"
+            ]))
+            .is_err(),
+            "--alpn belongs to the QUIC transport"
+        );
+    }
+
+    #[cfg(not(feature = "quic-diag"))]
+    #[test]
+    fn quic_handshake_is_a_usage_error_without_quic_diag() {
+        let e = parse_args(&args(&[
+            "handshake",
+            "h",
+            "--transport",
+            "quic",
+            "--alpn",
+            "x",
+            "--cert-sha256",
+            PIN,
+        ]))
+        .err()
+        .expect("usage error")
+        .0;
+        assert!(
+            e.contains("requires a build with --features std,tcp,quic-diag"),
+            "{e}"
+        );
+    }
+
+    #[cfg(feature = "quic-diag")]
+    #[test]
+    fn parses_quic_handshake() {
+        use tatami::quic::diag::tls::ClientTrust;
+
+        let Command::QuicHandshake { options: o, json } = parse_args(&args(&[
+            "handshake",
+            "2001:db8::10",
+            "--transport",
+            "quic",
+            "--port",
+            "4434",
+            "--server-name",
+            "example.test",
+            "--alpn",
+            "tatami-diag/0",
+            "--cert-sha256",
+            PIN,
+            "--exporter-probe",
+            "--timeout",
+            "2s",
+            "--json",
+        ]))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.host, "2001:db8::10");
+        assert_eq!(o.port, 4434);
+        assert_eq!(o.effective_server_name(), "example.test");
+        assert_eq!(o.alpn, vec![b"tatami-diag/0".to_vec()]);
+        assert!(matches!(o.trust, ClientTrust::PinnedCertificateSha256(_)));
+        assert!(o.exporter_probe);
+        assert_eq!(o.handshake_timeout, Duration::from_secs(2));
+        assert!(json);
+
+        let Command::QuicHandshake { options: o, json } = parse_args(&args(&[
+            "handshake",
+            "--transport",
+            "quic",
+            "h",
+            "--alpn",
+            "x",
+            "--cert-sha256",
+            PIN,
+        ]))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.port, 4433);
+        assert_eq!(o.handshake_timeout, Duration::from_secs(5));
+        assert_eq!(o.effective_server_name(), "h");
+        assert!(!o.exporter_probe);
+        assert!(!json);
+    }
+
+    #[cfg(feature = "quic-diag")]
+    #[test]
+    fn rejects_bad_quic_usage() {
+        let q = |rest: &[&str]| {
+            let mut a = vec!["handshake", "--transport", "quic"];
+            a.extend_from_slice(rest);
+            parse_args(&args(&a))
+        };
+        for rest in [
+            &[][..],
+            &["h"],
+            &["h", "--alpn", "x"],
+            &["h", "--cert-sha256", PIN],
+            &["h", "--alpn", "", "--cert-sha256", PIN],
+            &["h", "--alpn", "x", "--cert-sha256", "SHA256:short"],
+            &["h", "--alpn", "x", "--cert-sha256", PIN, "--port", "0"],
+            &["h", "--alpn", "x", "--cert-sha256", PIN, "--timeout", "0s"],
+            &[
+                "h",
+                "--alpn",
+                "x",
+                "--cert-sha256",
+                PIN,
+                "--cert-sha256",
+                PIN,
+            ],
+            &["h", "--alpn", "x", "--cert-sha256", PIN, "--bogus"],
+            &["h", "--alpn", "x", "--cert-sha256", PIN, "extra"],
+            &["h", "--alpn", "x", "--root-cert", "/nonexistent/root.pem"],
+            // TCP-only options are not accepted by the QUIC transport.
+            &[
+                "h",
+                "--alpn",
+                "x",
+                "--cert-sha256",
+                PIN,
+                "--host-key-sha256",
+                PIN,
+            ],
+            &["h", "--alpn", "x", "--cert-sha256", PIN, "--no-strict-kex"],
+            &[
+                "h",
+                "--alpn",
+                "x",
+                "--cert-sha256",
+                PIN,
+                "--transport",
+                "tcp",
+            ],
+        ] {
+            assert!(q(rest).is_err(), "{rest:?}");
+        }
+    }
+
+    #[test]
+    fn help_states_the_quic_caveats() {
+        for word in [
+            "EXPERIMENTAL",
+            "UNREGISTERED",
+            "no interoperability",
+            "not an SSH client",
+            "0-RTT",
+            "not an SSH host-key fingerprint",
+            "--transport quic",
+        ] {
+            assert!(USAGE.contains(word), "help text lacks {word:?}");
+        }
     }
 }

@@ -1,8 +1,9 @@
 //! QUIC/TLS diagnostic handshake facade (feature `quic-diag`).
 //!
-//! Thin composition over [`tatami_quic::diag`] for the `tatami-quic-server`
-//! and `tatami-quic-client` binaries: option types, identity loading, JSON
-//! Lines encoding and text rendering. It adds no protocol behaviour.
+//! Thin composition over [`tatami_quic::diag`] for the `--transport quic`
+//! mode of `tatami-server observe` and `tatami-client handshake`: option
+//! types, identity loading, JSON Lines encoding and text rendering. It adds
+//! no protocol behaviour.
 //!
 //! This is observer (a) of `docs/quic-observer-readiness.md`: it completes
 //! TLS 1.3 handshakes over QUIC v1 and reports them. It is **experimental**,
