@@ -1,0 +1,57 @@
+[package]
+name = "tatami_ssh"
+description = "Reusable SSH client and server composition for Tatami"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Exposes `host::{environment, process, pty}` and `client::probe`. Forwards
+# `std` to whichever bindings are enabled without itself selecting a transport.
+std = ["tatami_ssh_tcp?/std", "tatami_ssh_quic?/std"]
+tcp = ["dep:tatami_ssh_tcp"]
+quic = ["dep:tatami_ssh_quic"]
+# Portable TCP key exchange, host-key verification and packet protection
+# (first interoperability profile; see docs/crypto-provider-audit.md).
+# Also enables read-only known_hosts parsing (portable), used by
+# `tatami-client handshake --known-hosts` with `std`.
+kex = ["tcp", "tatami_ssh_tcp?/kex", "tatami_ssh_keys/ed25519", "tatami_ssh_keys/known-hosts"]
+# Host-only QUIC/TLS diagnostic handshake backend (quinn-proto + rustls).
+# Requires std; pulls ring (C/asm). Adds `--transport quic` to the
+# tatami-client and tatami-server binaries (which also need `tcp`), with
+# SSH host keys as RFC 7250 raw public keys (OpenSSH key files, known_hosts).
+quic-diag = [
+    "std",
+    "quic",
+    "tatami_ssh_quic?/quinn-backend",
+    "tatami_ssh_keys/known-hosts",
+    "tatami_ssh_keys/openssh-key",
+]
+
+[dependencies]
+tatami_ssh_keys = { workspace = true }
+tatami_ssh_auth = { workspace = true }
+tatami_ssh_connection = { workspace = true }
+tatami_ssh_tcp = { workspace = true, optional = true }
+tatami_ssh_quic = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Test-only: an independent JSON parser to validate JSON Lines output.
+# MSRV 1.56; never a dependency of any library target.
+serde_json = "1"
+# Test-only: decoding fixture public keys.
+base64ct = { version = "1.6", features = ["alloc"] }
+
+[[bin]]
+name = "tatami-client"
+path = "src/bin/tatami-client.rs"
+required-features = ["std", "tcp"]
+
+[[bin]]
+name = "tatami-server"
+path = "src/bin/tatami-server.rs"
+required-features = ["std", "tcp"]

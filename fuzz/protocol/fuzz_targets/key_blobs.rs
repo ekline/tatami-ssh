@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami-keys`: public-key and signature blob codecs, `ssh-ed25519` host
+//! `tatami_ssh_keys`: public-key and signature blob codecs, `ssh-ed25519` host
 //! keys and signatures, `SHA256:` fingerprints and the pinned trust policy.
 //!
 //! # Input layout
@@ -38,20 +38,20 @@
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use libfuzzer_sys::fuzz_target;
 use sha2::{Digest, Sha256};
-use tatami_fuzz_protocol::kex_support::base64;
-use tatami_fuzz_protocol::kex_support::crypto::{ed25519_key_blob, ed25519_sig_blob, string};
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_keys::blob::{
+use tatami_ssh_fuzz_protocol::kex_support::base64;
+use tatami_ssh_fuzz_protocol::kex_support::crypto::{ed25519_key_blob, ed25519_sig_blob, string};
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_keys::blob::{
     ED25519_BLOB_LEN, ED25519_SIGNATURE_BLOB_LEN, PublicKeyBlob, SignatureBlob, encode_ed25519_blob,
 };
-use tatami_keys::ed25519::{Ed25519PublicKey, Ed25519Signature, HostKey};
-use tatami_keys::error::{BlobError, KeyError, VerifyError};
-use tatami_keys::fingerprint::{FingerprintParseError, Sha256Fingerprint};
-use tatami_keys::trust::{
+use tatami_ssh_keys::ed25519::{Ed25519PublicKey, Ed25519Signature, HostKey};
+use tatami_ssh_keys::error::{BlobError, KeyError, VerifyError};
+use tatami_ssh_keys::fingerprint::{FingerprintParseError, Sha256Fingerprint};
+use tatami_ssh_keys::trust::{
     HostIdentity, HostTrustPolicy, NoTrustPolicy, PinnedSha256, TrustDecision, TrustSource,
     UntrustedReason,
 };
-use tatami_wire::{DecodeError, EncodeError};
+use tatami_ssh_wire::{DecodeError, EncodeError};
 
 // ---------------------------------------------------------------------------
 // Reference layouts.

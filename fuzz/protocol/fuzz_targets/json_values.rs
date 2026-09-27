@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami::json::Value` serialization and `tatami::text` escaping against
+//! `tatami_ssh::json::Value` serialization and `tatami_ssh::text` escaping against
 //! independent references (`state_support::json_ref`) and `serde_json`.
 //!
 //! # Input layout
@@ -53,12 +53,12 @@
 //!   quoted form in a JSON string round-trips through the tokenizer.
 
 use libfuzzer_sys::fuzz_target;
-use tatami::json::Value;
-use tatami::text::{escape_bytes, quoted};
-use tatami_fuzz_protocol::state_support::json_ref::{
+use tatami_ssh::json::Value;
+use tatami_ssh::text::{escape_bytes, quoted};
+use tatami_ssh_fuzz_protocol::state_support::json_ref::{
     self, Node, collect_strings, decode_hex_lower, scan_strings, unescape_terminal,
 };
-use tatami_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
 
 const MAX_NODES: usize = 64;
 const MAX_DEPTH: usize = 6;

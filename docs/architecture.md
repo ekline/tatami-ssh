@@ -6,20 +6,20 @@ in `tatami-ssh-design-state-checkpoint.md`.
 
 All libraries are `no_std`. All seven proposed package boundaries exist so
 that the layout, dependency direction and feature policy can be checked
-mechanically. `tatami-wire`, `tatami-keys`, `tatami-tcp`, `tatami-connection`,
-`tatami-quic` (diagnostic backend only) and the `tatami` facade contain
-working code (see "Implemented" below); `tatami-auth` remains
+mechanically. `tatami_ssh_wire`, `tatami_ssh_keys`, `tatami_ssh_tcp`, `tatami_ssh_connection`,
+`tatami_ssh_quic` (diagnostic backend only) and the `tatami_ssh` facade contain
+working code (see "Implemented" below); `tatami_ssh_auth` remains
 documentation-only.
 
 ## Portability layers
 
 | Layer | Packages | Policy |
 |---|---|---|
-| No allocation required | `tatami-wire` | Borrowed/caller-buffer codecs by default; owned helpers may use the optional `alloc` feature. |
-| Allocation permitted, no OS | `tatami-keys`, `tatami-auth`, `tatami-connection` | Always `no_std` with `alloc`; no `std` feature. `tatami-keys/ed25519` adds pure-Rust verification, fingerprints, strict SPKI conversion and SSHFP values; `known-hosts` (parser/policy over bytes) and `openssh-key` (private-key decoding from bytes) stay `no_std` and do no I/O. |
-| Portable binding state with optional host integration | `tatami-tcp`, `tatami-quic` | Always `no_std` with `alloc`; `std` exposes `io` modules. `tatami-tcp/kex` is **portable `no_std` crypto** (pure Rust, entropy injected via `rand_core`; `getrandom` only under `std`). |
-| Host-only backend | `tatami-quic/quinn-backend` | Enables `std`; pulls `quinn-proto`, `rustls`, `ring` (C/assembly), `rcgen`. Never present in default, `tcp`-only or portable builds (`check-workspace.sh` verifies both directions). |
-| Application composition | `tatami` | Portable `client`/`server` modules; `std` exposes `host::{environment,files,process,pty}` (`files`: bounded reads of explicitly named files, owner-only private keys on Unix) and, with `kex` or `quic-diag`, `trust` (pin or `known_hosts` selection); `kex` = `tcp` + portable crypto + `known-hosts`; `quic-diag` = `std` + `quic` + backend + `known-hosts` + `openssh-key`, adding `--transport quic` to the `tatami-client`/`tatami-server` binaries (W-35). |
+| No allocation required | `tatami_ssh_wire` | Borrowed/caller-buffer codecs by default; owned helpers may use the optional `alloc` feature. |
+| Allocation permitted, no OS | `tatami_ssh_keys`, `tatami_ssh_auth`, `tatami_ssh_connection` | Always `no_std` with `alloc`; no `std` feature. `tatami_ssh_keys/ed25519` adds pure-Rust verification, fingerprints, strict SPKI conversion and SSHFP values; `known-hosts` (parser/policy over bytes) and `openssh-key` (private-key decoding from bytes) stay `no_std` and do no I/O. |
+| Portable binding state with optional host integration | `tatami_ssh_tcp`, `tatami_ssh_quic` | Always `no_std` with `alloc`; `std` exposes `io` modules. `tatami_ssh_tcp/kex` is **portable `no_std` crypto** (pure Rust, entropy injected via `rand_core`; `getrandom` only under `std`). |
+| Host-only backend | `tatami_ssh_quic/quinn-backend` | Enables `std`; pulls `quinn-proto`, `rustls`, `ring` (C/assembly), `rcgen`. Never present in default, `tcp`-only or portable builds (`check-workspace.sh` verifies both directions). |
+| Application composition | `tatami_ssh` | Portable `client`/`server` modules; `std` exposes `host::{environment,files,process,pty}` (`files`: bounded reads of explicitly named files, owner-only private keys on Unix) and, with `kex` or `quic-diag`, `trust` (pin or `known_hosts` selection); `kex` = `tcp` + portable crypto + `known-hosts`; `quic-diag` = `std` + `quic` + backend + `known-hosts` + `openssh-key`, adding `--transport quic` to the `tatami-client`/`tatami-server` binaries (W-35). |
 
 `alloc` provides owned collections without requiring `std`. A final application
 that uses them needs an allocator; the libraries do not install one. Passing a
@@ -53,15 +53,15 @@ Each dependency below is a Cargo path dependency declared once in
 
 | Package | Depends on |
 |---|---|
-| `tatami-wire` | No project packages |
-| `tatami-keys` | `wire` |
-| `tatami-auth` | `wire`, `keys` |
-| `tatami-connection` | `wire` |
-| `tatami-tcp` | `wire`, `keys`, `auth`, `connection` |
-| `tatami-quic` | `wire`, `keys`, `auth`, `connection` |
-| `tatami` | `keys`, `auth`, `connection`; optional `tcp` and `quic` |
+| `tatami_ssh_wire` | No project packages |
+| `tatami_ssh_keys` | `wire` |
+| `tatami_ssh_auth` | `wire`, `keys` |
+| `tatami_ssh_connection` | `wire` |
+| `tatami_ssh_tcp` | `wire`, `keys`, `auth`, `connection` |
+| `tatami_ssh_quic` | `wire`, `keys`, `auth`, `connection` |
+| `tatami_ssh` | `keys`, `auth`, `connection`; optional `tcp` and `quic` |
 
-Names in the dependency column omit the `tatami-` prefix. Bindings own their
+Names in the dependency column omit the `tatami_ssh_` prefix. Bindings own their
 distinct transport drivers and compose shared engines; neither shared engines
 nor either binding depend on the facade. No common `Transport`/KEX interface is
 introduced. Client and server remain library modules of the facade, avoiding
@@ -70,11 +70,11 @@ extra empty role-specific packages.
 ## Feature behavior
 
 All package defaults are empty. In the four shared protocol packages the only
-opt-in features are `tatami-wire/alloc` and `tatami-keys/{ed25519,
+opt-in features are `tatami_ssh_wire/alloc` and `tatami_ssh_keys/{ed25519,
 known-hosts, openssh-key}` (providers and portable parsers, not portability
 changes; the latter two imply `ed25519`). The three shared packages other than
-`tatami-wire` permit allocation unconditionally (and enable
-`tatami-wire/alloc` themselves); `--no-default-features` is not a
+`tatami_ssh_wire` permit allocation unconditionally (and enable
+`tatami_ssh_wire/alloc` themselves); `--no-default-features` is not a
 no-allocation mode for them.
 
 | Facade features | Binding dependencies | Host modules |
@@ -87,13 +87,13 @@ no-allocation mode for them.
 | `std,tcp` | TCP with `std` | Facade and TCP; `tatami-client probe`, `tatami-server observe` |
 | `std,quic` | QUIC with `std` | Facade and QUIC (no backend) |
 | `std,tcp,quic` | Both with `std` | Facade and both bindings |
-| `kex` (implies `tcp`) | TCP + `tatami-tcp/kex` + `tatami-keys/{ed25519,known-hosts}` | None; portable — `check-workspace.sh` checks it on `thumbv7em-none-eabi` (CI gate; first run not yet observed) and that it pulls no `ssh-key`/`rustls`/`ring` |
+| `kex` (implies `tcp`) | TCP + `tatami_ssh_tcp/kex` + `tatami_ssh_keys/{ed25519,known-hosts}` | None; portable — `check-workspace.sh` checks it on `thumbv7em-none-eabi` (CI gate; first run not yet observed) and that it pulls no `ssh-key`/`rustls`/`ring` |
 | `std,tcp,kex` | as above with `std` | `tatami-client handshake` (pin or `--known-hosts`) |
-| `quic-diag` (implies `std,quic`) | QUIC + `tatami-quic/quinn-backend` + `tatami-keys/{known-hosts,openssh-key}` | `tatami::quic_diag` (no binaries without `tcp`) |
+| `quic-diag` (implies `std,quic`) | QUIC + `tatami_ssh_quic/quinn-backend` + `tatami_ssh_keys/{known-hosts,openssh-key}` | `tatami_ssh::quic_diag` (no binaries without `tcp`) |
 | `std,tcp,quic-diag` | TCP with `std` + QUIC backend | `tatami-client probe`, `tatami-client handshake --transport quic`, `tatami-server observe [--transport quic]` |
 | `std,tcp,kex,quic-diag` | everything above | every command of both binaries (W-35) |
 
-Weak dependency feature forwarding (`tatami-tcp?/std`, `tatami-quic?/std`) ensures
+Weak dependency feature forwarding (`tatami_ssh_tcp?/std`, `tatami_ssh_quic?/std`) ensures
 that `std` does not itself select a transport. Cargo features are additive and
 can be unified by other dependents, so inspect the resolved graph
 (`cargo tree -e features`) when adding providers.
@@ -112,52 +112,52 @@ locally; CI installs it and requires the step.
 | Location | Contents |
 |---|---|
 | `crates/*/src/lib.rs` | Package documentation and portability gates |
-| `crates/tatami-wire/src/{primitives,namelist}.rs` | Checked `Reader`/`Writer` and borrowed name lists; no `alloc` |
-| `crates/tatami-wire/src/ident.rs` | Shared identification *content* syntax: borrowed parser, content encoder, version classification; `OwnedIdentification` behind `alloc` |
-| `crates/tatami-wire/src/{kexinit,transport,channel}.rs` | `KEXINIT`, `DISCONNECT`/`IGNORE`/`DEBUG`/`UNIMPLEMENTED`/`SERVICE_REQUEST`/`SERVICE_ACCEPT`, and channel-opening payload codecs |
-| `crates/tatami-wire/src/primitives.rs` (`Mpint`) | RFC 4251 §5 `mpint`: borrowed two's-complement read, minimal-encoding check, positive-magnitude write; tested against the RFC's five examples (round 4) |
-| `crates/tatami-wire/src/kex.rs` | `KEX_ECDH_INIT` / `KEX_ECDH_REPLY` (RFC 5656 §4 structure) and `NEWKEYS` codecs; syntactic only (round 4) |
-| `crates/tatami-wire/src/ext_info.rs` | `EXT_INFO` lazy decoder/encoder, known extension names (RFC 8308) (round 4) |
-| `crates/tatami-wire/src/algorithms.rs` | Name constants for the first interoperability profile and markers (round 4) |
-| `crates/tatami-keys/src/{blob,fingerprint,trust}.rs` | `PublicKeyBlob`/`SignatureBlob` codecs; `Sha256Fingerprint` (`SHA256:` base64, OpenSSH presentation); `HostTrustPolicy`, `TrustDecision`, `PinnedSha256`, `NoTrustPolicy` (round 4) |
-| `crates/tatami-keys/src/ed25519.rs` (`ed25519`) | `Ed25519PublicKey`/`Ed25519Signature`/`HostKey`; verification via `ed25519-dalek` `verify_strict`; RFC 8032 §7.1 vectors (round 4) |
-| `crates/tatami-keys/src/{spki,sshfp}.rs` (`ed25519`) | The one strict Ed25519 SPKI ⇄ `ssh-ed25519` blob converter; SSHFP 4/2 values over the blob, no DNS (round 5) |
-| `crates/tatami-keys/src/known_hosts.rs` (`known-hosts`) | Bounded read-only parser, `lookup_name`, bounded glob, `KnownHostsPolicy` (round 5, W-37, W-38) |
-| `crates/tatami-keys/src/openssh_key.rs` (`openssh-key`) | Unencrypted Ed25519 `openssh-key-v1` decoding via `ssh-key`, derivation check, zeroizing PKCS#8 (round 5, W-39) |
-| `crates/tatami-tcp/src/{ident,packet}.rs` | Identification *exchange* (terminators, prelude, 255-byte rule, version policy) over the shared syntax; initial unprotected packet framing |
-| `crates/tatami-tcp/src/negotiate.rs` (`kex`) | Client proposal; RFC 4253 §7.1 negotiation; strict-KEX spelling pairing; `first_kex_packet_follows`; AEAD-implies-no-MAC rule (W-30) (round 4) |
-| `crates/tatami-tcp/src/transcript.rs` (`kex`) | X25519 agreement (RFC 7748 §6.1 vectors, all-zero abort), exchange hash `H`, session id, RFC 4253 §7.2 key derivation (round 4) |
-| `crates/tatami-tcp/src/gcm.rs` (`kex`) | `aes128-gcm@openssh.com` seal/open (RFC 5647: length as AAD, 64-bit invocation counter, never reset) (round 4) |
-| `crates/tatami-tcp/src/handshake.rs` (`kex`) | Portable `ClientHandshake` state machine and `HandshakeReport`; scripted fixture server for tests (round 4) |
-| `crates/tatami-tcp/src/io/handshake.rs` (`std`+`kex`) | Blocking driver with connect + overall deadlines and OS entropy (round 4) |
-| `crates/tatami-tcp/tests/openssh_handshake.rs` | Interop against a locally spawned OpenSSH `sshd` (skips if absent; fails instead with `TATAMI_REQUIRE_OPENSSH=1`, set in CI) (round 4) |
-| `crates/tatami-quic/src/diag/{mod,identity,tls,server,client,inmem,udp}.rs` (`quinn-backend`) | QUIC/TLS diagnostic handshake observer: sans-I/O `ServerCore`/`ClientCore`, recording `ResolvesServerCert`, pinned certificate and RFC 7250 raw-public-key verifiers, rcgen test identities, in-memory pair for tests, UDP adapter (round 4); `HostKeyIdentity` and `SshHostKeyVerifier` for SSH host keys as raw public keys (round 5, W-40) |
-| `crates/tatami-quic/tests/{inmem_handshake,loopback,exporter,rpk,host_key}.rs` | Evidence for the QUIC experiment (see `quic-observer-readiness.md`) (round 4; `host_key` round 5) |
-| `crates/tatami/src/quic_diag/` (`quic-diag`) | Options, JSON Lines encoder and text reports for `--transport quic`; `--host-key` loading and SSH trust reporting (rounds 4–5) |
-| `crates/tatami/src/trust.rs` (`std` + `kex` or `quic-diag`) | `TrustConfig::{Pin, KnownHostsFile}`; `prepare(host, port)` reads the file and binds the lookup name before connecting; `TrustConfigError` (round 5, W-41) |
-| `crates/tatami/src/host/files.rs` (`std`) | Bounded reads on the opened handle; private keys: Unix owner-only check, zeroizing buffer (round 5) |
-| `crates/tatami/tests/host_identity.rs` | Real `sshd` + `tatami-server --host-key` on one TCP/UDP port number, one `known_hosts` entry; skips without OpenSSH unless `TATAMI_REQUIRE_OPENSSH=1` (CI) (round 5) |
-| `crates/tatami/src/bin/tatami-{server,client}.rs` | `observe` and `probe`/`handshake` executables; `--transport quic` with `quic-diag` (W-35) |
+| `crates/tatami_ssh_wire/src/{primitives,namelist}.rs` | Checked `Reader`/`Writer` and borrowed name lists; no `alloc` |
+| `crates/tatami_ssh_wire/src/ident.rs` | Shared identification *content* syntax: borrowed parser, content encoder, version classification; `OwnedIdentification` behind `alloc` |
+| `crates/tatami_ssh_wire/src/{kexinit,transport,channel}.rs` | `KEXINIT`, `DISCONNECT`/`IGNORE`/`DEBUG`/`UNIMPLEMENTED`/`SERVICE_REQUEST`/`SERVICE_ACCEPT`, and channel-opening payload codecs |
+| `crates/tatami_ssh_wire/src/primitives.rs` (`Mpint`) | RFC 4251 §5 `mpint`: borrowed two's-complement read, minimal-encoding check, positive-magnitude write; tested against the RFC's five examples (round 4) |
+| `crates/tatami_ssh_wire/src/kex.rs` | `KEX_ECDH_INIT` / `KEX_ECDH_REPLY` (RFC 5656 §4 structure) and `NEWKEYS` codecs; syntactic only (round 4) |
+| `crates/tatami_ssh_wire/src/ext_info.rs` | `EXT_INFO` lazy decoder/encoder, known extension names (RFC 8308) (round 4) |
+| `crates/tatami_ssh_wire/src/algorithms.rs` | Name constants for the first interoperability profile and markers (round 4) |
+| `crates/tatami_ssh_keys/src/{blob,fingerprint,trust}.rs` | `PublicKeyBlob`/`SignatureBlob` codecs; `Sha256Fingerprint` (`SHA256:` base64, OpenSSH presentation); `HostTrustPolicy`, `TrustDecision`, `PinnedSha256`, `NoTrustPolicy` (round 4) |
+| `crates/tatami_ssh_keys/src/ed25519.rs` (`ed25519`) | `Ed25519PublicKey`/`Ed25519Signature`/`HostKey`; verification via `ed25519-dalek` `verify_strict`; RFC 8032 §7.1 vectors (round 4) |
+| `crates/tatami_ssh_keys/src/{spki,sshfp}.rs` (`ed25519`) | The one strict Ed25519 SPKI ⇄ `ssh-ed25519` blob converter; SSHFP 4/2 values over the blob, no DNS (round 5) |
+| `crates/tatami_ssh_keys/src/known_hosts.rs` (`known-hosts`) | Bounded read-only parser, `lookup_name`, bounded glob, `KnownHostsPolicy` (round 5, W-37, W-38) |
+| `crates/tatami_ssh_keys/src/openssh_key.rs` (`openssh-key`) | Unencrypted Ed25519 `openssh-key-v1` decoding via `ssh-key`, derivation check, zeroizing PKCS#8 (round 5, W-39) |
+| `crates/tatami_ssh_tcp/src/{ident,packet}.rs` | Identification *exchange* (terminators, prelude, 255-byte rule, version policy) over the shared syntax; initial unprotected packet framing |
+| `crates/tatami_ssh_tcp/src/negotiate.rs` (`kex`) | Client proposal; RFC 4253 §7.1 negotiation; strict-KEX spelling pairing; `first_kex_packet_follows`; AEAD-implies-no-MAC rule (W-30) (round 4) |
+| `crates/tatami_ssh_tcp/src/transcript.rs` (`kex`) | X25519 agreement (RFC 7748 §6.1 vectors, all-zero abort), exchange hash `H`, session id, RFC 4253 §7.2 key derivation (round 4) |
+| `crates/tatami_ssh_tcp/src/gcm.rs` (`kex`) | `aes128-gcm@openssh.com` seal/open (RFC 5647: length as AAD, 64-bit invocation counter, never reset) (round 4) |
+| `crates/tatami_ssh_tcp/src/handshake.rs` (`kex`) | Portable `ClientHandshake` state machine and `HandshakeReport`; scripted fixture server for tests (round 4) |
+| `crates/tatami_ssh_tcp/src/io/handshake.rs` (`std`+`kex`) | Blocking driver with connect + overall deadlines and OS entropy (round 4) |
+| `crates/tatami_ssh_tcp/tests/openssh_handshake.rs` | Interop against a locally spawned OpenSSH `sshd` (skips if absent; fails instead with `TATAMI_REQUIRE_OPENSSH=1`, set in CI) (round 4) |
+| `crates/tatami_ssh_quic/src/diag/{mod,identity,tls,server,client,inmem,udp}.rs` (`quinn-backend`) | QUIC/TLS diagnostic handshake observer: sans-I/O `ServerCore`/`ClientCore`, recording `ResolvesServerCert`, pinned certificate and RFC 7250 raw-public-key verifiers, rcgen test identities, in-memory pair for tests, UDP adapter (round 4); `HostKeyIdentity` and `SshHostKeyVerifier` for SSH host keys as raw public keys (round 5, W-40) |
+| `crates/tatami_ssh_quic/tests/{inmem_handshake,loopback,exporter,rpk,host_key}.rs` | Evidence for the QUIC experiment (see `quic-observer-readiness.md`) (round 4; `host_key` round 5) |
+| `crates/tatami_ssh/src/quic_diag/` (`quic-diag`) | Options, JSON Lines encoder and text reports for `--transport quic`; `--host-key` loading and SSH trust reporting (rounds 4–5) |
+| `crates/tatami_ssh/src/trust.rs` (`std` + `kex` or `quic-diag`) | `TrustConfig::{Pin, KnownHostsFile}`; `prepare(host, port)` reads the file and binds the lookup name before connecting; `TrustConfigError` (round 5, W-41) |
+| `crates/tatami_ssh/src/host/files.rs` (`std`) | Bounded reads on the opened handle; private keys: Unix owner-only check, zeroizing buffer (round 5) |
+| `crates/tatami_ssh/tests/host_identity.rs` | Real `sshd` + `tatami-server --host-key` on one TCP/UDP port number, one `known_hosts` entry; skips without OpenSSH unless `TATAMI_REQUIRE_OPENSSH=1` (CI) (round 5) |
+| `crates/tatami_ssh/src/bin/tatami-{server,client}.rs` | `observe` and `probe`/`handshake` executables; `--transport quic` with `quic-diag` (W-35) |
 | `scripts/openssh-fixture.sh` | Reproducible loopback `sshd` with an ephemeral Ed25519 key; prints the pin and the exact handshake command (round 4) |
 | `docs/crypto-provider-audit.md` | Provider versions, features, MSRV, `no_std` evidence, MAC-list policy, QUIC backend constraints (round 4) |
-| `crates/tatami-tcp/src/io/seam.rs` | Internal `Conn`/`Clock` seam with a scripted connection and virtual clock for deterministic adapter tests (`std`, `pub(crate)`) |
-| `crates/tatami-tcp/src/initial.rs` | Bounded `InputBuffer`; shared pre-`KEXINIT` packet handling and error codes |
-| `crates/tatami-tcp/src/probe.rs` | Portable client-side initial-offer probe |
-| `crates/tatami-tcp/src/observer.rs` | Portable server-side observer (no server `KEXINIT`) |
-| `crates/tatami-tcp/src/io.rs` | Blocking TCP connect/read adapter with phase deadlines (`std`) |
-| `crates/tatami-tcp/src/io/listener.rs` | Bounded diagnostic listener: accept loop, worker pool, record channel (`std`) |
-| `crates/tatami-tcp/tests/` | Loopback fixture-peer tests for the probe adapter and the listener |
-| `crates/tatami-quic/src/io.rs` | Future optional socket/runtime adapters |
-| `crates/tatami-connection/src/opening.rs` | Channel-opening lifecycle engine |
-| `crates/tatami/src/client.rs` | `client::probe` (`std,tcp`) and `client::handshake` (`std,tcp,kex`): options, structured reports, text and JSON rendering |
-| `crates/tatami/src/server.rs` | `server::observe`: listener options, JSON Lines encoder, RFC 3339 time (`std,tcp`) |
-| `crates/tatami/src/json.rs` | Small RFC 8259 serializer used for JSON Lines |
-| `crates/tatami/src/text.rs` | Escaping of untrusted bytes for terminal display (not JSON) |
-| `crates/tatami/src/bin/` | `tatami-client` (`probe`; `handshake` with `kex`) and `tatami-server` executables (`std,tcp`) |
-| `crates/tatami/tests/` | End-to-end binary tests; JSON validated with `serde_json` (dev-dependency only) |
+| `crates/tatami_ssh_tcp/src/io/seam.rs` | Internal `Conn`/`Clock` seam with a scripted connection and virtual clock for deterministic adapter tests (`std`, `pub(crate)`) |
+| `crates/tatami_ssh_tcp/src/initial.rs` | Bounded `InputBuffer`; shared pre-`KEXINIT` packet handling and error codes |
+| `crates/tatami_ssh_tcp/src/probe.rs` | Portable client-side initial-offer probe |
+| `crates/tatami_ssh_tcp/src/observer.rs` | Portable server-side observer (no server `KEXINIT`) |
+| `crates/tatami_ssh_tcp/src/io.rs` | Blocking TCP connect/read adapter with phase deadlines (`std`) |
+| `crates/tatami_ssh_tcp/src/io/listener.rs` | Bounded diagnostic listener: accept loop, worker pool, record channel (`std`) |
+| `crates/tatami_ssh_tcp/tests/` | Loopback fixture-peer tests for the probe adapter and the listener |
+| `crates/tatami_ssh_quic/src/io.rs` | Future optional socket/runtime adapters |
+| `crates/tatami_ssh_connection/src/opening.rs` | Channel-opening lifecycle engine |
+| `crates/tatami_ssh/src/client.rs` | `client::probe` (`std,tcp`) and `client::handshake` (`std,tcp,kex`): options, structured reports, text and JSON rendering |
+| `crates/tatami_ssh/src/server.rs` | `server::observe`: listener options, JSON Lines encoder, RFC 3339 time (`std,tcp`) |
+| `crates/tatami_ssh/src/json.rs` | Small RFC 8259 serializer used for JSON Lines |
+| `crates/tatami_ssh/src/text.rs` | Escaping of untrusted bytes for terminal display (not JSON) |
+| `crates/tatami_ssh/src/bin/` | `tatami-client` (`probe`; `handshake` with `kex`) and `tatami-server` executables (`std,tcp`) |
+| `crates/tatami_ssh/tests/` | End-to-end binary tests; JSON validated with `serde_json` (dev-dependency only) |
 | `docs/specification-inventory.md` | Which specifications touch which layer, and their status |
 | `docs/quic-observer-readiness.md` | QUIC handshake observer: backend decision, implementation corrections, what remains for an SSH-over-QUIC observer |
-| `crates/tatami/src/host/` | Bounded file reads (`files`); future environment, process and PTY adapters |
+| `crates/tatami_ssh/src/host/` | Bounded file reads (`files`); future environment, process and PTY adapters |
 | `docs/` | Architecture, decisions, protocol checkpoint and existing Draft 00 |
 | `scripts/check-workspace.sh` | Local and CI build/feature verification |
 | `.github/workflows/ci.yml` | Minimum-version and stable checks |
@@ -180,15 +180,15 @@ both strict-KEX spellings (`kex-strict-*-v00@openssh.com`, `kex-strict-*`) as
 non-methods, and `classify_strict_kex_name` yields role and spelling. Round 4
 added `kex` (`KEX_ECDH_INIT`/`REPLY`, `NEWKEYS`), `ext_info` (lazy, bounded)
 and the `SERVICE_REQUEST`/`SERVICE_ACCEPT` codecs; all remain syntactic
-(the 32-byte X25519 length rule lives in `tatami-tcp::transcript`).
+(the 32-byte X25519 length rule lives in `tatami_ssh_tcp::transcript`).
 
-**Identification (round 3 split).** `tatami_wire::ident::Identification::parse`
+**Identification (round 3 split).** `tatami_ssh_wire::ident::Identification::parse`
 validates complete content without a terminator: the `SSH-` prefix, both
 separators, RFC 4253 token characters, and no CR/LF/NUL anywhere; fields are
 borrowed slices, absent and empty comments stay distinct, nothing is trimmed
 or lossily decoded, and any syntactically valid version parses.
-`tatami_wire::ident::encode` writes content only and never partially fills
-the buffer. `tatami_tcp::ident` wraps that with everything TCP-specific and
+`tatami_ssh_wire::ident::encode` writes content only and never partially fills
+the buffer. `tatami_ssh_tcp::ident` wraps that with everything TCP-specific and
 applies the `2.0`/`1.99` policy (W-12 revised).
 
 **TCP.** Identification parsing survives any read boundary, bounds prelude
@@ -237,7 +237,7 @@ another client connecting.
 **Facade.** `client::probe::run` returns a `Report`; `write_text` renders it
 with every peer string escaped, lists in advertised order and both directions
 printed separately. `server::observe::prepare` binds and returns the actual
-address; `run_jsonl` writes schema-1 JSON Lines through `tatami::json`, with
+address; `run_jsonl` writes schema-1 JSON Lines through `tatami_ssh::json`, with
 raw bytes as lossy text plus bounded hex and oversized records re-emitted
 truncated. Exit statuses per W-16.
 
@@ -247,7 +247,7 @@ oracles; committed seeds reach the deep states; `scripts/fuzz.sh` wraps
 build/replay/run/reproduce/minimize/coverage; CI runs bounded campaigns.
 Details, execution evidence and findings are in `fuzzing.md`.
 
-**TCP handshake (round 4).** `tatami-tcp/kex` implements exactly the first
+**TCP handshake (round 4).** `tatami_ssh_tcp/kex` implements exactly the first
 interoperability profile (W-29): `negotiate` builds the client `KEXINIT`
 (one method, one host-key algorithm, one AEAD cipher, `none` compression,
 `hmac-sha2-256` listed only to satisfy the non-empty name-list syntax, W-30)
@@ -261,7 +261,7 @@ keys/IVs (§7.2). `gcm` seals and opens `aes128-gcm@openssh.com` packets with
 the 4-byte length as AAD and a 64-bit invocation counter that is never reset
 or reused. `handshake::ClientHandshake` is a sans-I/O validator: it stops at
 `Step::TrustDecisionRequired` after the Ed25519 signature over `H` verifies,
-and only a `Trusted` answer (from `tatami_keys::trust::HostTrustPolicy`;
+and only a `Trusted` answer (from `tatami_ssh_keys::trust::HostTrustPolicy`;
 the CLI uses `PinnedSha256`, W-32, or since round 5 `KnownHostsPolicy`,
 W-37) lets `NEWKEYS` be sent. Under strict KEX
 the server `KEXINIT` must be the first packet, only KEX messages are accepted
@@ -275,11 +275,11 @@ server `KEXINIT` after `NEWKEYS` yields `RekeyNotSupported`; a
 packets are budgeted; reports never contain key material. `io::handshake`
 drives it over a blocking socket with connect and overall deadlines and OS
 entropy. Verified against a locally spawned `OpenSSH_10.2p1` in
-`tatami-tcp/tests/openssh_handshake.rs` and `tatami/tests/handshake_cli.rs`
+`tatami_ssh_tcp/tests/openssh_handshake.rs` and `tatami_ssh/tests/handshake_cli.rs`
 (default sshd completes; wrong pin stops before `NEWKEYS`; profile-restricted
 sshd completes; `Ciphers=aes256-ctr` fails negotiation cleanly).
 
-**Keys (round 4).** `tatami-keys` owns the algorithm-agnostic public-key
+**Keys (round 4).** `tatami_ssh_keys` owns the algorithm-agnostic public-key
 and signature blob codecs (key-format name and signature-algorithm name are
 separate fields, as RFC 8332 requires; `HostKey::from_blob` and
 `verify_signature_blob` check both for `ssh-ed25519`),
@@ -298,7 +298,7 @@ change; a late confirmation for a cancelled open with such a number is
 rejected and its tombstone kept. Regression tests and a strengthened
 independent fuzz model cover both paths.
 
-**QUIC diagnostic backend (round 4).** `tatami-quic::diag` (feature
+**QUIC diagnostic backend (round 4).** `tatami_ssh_quic::diag` (feature
 `quinn-backend`, W-31) is observer (a) of `quic-observer-readiness.md`: a
 QUIC v1-only `quinn-proto` endpoint with `rustls` 0.23 on `ring`, driven
 sans-I/O by `ServerCore`/`ClientCore` and, for hosts, a blocking UDP loop.
@@ -316,16 +316,16 @@ verifier pinning the SPKI SHA-256 with rustls verifying the
 SPKI DER. The same Ed25519 key has three distinct SHA-256 fingerprints
 (certificate DER, SPKI DER, `ssh-ed25519` blob). No SSH byte is sent; the
 tests assert this over every captured datagram. The facade adds
-`tatami::quic_diag` (JSON Lines schema 1, transport `quic`) and two
+`tatami_ssh::quic_diag` (JSON Lines schema 1, transport `quic`) and two
 binaries. Nothing here defines the SSH-over-QUIC mapping.
 
 **Host identity (round 5).** One OpenSSH Ed25519 host key, one
 `known_hosts` entry, both transports (W-36–W-41). The identity is the
-complete SSH blob. `tatami_keys::spki` is the only SPKI converter (the QUIC
+complete SSH blob. `tatami_ssh_keys::spki` is the only SPKI converter (the QUIC
 backend delegates to it); `known_hosts` parses and validates a whole file
 from bytes and binds it to one lookup name, producing an immutable
 `KnownHostsPolicy` that the TCP handshake and the QUIC `SshHostKeyVerifier`
-both receive through `tatami::trust::TrustConfig::prepare` before any
+both receive through `tatami_ssh::trust::TrustConfig::prepare` before any
 connection. The verifier converts the peer SPKI, applies the policy, records
 the result for the report and still verifies `CertificateVerify` with the
 provider; it requires raw public keys and does no file or DNS I/O.
@@ -333,10 +333,10 @@ provider; it requires raw public keys and does no file or DNS I/O.
 does the bounded, permission-checked read, and `HostKeyIdentity` loads the
 in-memory PKCS#8 through rustls/`ring` and checks the resulting public key
 against the expected blob. File access and OS policy stay in the facade,
-rustls glue in `tatami-quic`, portable parsing and decisions in
-`tatami-keys`; no transport or provider abstraction was added. Evidence:
-`tatami/tests/host_identity.rs` (OpenSSH_10.2p1 `sshd` + Tatami QUIC, one
-entry) and `tatami-quic/tests/host_key.rs` (in-memory). This is identity
+rustls glue in `tatami_ssh_quic`, portable parsing and decisions in
+`tatami_ssh_keys`; no transport or provider abstraction was added. Evidence:
+`tatami_ssh/tests/host_identity.rs` (OpenSSH_10.2p1 `sshd` + Tatami QUIC, one
+entry) and `tatami_ssh_quic/tests/host_key.rs` (in-memory). This is identity
 continuity only: no SSH byte crosses QUIC.
 
 ### Next implementation slices
@@ -357,7 +357,7 @@ continuity only: no SSH byte crosses QUIC.
    search domains, split DNS; explicit DNSSEC/SSHFP policy (an AD bit from an
    arbitrary resolver is not validation); DNS I/O outside the portable core;
    a pure-Rust stub resolver evaluated, none selected.
-4. **First authenticated command:** `publickey` userauth in `tatami-auth`
+4. **First authenticated command:** `publickey` userauth in `tatami_ssh_auth`
    consuming `session_id` (contract §2.2 item 6), a `session` channel with
    `exec`, data, window accounting (EID 3878), stdout/stderr, `EOF`/`CLOSE`
    and exit status against OpenSSH, then over QUIC, with server
@@ -374,7 +374,7 @@ The workspace still deliberately does not define QUIC record framing, window
 mapping, stream association, session-binding construction or a crypto
 abstraction. Interoperability evidence is the OpenSSH tests above (one
 implementation, client role only); the loopback fixtures in
-`tatami-tcp/tests`, `tatami-quic/tests` and `tatami/tests` are not SSH
+`tatami_ssh_tcp/tests`, `tatami_ssh_quic/tests` and `tatami_ssh/tests` are not SSH
 servers.
 
 ## Toolchain and publishing

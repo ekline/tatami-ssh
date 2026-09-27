@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::observer::Observer` (server side) under three delivery
+//! `tatami_ssh_tcp::observer::Observer` (server side) under three delivery
 //! schedules, bounded configurations, banner-only mode, unexpected client
 //! input, EOF, and deliberately oversized feeds.
 //!
@@ -48,19 +48,19 @@
 //! - `server_identification()` is `SSH-2.0-<software>\r\n`, ≤ 255 bytes.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::tcp_support::drive::{
+use tatami_ssh_fuzz_protocol::tcp_support::drive::{
     End, Ev, MAX_STEPS, OUTCOME_CODES, Run, assert_ident_phase, assert_same_run, drive,
     expected_outcome_code,
 };
-use tatami_fuzz_protocol::tcp_support::stream_gen::{self, ModelLimits, Role};
-use tatami_fuzz_protocol::tcp_support::{ChunkMode, Cursor, ident_ref, msg_ref};
-use tatami_tcp::ident::{IdentLimits, LineTerminator, VersionSupport};
-use tatami_tcp::initial::{InitialError, InitialLimits, InputOverflow};
-use tatami_tcp::observer::{
+use tatami_ssh_fuzz_protocol::tcp_support::stream_gen::{self, ModelLimits, Role};
+use tatami_ssh_fuzz_protocol::tcp_support::{ChunkMode, Cursor, ident_ref, msg_ref};
+use tatami_ssh_tcp::ident::{IdentLimits, LineTerminator, VersionSupport};
+use tatami_ssh_tcp::initial::{InitialError, InitialLimits, InputOverflow};
+use tatami_ssh_tcp::observer::{
     ObservationOutcome, Observer, ObserverConfig, ObserverStage, ObserverStep,
 };
-use tatami_tcp::packet::{HEADER_LEN, PacketLimits};
-use tatami_wire::kexinit::{KexName, classify_kex_name};
+use tatami_ssh_tcp::packet::{HEADER_LEN, PacketLimits};
+use tatami_ssh_wire::kexinit::{KexName, classify_kex_name};
 
 fn observer_config(sel: u8) -> ObserverConfig {
     let base = ObserverConfig::default();

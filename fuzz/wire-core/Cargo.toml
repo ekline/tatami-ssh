@@ -1,9 +1,9 @@
 [package]
-name = "tatami-fuzz-wire-core"
+name = "tatami_ssh_fuzz_wire_core"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "libFuzzer harnesses for tatami-wire with default features disabled (no alloc)"
+description = "libFuzzer harnesses for tatami_ssh_wire with default features disabled (no alloc)"
 
 [package.metadata]
 cargo-fuzz = true
@@ -14,7 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-tatami-wire = { path = "../../crates/tatami-wire", default-features = false }
+tatami_ssh_wire = { path = "../../crates/tatami_ssh_wire", default-features = false }
 
 [profile.release]
 debug = 1

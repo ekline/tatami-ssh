@@ -1,4 +1,4 @@
-//! Small helpers for the `tatami-keys` round-5 targets (`spki_conversion`,
+//! Small helpers for the `tatami_ssh_keys` round-5 targets (`spki_conversion`,
 //! `known_hosts`, `openssh_private_key`). Harness-only code.
 //!
 //! Deliberately not a second parser: the targets call the production APIs

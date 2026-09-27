@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::initial::InputBuffer` against a `Vec<u8>` + capacity model.
+//! `tatami_ssh_tcp::initial::InputBuffer` against a `Vec<u8>` + capacity model.
 //!
 //! # Input layout
 //!
@@ -34,8 +34,8 @@
 //!   part of the contract and is never inspected.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_tcp::initial::{InputBuffer, InputOverflow};
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_tcp::initial::{InputBuffer, InputOverflow};
 
 const MAX_OPS: usize = 256;
 

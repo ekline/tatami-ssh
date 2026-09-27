@@ -510,33 +510,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "tatami"
+name = "tatami_ssh"
 version = "0.1.0"
 dependencies = [
- "tatami-auth",
- "tatami-connection",
- "tatami-keys",
- "tatami-quic",
- "tatami-tcp",
+ "tatami_ssh_auth",
+ "tatami_ssh_connection",
+ "tatami_ssh_keys",
+ "tatami_ssh_quic",
+ "tatami_ssh_tcp",
 ]
 
 [[package]]
-name = "tatami-auth"
+name = "tatami_ssh_auth"
 version = "0.1.0"
 dependencies = [
- "tatami-keys",
- "tatami-wire",
+ "tatami_ssh_keys",
+ "tatami_ssh_wire",
 ]
 
 [[package]]
-name = "tatami-connection"
+name = "tatami_ssh_connection"
 version = "0.1.0"
 dependencies = [
- "tatami-wire",
+ "tatami_ssh_wire",
 ]
 
 [[package]]
-name = "tatami-fuzz-protocol"
+name = "tatami_ssh_fuzz_protocol"
 version = "0.0.0"
 dependencies = [
  "aes-gcm",
@@ -547,16 +547,16 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "tatami",
- "tatami-connection",
- "tatami-keys",
- "tatami-tcp",
- "tatami-wire",
+ "tatami_ssh",
+ "tatami_ssh_connection",
+ "tatami_ssh_keys",
+ "tatami_ssh_tcp",
+ "tatami_ssh_wire",
  "x25519-dalek",
 ]
 
 [[package]]
-name = "tatami-keys"
+name = "tatami_ssh_keys"
 version = "0.1.0"
 dependencies = [
  "base64ct",
@@ -565,22 +565,22 @@ dependencies = [
  "sha1",
  "sha2",
  "ssh-key",
- "tatami-wire",
+ "tatami_ssh_wire",
  "zeroize",
 ]
 
 [[package]]
-name = "tatami-quic"
+name = "tatami_ssh_quic"
 version = "0.1.0"
 dependencies = [
- "tatami-auth",
- "tatami-connection",
- "tatami-keys",
- "tatami-wire",
+ "tatami_ssh_auth",
+ "tatami_ssh_connection",
+ "tatami_ssh_keys",
+ "tatami_ssh_wire",
 ]
 
 [[package]]
-name = "tatami-tcp"
+name = "tatami_ssh_tcp"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -588,16 +588,16 @@ dependencies = [
  "rand_core",
  "sha2",
  "subtle",
- "tatami-auth",
- "tatami-connection",
- "tatami-keys",
- "tatami-wire",
+ "tatami_ssh_auth",
+ "tatami_ssh_connection",
+ "tatami_ssh_keys",
+ "tatami_ssh_wire",
  "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
-name = "tatami-wire"
+name = "tatami_ssh_wire"
 version = "0.1.0"
 
 [[package]]

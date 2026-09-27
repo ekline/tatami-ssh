@@ -1,9 +1,9 @@
 [package]
-name = "tatami-fuzz-protocol"
+name = "tatami_ssh_fuzz_protocol"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "libFuzzer harnesses for tatami-tcp, tatami-connection and the tatami facade"
+description = "libFuzzer harnesses for tatami_ssh_tcp, tatami_ssh_connection and the tatami_ssh facade"
 
 [package.metadata]
 cargo-fuzz = true
@@ -16,11 +16,11 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 # Independent JSON parser used only as an oracle.
 serde_json = "1"
-tatami-wire = { path = "../../crates/tatami-wire", default-features = false, features = ["alloc"] }
-tatami-keys = { path = "../../crates/tatami-keys", default-features = false, features = ["ed25519", "known-hosts", "openssh-key"] }
-tatami-tcp = { path = "../../crates/tatami-tcp", default-features = false, features = ["std", "kex"] }
-tatami-connection = { path = "../../crates/tatami-connection", default-features = false }
-tatami = { path = "../../crates/tatami", default-features = false, features = ["std", "tcp", "kex"] }
+tatami_ssh_wire = { path = "../../crates/tatami_ssh_wire", default-features = false, features = ["alloc"] }
+tatami_ssh_keys = { path = "../../crates/tatami_ssh_keys", default-features = false, features = ["ed25519", "known-hosts", "openssh-key"] }
+tatami_ssh_tcp = { path = "../../crates/tatami_ssh_tcp", default-features = false, features = ["std", "kex"] }
+tatami_ssh_connection = { path = "../../crates/tatami_ssh_connection", default-features = false }
+tatami_ssh = { path = "../../crates/tatami_ssh", default-features = false, features = ["std", "tcp", "kex"] }
 # Harness-only cryptographic providers, used as INDEPENDENT oracles: the
 # harness plays the server (X25519 agreement, Ed25519 signing over its own
 # exchange-hash computation, AES-GCM sealing, RFC 4253 §7.2 derivation with

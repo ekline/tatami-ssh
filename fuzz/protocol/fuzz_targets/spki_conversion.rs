@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_keys::spki`: strict Ed25519 `SubjectPublicKeyInfo` (RFC 8410 §4)
+//! `tatami_ssh_keys::spki`: strict Ed25519 `SubjectPublicKeyInfo` (RFC 8410 §4)
 //! ⇄ `ssh-ed25519` blob (RFC 8709 §4). Pattern: stateless conversion.
 //!
 //! 1. API/input: `sel:u8, rest`. `sel` even: `rest` (bounded by `-max_len`)
@@ -19,15 +19,15 @@
 //!    Seeds (`seeds/spki_conversion/`) carry the RFC 8410 §10.1 example and
 //!    one fixture per rejection class (other OIDs, NULL parameters, unused
 //!    bits, key length, long-form/indefinite lengths, trailing bytes,
-//!    truncation); unit tests in `crates/tatami-keys/src/spki.rs` pin the
+//!    truncation); unit tests in `crates/tatami_ssh_keys/src/spki.rs` pin the
 //!    exact error for each.
 //! 4. Not covered: the exact `SpkiError` variant for random inputs (error
 //!    precedence is not part of the contract); rustls's own SPKI handling.
 
 use ed25519_dalek::SigningKey;
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::keys_support::{dalek_accepts, ed25519_blob};
-use tatami_keys::spki::{
+use tatami_ssh_fuzz_protocol::keys_support::{dalek_accepts, ed25519_blob};
+use tatami_ssh_keys::spki::{
     ED25519_SPKI_PREFIX, ed25519_public_key_from_spki, ed25519_spki, spki_to_ssh_blob, ssh_blob_of,
     ssh_blob_to_spki,
 };

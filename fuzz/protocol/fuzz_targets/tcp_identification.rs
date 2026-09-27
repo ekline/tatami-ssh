@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::ident::IdentificationReader` against an independent line
+//! `tatami_ssh_tcp::ident::IdentificationReader` against an independent line
 //! reader, under two limit configurations and three delivery schedules.
 //!
 //! # Input layout
@@ -42,9 +42,9 @@
 //!   and `OwnedIdentification` preserves all of them losslessly.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::tcp_support::ident_ref::{self, RefIdent, RefOutcome};
-use tatami_fuzz_protocol::tcp_support::{ChunkMode, Cursor};
-use tatami_tcp::ident::{
+use tatami_ssh_fuzz_protocol::tcp_support::ident_ref::{self, RefIdent, RefOutcome};
+use tatami_ssh_fuzz_protocol::tcp_support::{ChunkMode, Cursor};
+use tatami_ssh_tcp::ident::{
     IdentError, IdentLimits, IdentStep, Identification, IdentificationReader, LineTerminator,
     OwnedIdentification, VersionSupport, starts_identification,
 };

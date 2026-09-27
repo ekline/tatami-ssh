@@ -12,8 +12,8 @@
 //! - each error variant implies the property it claims.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_wire_core::ident_ref;
-use tatami_wire::ident::{self, IdentSyntaxError, Identification, ProtocolVersionClass};
+use tatami_ssh_fuzz_wire_core::ident_ref;
+use tatami_ssh_wire::ident::{self, IdentSyntaxError, Identification, ProtocolVersionClass};
 
 fn is_subslice(outer: &[u8], inner: &[u8]) -> bool {
     let o = outer.as_ptr_range();

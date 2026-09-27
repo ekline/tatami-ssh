@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::probe::Probe` (client side) under three delivery schedules,
+//! `tatami_ssh_tcp::probe::Probe` (client side) under three delivery schedules,
 //! bounded configurations, EOF, and deliberately oversized feeds.
 //!
 //! # Input layout
@@ -51,16 +51,16 @@
 //!   `InputOverflow { capacity, pending, offered }` and copies nothing.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::tcp_support::drive::{
+use tatami_ssh_fuzz_protocol::tcp_support::drive::{
     End, MAX_STEPS, assert_ident_phase, assert_same_run, drive,
 };
-use tatami_fuzz_protocol::tcp_support::stream_gen::{self, ModelLimits, Role};
-use tatami_fuzz_protocol::tcp_support::{ChunkMode, Cursor, ident_ref, msg_ref};
-use tatami_tcp::ident::IdentLimits;
-use tatami_tcp::initial::InputOverflow;
-use tatami_tcp::packet::{HEADER_LEN, PacketLimits};
-use tatami_tcp::probe::{Probe, ProbeConfig, ProbeEnd, ProbeError, Stage, Step};
-use tatami_wire::kexinit::classify_kex_name;
+use tatami_ssh_fuzz_protocol::tcp_support::stream_gen::{self, ModelLimits, Role};
+use tatami_ssh_fuzz_protocol::tcp_support::{ChunkMode, Cursor, ident_ref, msg_ref};
+use tatami_ssh_tcp::ident::IdentLimits;
+use tatami_ssh_tcp::initial::InputOverflow;
+use tatami_ssh_tcp::packet::{HEADER_LEN, PacketLimits};
+use tatami_ssh_tcp::probe::{Probe, ProbeConfig, ProbeEnd, ProbeError, Stage, Step};
+use tatami_ssh_wire::kexinit::classify_kex_name;
 
 fn probe_config(sel: u8) -> ProbeConfig {
     let base = ProbeConfig::default();
@@ -138,7 +138,7 @@ fn check_proposal_names(end: &Option<End>) {
             );
             assert_eq!(
                 class.is_marker(),
-                class != tatami_wire::kexinit::KexName::Method
+                class != tatami_ssh_wire::kexinit::KexName::Method
             );
         }
         assert!(

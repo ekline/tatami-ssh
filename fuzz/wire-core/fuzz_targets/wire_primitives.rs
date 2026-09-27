@@ -30,12 +30,12 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_wire_core::bytes::{be_u32, be_u64};
-use tatami_fuzz_wire_core::generate;
-use tatami_fuzz_wire_core::namelist_ref;
-use tatami_wire::namelist;
-use tatami_wire::primitives::TrailingBytes;
-use tatami_wire::{DecodeError, EncodeError, NameList, Reader, Writer};
+use tatami_ssh_fuzz_wire_core::bytes::{be_u32, be_u64};
+use tatami_ssh_fuzz_wire_core::generate;
+use tatami_ssh_fuzz_wire_core::namelist_ref;
+use tatami_ssh_wire::namelist;
+use tatami_ssh_wire::primitives::TrailingBytes;
+use tatami_ssh_wire::{DecodeError, EncodeError, NameList, Reader, Writer};
 
 const MAX_OPS: usize = 64;
 const MAX_INPUT: usize = 2048;
@@ -328,18 +328,18 @@ fuzz_target!(|script: Script| {
             }
             Op::WriteU32(v) => {
                 let mut e = Vec::new();
-                tatami_fuzz_wire_core::bytes::put_u32(&mut e, *v);
+                tatami_ssh_fuzz_wire_core::bytes::put_u32(&mut e, *v);
                 write_fixed(&mut w, &mut wmodel, &e, w_u32(*v), "write_u32");
             }
             Op::WriteU64(v) => {
                 let mut e = Vec::new();
-                tatami_fuzz_wire_core::bytes::put_u64(&mut e, *v);
+                tatami_ssh_fuzz_wire_core::bytes::put_u64(&mut e, *v);
                 write_fixed(&mut w, &mut wmodel, &e, w_u64(*v), "write_u64");
             }
             Op::WriteBytes(b) => write_fixed(&mut w, &mut wmodel, b, w_bytes(b), "write_bytes"),
             Op::WriteString(s) => {
                 let mut e = Vec::new();
-                tatami_fuzz_wire_core::bytes::put_string(&mut e, s);
+                tatami_ssh_fuzz_wire_core::bytes::put_string(&mut e, s);
                 write_fixed(&mut w, &mut wmodel, &e, w_string(s), "write_string");
             }
             Op::WriteNameList(names) => {
@@ -369,7 +369,7 @@ fuzz_target!(|script: Script| {
                     }
                     None => {
                         let mut e = Vec::new();
-                        tatami_fuzz_wire_core::bytes::put_name_list(&mut e, names);
+                        tatami_ssh_fuzz_wire_core::bytes::put_name_list(&mut e, names);
                         let needed = e.len();
                         let available = script.capacity - wmodel.len();
                         if needed > available {

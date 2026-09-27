@@ -16,7 +16,7 @@
 //!   exchange hash and RFC 4253 §7.2 key expansion with `sha2`, `mpint`
 //!   encoding by hand, AES-128-GCM sealing/opening in the RFC 5647 layout
 //!   with `aes_gcm`, and a deterministic `CryptoRngCore` for the client.
-//!   Nothing here calls `tatami_tcp::{transcript, gcm, negotiate}`.
+//!   Nothing here calls `tatami_ssh_tcp::{transcript, gcm, negotiate}`.
 
 /// RFC 4648 §4 alphabet, unpadded, with a strict decoder.
 pub mod base64 {
@@ -317,7 +317,7 @@ pub mod lists {
 
 /// Independent RFC 4253 §7.1 negotiation model for the first profile.
 pub mod negotiate_ref {
-    use tatami_tcp::negotiate::{Direction, Mac, Negotiated, NegotiationError, StrictKex};
+    use tatami_ssh_tcp::negotiate::{Direction, Mac, Negotiated, NegotiationError, StrictKex};
 
     use super::lists::{Lists, MARKERS};
 

@@ -32,16 +32,18 @@
 
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_wire_core::bytes::{put_bool, put_string, put_u8, put_u32};
-use tatami_fuzz_wire_core::generate;
-use tatami_fuzz_wire_core::messages_ref as mref;
-use tatami_fuzz_wire_core::namelist_ref;
-use tatami_wire::channel::{
+use tatami_ssh_fuzz_wire_core::bytes::{put_bool, put_string, put_u8, put_u32};
+use tatami_ssh_fuzz_wire_core::generate;
+use tatami_ssh_fuzz_wire_core::messages_ref as mref;
+use tatami_ssh_fuzz_wire_core::namelist_ref;
+use tatami_ssh_wire::channel::{
     ChannelOpen, ChannelOpenConfirmation, ChannelOpenFailure, open_failure_reason,
 };
-use tatami_wire::kexinit::{ALGORITHM_LIST_NAMES, COOKIE_LEN, KexInit, KexName, classify_kex_name};
-use tatami_wire::transport::{Debug, Disconnect, Ignore, Unimplemented, disconnect_reason};
-use tatami_wire::{EncodeError, MessageError, NameList, msg};
+use tatami_ssh_wire::kexinit::{
+    ALGORITHM_LIST_NAMES, COOKIE_LEN, KexInit, KexName, classify_kex_name,
+};
+use tatami_ssh_wire::transport::{Debug, Disconnect, Ignore, Unimplemented, disconnect_reason};
+use tatami_ssh_wire::{EncodeError, MessageError, NameList, msg};
 
 // ---------------------------------------------------------------------------
 // Raw path: production decoder vs reference decoder on arbitrary bytes.
@@ -557,7 +559,7 @@ fn structured_kexinit(u: &mut Unstructured<'_>) {
     put_u8(&mut hand, mref::KEXINIT);
     hand.extend_from_slice(&cookie);
     for names in &lists {
-        tatami_fuzz_wire_core::bytes::put_name_list(&mut hand, names);
+        tatami_ssh_fuzz_wire_core::bytes::put_name_list(&mut hand, names);
     }
     put_bool(&mut hand, first);
     put_u32(&mut hand, reserved);

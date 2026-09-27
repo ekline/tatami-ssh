@@ -5,6 +5,10 @@
 # tatami-ssh
 Rust-based SSH experiment
 
+Cargo packages and Rust imports use the `tatami_ssh` prefix: the facade is
+`tatami_ssh`, with libraries such as `tatami_ssh_wire` and `tatami_ssh_keys`.
+The executables are `tatami-client` and `tatami-server`.
+
 Genuine SSH over TCP, with QUIC explored as an alternate transport binding.
 All libraries are `no_std`; see `docs/architecture.md` for the package layout,
 portability layers and feature policy, and `docs/decisions.md` for workspace
@@ -45,16 +49,16 @@ Early. What runs today (round 5, 2026-09-26):
 
 Library pieces behind that: bounded SSH primitive codecs (including `mpint`)
 and `KEXINIT` / `KEX_ECDH_*` / `NEWKEYS` / `EXT_INFO` / service / transport /
-channel-opening codecs (`tatami-wire`); key and signature blobs, Ed25519
+channel-opening codecs (`tatami_ssh_wire`); key and signature blobs, Ed25519
 verification, `SHA256:` fingerprints, the trust policies (pin and read-only
 `known_hosts`), strict Ed25519 SPKI conversion, SSHFP values and unencrypted
-OpenSSH Ed25519 private-key decoding (`tatami-keys`); identification and
+OpenSSH Ed25519 private-key decoding (`tatami_ssh_keys`); identification and
 packet framing, negotiation, exchange hash and key derivation, AES-GCM packet
 protection, the probe/observer and handshake state machines, and blocking
-host adapters (`tatami-tcp`); a pure
-channel-opening engine (`tatami-connection`); the QUIC diagnostic backend
-(`tatami-quic`, feature `quinn-backend`); and reporting, bounded file reads
-and trust selection (`tatami`).
+host adapters (`tatami_ssh_tcp`); a pure
+channel-opening engine (`tatami_ssh_connection`); the QUIC diagnostic backend
+(`tatami_ssh_quic`, feature `quinn-backend`); and reporting, bounded file reads
+and trust selection (`tatami_ssh`).
 
 Not implemented: user authentication, rekeying, a TCP SSH server handshake,
 writing or enrolling `known_hosts` (or reading `~/.ssh` implicitly),
@@ -67,13 +71,13 @@ framing, control stream and session binding are open).
 ## Running the probe
 
 ```sh
-cargo run -p tatami --features std,tcp --bin tatami-client -- \
+cargo run -p tatami_ssh --features std,tcp --bin tatami-client -- \
   probe ssh.example.net --port 22
 
-cargo run -p tatami --features std,tcp --bin tatami-client -- \
+cargo run -p tatami_ssh --features std,tcp --bin tatami-client -- \
   probe 2001:db8::10 --port 2222 --connect-timeout 5s --read-timeout 5s
 
-cargo run -p tatami --features std,tcp --bin tatami-client -- --help
+cargo run -p tatami_ssh --features std,tcp --bin tatami-client -- --help
 ```
 
 Host and port are separate so IPv6 literals need no brackets. Exit status is
@@ -99,16 +103,16 @@ non-methods, `[preauth]` close in sshd's log.
 
 ```sh
 # Local diagnostic, finite duration and connection count.
-cargo run -p tatami --features std,tcp --bin tatami-server -- \
+cargo run -p tatami_ssh --features std,tcp --bin tatami-server -- \
   observe --listen 127.0.0.1:2222 --timeout 5s \
   --max-concurrent 32 --max-connections 100 --run-for 10m --format jsonl
 
 # IPv6 banner-only observation.
-cargo run -p tatami --features std,tcp --bin tatami-server -- \
+cargo run -p tatami_ssh --features std,tcp --bin tatami-server -- \
   observe --listen '[::1]:2222' --banner-only --run-for 1m --format jsonl
 
 # Explicit public bind, for you to run on the intended host.
-cargo run -p tatami --features std,tcp --bin tatami-server -- \
+cargo run -p tatami_ssh --features std,tcp --bin tatami-server -- \
   observe --listen 0.0.0.0:2222 --format jsonl > observations.jsonl
 ```
 
@@ -164,7 +168,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 #   256 SHA256:<43 base64 characters> comment (ED25519)
 
 # On the client, with the SHA256: value printed above.
-cargo run -p tatami --features std,tcp,kex --bin tatami-client -- \
+cargo run -p tatami_ssh --features std,tcp,kex --bin tatami-client -- \
   handshake ssh.example.net --port 22 \
   --host-key-sha256 'SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8'
 
@@ -219,8 +223,8 @@ scripts/openssh-fixture.sh stop     # kills sshd, deletes the key
 ```
 
 Observed against `OpenSSH_10.2p1` during development
-(`crates/tatami-tcp/tests/openssh_handshake.rs`,
-`crates/tatami/tests/handshake_cli.rs`; the tests skip when
+(`crates/tatami_ssh_tcp/tests/openssh_handshake.rs`,
+`crates/tatami_ssh/tests/handshake_cli.rs`; the tests skip when
 `/usr/sbin/sshd` is absent, unless `TATAMI_REQUIRE_OPENSSH=1` makes that a
 failure, as CI sets it): default sshd — `Completed`, strict KEX
 negotiated under `kex-strict-s-v00@openssh.com`, `EXT_INFO` with
@@ -236,13 +240,13 @@ on sshd's. No authentication attempt appears in any log.
 ```sh
 # Server: generates a self-signed Ed25519 test identity into DIR on first run
 # and prints its certificate SHA-256 to stderr.
-cargo run -p tatami --features std,tcp,quic-diag --bin tatami-server -- \
+cargo run -p tatami_ssh --features std,tcp,quic-diag --bin tatami-server -- \
   observe --transport quic --listen 127.0.0.1:4433 --alpn tatami-diag/0 \
   --identity-dir target/quic-identity --generate-identity \
   [--require-validation] [--timeout 5s] [--max-connections N] [--run-for 10m]
 
 # Client: pins that certificate fingerprint (not an SSH host-key fingerprint).
-cargo run -p tatami --features std,tcp,quic-diag --bin tatami-client -- \
+cargo run -p tatami_ssh --features std,tcp,quic-diag --bin tatami-client -- \
   handshake 127.0.0.1 --transport quic --port 4433 --server-name localhost \
   --alpn tatami-diag/0 --cert-sha256 'SHA256:…' --exporter-probe [--json]
 ```
@@ -258,7 +262,7 @@ does for the TCP handshake. Build with `--features std,tcp,kex,quic-diag`
 to get every command in one pair of binaries.
 
 This is **experimental**: `quinn-proto` 0.11.18 + `rustls` 0.23.45 on `ring`,
-host-only, behind `tatami-quic/quinn-backend` (`docs/decisions.md` W-31). The
+host-only, behind `tatami_ssh_quic/quinn-backend` (`docs/decisions.md` W-31). The
 ALPN value has no default, is unregistered, and interoperates with nothing
 else. No stream is opened, no DATAGRAM is sent, 0-RTT and resumption are
 disabled, and **no SSH byte is ever sent** — tests inspect every datagram. It
@@ -280,16 +284,16 @@ entry (round 5). Build with `--features std,tcp,kex,quic-diag`:
 
 ```sh
 # QUIC: the key sshd uses on TCP, presented as an RFC 7250 raw public key.
-cargo run -p tatami --features std,tcp,kex,quic-diag --bin tatami-server -- \
+cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-server -- \
   observe --transport quic --listen 127.0.0.1:2222 \
   --alpn tatami-diag/0 --host-key /path/to/ssh_host_ed25519_key
 
 # TCP (sshd on 127.0.0.1:2222) and QUIC (UDP 2222) under the same entry.
-cargo run -p tatami --features std,tcp,kex,quic-diag --bin tatami-client -- \
+cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-client -- \
   handshake 127.0.0.1 --transport tcp --port 2222 \
   --known-hosts /path/to/fixture_known_hosts
 
-cargo run -p tatami --features std,tcp,kex,quic-diag --bin tatami-client -- \
+cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-client -- \
   handshake 127.0.0.1 --transport quic --port 2222 \
   --alpn tatami-diag/0 --known-hosts /path/to/fixture_known_hosts
 ```
@@ -331,7 +335,7 @@ key over QUIC/TLS is not an SSH session. No SSH byte crosses QUIC, no user is
 authenticated, and the QUIC report says `ssh_session: false`. Tatami has no
 TCP SSH server; OpenSSH is the TCP side.
 
-Observed during development (`crates/tatami/tests/host_identity.rs`, real
+Observed during development (`crates/tatami_ssh/tests/host_identity.rs`, real
 `sshd` and `tatami-server --host-key` on the same TCP/UDP port number, one
 entry; skips when `/usr/sbin/sshd` or `ssh-keygen` is absent, fails instead
 with `TATAMI_REQUIRE_OPENSSH=1`) against
@@ -352,11 +356,11 @@ scripts/check-workspace.sh
 ```
 
 Runs formatting, Clippy, the feature matrix (including `kex`, `std,tcp,kex`,
-`quic-diag`, `tatami-keys` `known-hosts`/`openssh-key`), dependency-graph
+`quic-diag`, `tatami_ssh_keys` `known-hosts`/`openssh-key`), dependency-graph
 checks (no `std`, TLS, resolver or `getrandom` crates in the portable key
 graphs; no private-key or TLS crates in the portable `kex` facade), tests,
 docs and (when the `thumbv7em-none-eabi` target is installed) core/alloc-only
-builds, including `tatami-tcp --features kex` and `tatami-keys --features
+builds, including `tatami_ssh_tcp --features kex` and `tatami_ssh_keys --features
 known-hosts,openssh-key` with no standard library. CI runs it on Rust 1.85.0
 and stable, with OpenSSH installed and `TATAMI_REQUIRE_OPENSSH=1` so the
 OpenSSH interoperability tests fail rather than skip. Round 5 ran it locally

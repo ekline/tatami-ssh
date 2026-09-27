@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::packet` framing and `tatami_tcp::initial::InitialPackets`
+//! `tatami_ssh_tcp::packet` framing and `tatami_ssh_tcp::initial::InitialPackets`
 //! against independent header rules, slicing and budget accounting.
 //!
 //! # Input layout
@@ -50,11 +50,11 @@
 //!   lengths are huge while inputs stay small.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::tcp_support::packet_ref::{self, RefStep};
-use tatami_fuzz_protocol::tcp_support::stream_gen::{self, Role};
-use tatami_fuzz_protocol::tcp_support::{ChunkMode, Cursor, filler, msg_ref, put_string};
-use tatami_tcp::initial::InitialLimits;
-use tatami_tcp::packet::{
+use tatami_ssh_fuzz_protocol::tcp_support::packet_ref::{self, RefStep};
+use tatami_ssh_fuzz_protocol::tcp_support::stream_gen::{self, Role};
+use tatami_ssh_fuzz_protocol::tcp_support::{ChunkMode, Cursor, filler, msg_ref, put_string};
+use tatami_ssh_tcp::initial::InitialLimits;
+use tatami_ssh_tcp::packet::{
     EncodeInitialError, PacketError, PacketLimits, PacketStep, decode_initial_packet,
     encode_initial_packet,
 };

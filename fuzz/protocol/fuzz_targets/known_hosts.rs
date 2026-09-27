@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_keys::known_hosts`: parsing, matching and the trust decision of
+//! `tatami_ssh_keys::known_hosts`: parsing, matching and the trust decision of
 //! `KnownHostsPolicy`. Pattern: trust policy.
 //!
 //! 1. API/input: a small description is decoded into `known_hosts` text,
@@ -46,8 +46,8 @@
 //!    - `glob_match` equals `glob_ref`.
 //!
 //!    Exact semantics (OpenSSH `ssh-keygen -F` agreement, limits, bounded
-//!    glob) are unit/integration tests in `tatami-keys` and
-//!    `crates/tatami/tests/host_identity.rs`.
+//!    glob) are unit/integration tests in `tatami_ssh_keys` and
+//!    `crates/tatami_ssh/tests/host_identity.rs`.
 //! 4. Not covered: `Limits` errors (unit tests), arbitrary bytes beyond the
 //!    malformed kinds above, file I/O (host layer).
 
@@ -55,11 +55,11 @@ use std::sync::OnceLock;
 
 use ed25519_dalek::SigningKey;
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::keys_support::{b64_encode, ed25519_blob, glob_ref, hmac_sha1};
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_keys::fingerprint::Sha256Fingerprint;
-use tatami_keys::known_hosts::{KnownHosts, KnownHostsError, Limits, Malformed, glob_match};
-use tatami_keys::trust::{
+use tatami_ssh_fuzz_protocol::keys_support::{b64_encode, ed25519_blob, glob_ref, hmac_sha1};
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
+use tatami_ssh_keys::known_hosts::{KnownHosts, KnownHostsError, Limits, Malformed, glob_match};
+use tatami_ssh_keys::trust::{
     HostIdentity, HostTrustPolicy, TrustDecision, TrustSource, UntrustedReason,
 };
 

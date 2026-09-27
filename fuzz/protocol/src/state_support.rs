@@ -3,27 +3,27 @@
 //! Harness-only code; never a dependency of a production package.
 //!
 //! - [`opening_model`]: an independent model of the channel-opening engine
-//!   (`tatami_connection::opening`) written from its documented contract. It
+//!   (`tatami_ssh_connection::opening`) written from its documented contract. It
 //!   keys state by protocol identities (local numbers, peer numbers, handles
 //!   as opaque tokens) rather than mirroring the engine's slot/generation
 //!   bookkeeping, and predicts every result, event and outgoing message.
-//! - [`json_ref`]: an independent RFC 8259 reference for `tatami::json`: a
+//! - [`json_ref`]: an independent RFC 8259 reference for `tatami_ssh::json`: a
 //!   shadow tree, a compact serializer, a string tokenizer/unescaper and an
-//!   inverse of the `tatami::text` terminal escaping.
+//!   inverse of the `tatami_ssh::text` terminal escaping.
 //! - [`record_ref`]: independent RFC 3339 formatting (Fliegel–Van Flandern),
 //!   the closed sets of stable codes an observer record may contain, and the
 //!   size bound of a truncated observation record.
 
-/// Independent model of `tatami_connection::opening::OpeningEngine`.
+/// Independent model of `tatami_ssh_connection::opening::OpeningEngine`.
 pub mod opening_model {
     use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-    use tatami_connection::opening::{
+    use tatami_ssh_connection::opening::{
         AcceptParams, ChannelHandle, Credit, Event, HandleError, LateReply, LocalNumber, OpenError,
         OpenParams, OpeningEngine, OpeningLimits, Outgoing, PeerNumber, Phase, Violation,
     };
-    use tatami_wire::EncodeError;
-    use tatami_wire::channel::{
+    use tatami_ssh_wire::EncodeError;
+    use tatami_ssh_wire::channel::{
         ChannelOpen, ChannelOpenConfirmation, ChannelOpenFailure, open_failure_reason,
     };
 
@@ -33,7 +33,7 @@ pub mod opening_model {
     pub const EXHAUSTED_REFUSAL_DESCRIPTION: &[u8] = b"channel numbers exhausted";
 
     // Finding history: with `max_tombstones == 0` the engine used to keep one
-    // tombstone (evict-before-push). Fixed in `tatami-connection` with the
+    // tombstone (evict-before-push). Fixed in `tatami_ssh_connection` with the
     // regression test `zero_tombstones_forgets_cancelled_numbers_immediately`;
     // the model now follows the documented capacity exactly.
 
@@ -63,7 +63,7 @@ pub mod opening_model {
         Est(u32),
     }
 
-    /// The model. See the module docs of `tatami_connection::opening` for
+    /// The model. See the module docs of `tatami_ssh_connection::opening` for
     /// the contract this encodes.
     #[derive(Clone, Debug)]
     pub struct Model {
@@ -729,9 +729,9 @@ pub mod opening_model {
     }
 }
 
-/// Independent RFC 8259 reference for `tatami::json` and `tatami::text`.
+/// Independent RFC 8259 reference for `tatami_ssh::json` and `tatami_ssh::text`.
 pub mod json_ref {
-    /// Shadow of a `tatami::json::Value`, built by the harness alongside the
+    /// Shadow of a `tatami_ssh::json::Value`, built by the harness alongside the
     /// production value.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Node {
@@ -990,8 +990,8 @@ pub mod json_ref {
         out
     }
 
-    /// Inverse of `tatami::text::escape_bytes` (`quotes_escaped == false`)
-    /// and of the inside of `tatami::text::quoted` (`quotes_escaped == true`).
+    /// Inverse of `tatami_ssh::text::escape_bytes` (`quotes_escaped == false`)
+    /// and of the inside of `tatami_ssh::text::quoted` (`quotes_escaped == true`).
     /// Panics if the text is not printable ASCII or an escape is malformed.
     #[must_use]
     pub fn unescape_terminal(s: &str, quotes_escaped: bool) -> Vec<u8> {
@@ -1408,11 +1408,11 @@ pub mod record_ref {
         /// the longest registered name and `f`-byte description and tag.
         fn worst_truncated_record(f: usize, line_len: usize) -> (usize, usize) {
             use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-            use tatami::server::observe::observation_record;
-            use tatami_tcp::ident::{LineTerminator, OwnedIdentification, VersionSupport};
-            use tatami_tcp::initial::SkippedMessage;
-            use tatami_tcp::io::{Observation, ObservationEnd};
-            use tatami_tcp::observer::{ObservationOutcome, ObserverStage};
+            use tatami_ssh::server::observe::observation_record;
+            use tatami_ssh_tcp::ident::{LineTerminator, OwnedIdentification, VersionSupport};
+            use tatami_ssh_tcp::initial::SkippedMessage;
+            use tatami_ssh_tcp::io::{Observation, ObservationEnd};
+            use tatami_ssh_tcp::observer::{ObservationOutcome, ObserverStage};
 
             let addr = SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::new(

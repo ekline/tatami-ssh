@@ -1,6 +1,6 @@
 #![no_main]
 //! Key-exchange, service and extension codecs plus the `mpint` primitive
-//! (`tatami-wire` without `alloc`), judged by independent reference layouts
+//! (`tatami_ssh_wire` without `alloc`), judged by independent reference layouts
 //! and the RFC 4251 §5 canonical-form rule.
 //!
 //! # Input layout
@@ -46,17 +46,17 @@
 
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_wire_core::bytes::{put_string, put_u8};
-use tatami_fuzz_wire_core::generate;
-use tatami_fuzz_wire_core::kex_ref as kref;
-use tatami_fuzz_wire_core::mpint_ref;
-use tatami_wire::ext_info::{
+use tatami_ssh_fuzz_wire_core::bytes::{put_string, put_u8};
+use tatami_ssh_fuzz_wire_core::generate;
+use tatami_ssh_fuzz_wire_core::kex_ref as kref;
+use tatami_ssh_fuzz_wire_core::mpint_ref;
+use tatami_ssh_wire::ext_info::{
     ExtInfo, ExtInfoError, KnownExtension, classify_extension, encode_ext_info,
 };
-use tatami_wire::kex::{KexEcdhInit, KexEcdhReply, NewKeys};
-use tatami_wire::primitives::mpint_positive_len;
-use tatami_wire::transport::{ServiceAccept, ServiceRequest};
-use tatami_wire::{DecodeError, EncodeError, MessageError, Reader, Writer, msg};
+use tatami_ssh_wire::kex::{KexEcdhInit, KexEcdhReply, NewKeys};
+use tatami_ssh_wire::primitives::mpint_positive_len;
+use tatami_ssh_wire::transport::{ServiceAccept, ServiceRequest};
+use tatami_ssh_wire::{DecodeError, EncodeError, MessageError, Reader, Writer, msg};
 
 const VALIDATE_MAXES: [usize; 4] = [0, 1, 8, 64];
 
@@ -71,7 +71,7 @@ fn message_numbers_agree() {
     assert_eq!(msg::NEWKEYS, kref::NEWKEYS);
     assert_eq!(msg::KEX_ECDH_INIT, kref::KEX_ECDH_INIT);
     assert_eq!(msg::KEX_ECDH_REPLY, kref::KEX_ECDH_REPLY);
-    assert_eq!(tatami_wire::ext_info::MIN_PAIR_LEN, kref::MIN_PAIR_LEN);
+    assert_eq!(tatami_ssh_wire::ext_info::MIN_PAIR_LEN, kref::MIN_PAIR_LEN);
     assert_eq!(NewKeys::LEN, 1);
     for (name, kind) in kref::KNOWN_EXTENSIONS {
         assert_eq!(kind.name(), name);
@@ -243,7 +243,7 @@ fn check_ext_info_raw(payload: &[u8]) {
 /// cursor unmoved on failure, and every inspection method against the rule.
 fn check_mpint_raw(input: &[u8]) {
     let mut r = Reader::new(input);
-    let mut c = tatami_fuzz_wire_core::cursor::RefCursor::new(input);
+    let mut c = tatami_ssh_fuzz_wire_core::cursor::RefCursor::new(input);
     match (r.read_mpint(), c.string()) {
         (Err(a), Err(e)) => {
             assert_eq!(a, e, "read_mpint error for {input:?}");
@@ -257,7 +257,7 @@ fn check_mpint_raw(input: &[u8]) {
     }
 }
 
-fn check_mpint_body(m: tatami_wire::Mpint<'_>, body: &[u8]) {
+fn check_mpint_body(m: tatami_ssh_wire::Mpint<'_>, body: &[u8]) {
     assert_eq!(m.as_bytes(), body, "as_bytes is the raw body");
     assert_eq!(
         m.is_zero(),
@@ -734,7 +734,7 @@ fn structured_ext_info(u: &mut Unstructured<'_>) {
         .iter()
         .find(|(n, _)| n == b"server-sig-algs")
         .map(|(_, v)| {
-            tatami_fuzz_wire_core::namelist_ref::parse(v)
+            tatami_ssh_fuzz_wire_core::namelist_ref::parse(v)
                 .map_err(ExtInfoError::InvalidServerSigAlgs)
         });
     let got_algs = ext

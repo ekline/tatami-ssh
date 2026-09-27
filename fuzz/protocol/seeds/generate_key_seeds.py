@@ -11,7 +11,7 @@ Provenance:
 - `known_hosts` seeds are *descriptions* in the layout documented at the top
   of `fuzz_targets/known_hosts.rs`; keys are derived at run time.
 - `openssh_private_key` raw seeds are the `ssh-keygen` (OpenSSH_10.2p1)
-  TEST fixtures already committed in `crates/tatami-keys/src/openssh_key.rs`
+  TEST fixtures already committed in `crates/tatami_ssh_keys/src/openssh_key.rs`
   (never host keys); structured seeds are descriptions (seed bytes, tamper
   kind), with key material derived at run time.
 """
@@ -171,7 +171,7 @@ for kind, name in enumerate(
     )
 
 # ---- openssh_private_key --------------------------------------------------
-src = (ROOT / "crates/tatami-keys/src/openssh_key.rs").read_text()
+src = (ROOT / "crates/tatami_ssh_keys/src/openssh_key.rs").read_text()
 
 
 def fixture(const):

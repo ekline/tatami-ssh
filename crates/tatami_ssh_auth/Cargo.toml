@@ -1,0 +1,16 @@
+[package]
+name = "tatami_ssh_auth"
+description = "SSH user authentication state machines for Tatami"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+tatami_ssh_wire = { workspace = true, features = ["alloc"] }
+tatami_ssh_keys = { workspace = true }

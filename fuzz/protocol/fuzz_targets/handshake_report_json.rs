@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami::client::handshake::Report::{to_json, write_text}` on reports
+//! `tatami_ssh::client::handshake::Report::{to_json, write_text}` on reports
 //! assembled from their public fields.
 //!
 //! # Input layout
@@ -53,22 +53,22 @@ use libfuzzer_sys::fuzz_target;
 use serde_json::Value as J;
 use std::path::PathBuf;
 
-use tatami::client::handshake::{Completion, Report, TrustConfig, TrustConfigError};
-use tatami::host::files::FileError;
-use tatami_fuzz_protocol::kex_support::base64;
-use tatami_fuzz_protocol::kex_support::crypto::HarnessRng;
-use tatami_fuzz_protocol::kex_support::negotiate_ref;
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_keys::fingerprint::Sha256Fingerprint;
-use tatami_keys::known_hosts::{KnownHostsError, LookupNameError, Malformed};
-use tatami_keys::trust::UntrustedReason;
-use tatami_tcp::handshake::{
+use tatami_ssh::client::handshake::{Completion, Report, TrustConfig, TrustConfigError};
+use tatami_ssh::host::files::FileError;
+use tatami_ssh_fuzz_protocol::kex_support::base64;
+use tatami_ssh_fuzz_protocol::kex_support::crypto::HarnessRng;
+use tatami_ssh_fuzz_protocol::kex_support::negotiate_ref;
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
+use tatami_ssh_keys::known_hosts::{KnownHostsError, LookupNameError, Malformed};
+use tatami_ssh_keys::trust::UntrustedReason;
+use tatami_ssh_tcp::handshake::{
     ClientHandshake, HandshakeConfig, HandshakeOutcome, HandshakeReport, LimitKind, Phase,
     ProtocolViolation, Step,
 };
-use tatami_tcp::initial::InputOverflow;
-use tatami_tcp::io::ConnectError;
-use tatami_tcp::negotiate::{Direction, NegotiationError};
+use tatami_ssh_tcp::initial::InputOverflow;
+use tatami_ssh_tcp::io::ConnectError;
+use tatami_ssh_tcp::negotiate::{Direction, NegotiationError};
 
 const OUTCOME_CODES: [&str; 18] = [
     "completed",

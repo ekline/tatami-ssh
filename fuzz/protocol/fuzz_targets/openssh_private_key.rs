@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_keys::openssh_key::Ed25519HostPrivateKey::from_openssh`: the
+//! `tatami_ssh_keys::openssh_key::Ed25519HostPrivateKey::from_openssh`: the
 //! validation adapter over `ssh-key` 0.6. Pattern: stateless parser.
 //!
 //! 1. API/input: `sel:u8, rest`. `sel` even: `rest` (bounded by the
@@ -32,15 +32,15 @@
 //!    ECDSA; the same ones as the unit tests in `openssh_key.rs`), plus one
 //!    structured description per tamper kind. Secrets are synthetic.
 //! 4. Not covered: `ssh-key`'s internal error wording; file permissions and
-//!    size checks (host layer, unit-tested in `crates/tatami`).
+//!    size checks (host layer, unit-tested in `crates/tatami_ssh`).
 
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::keys_support::{ed25519_blob, openssh_armor};
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_keys::openssh_key::{Ed25519HostPrivateKey, PrivateKeyError};
+use tatami_ssh_fuzz_protocol::keys_support::{ed25519_blob, openssh_armor};
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_keys::openssh_key::{Ed25519HostPrivateKey, PrivateKeyError};
 
 const PKCS8_PREFIX: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,

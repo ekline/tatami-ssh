@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami::server::observe::Encoder` on constructed `ListenerEvent`s whose
+//! `tatami_ssh::server::observe::Encoder` on constructed `ListenerEvent`s whose
 //! untrusted fields are mutated, checked against `serde_json`, an
 //! independent RFC 3339 formatter, closed code sets and a derived size bound
 //! (`state_support::record_ref`).
@@ -88,24 +88,24 @@ use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Value as J, json};
-use tatami::server::observe::{
+use tatami_ssh::server::observe::{
     Encoder, SCHEMA_VERSION, observation_record, rfc3339, summary_record,
 };
-use tatami_fuzz_protocol::state_support::json_ref::{self, Node, decode_hex_lower};
-use tatami_fuzz_protocol::state_support::record_ref::{
+use tatami_ssh_fuzz_protocol::state_support::json_ref::{self, Node, decode_hex_lower};
+use tatami_ssh_fuzz_protocol::state_support::record_ref::{
     self, FieldBounds, KEX_MARKERS, disconnect_name, looks_like_rfc3339, truncated_record_bound,
 };
-use tatami_fuzz_protocol::tcp_support::{Cursor, filler};
-use tatami_tcp::ident::{
+use tatami_ssh_fuzz_protocol::tcp_support::{Cursor, filler};
+use tatami_ssh_tcp::ident::{
     IdentError, InvalidIdentification, LineTerminator, OwnedIdentification, VersionSupport,
 };
-use tatami_tcp::initial::{InitialError, InputOverflow, SkippedMessage};
-use tatami_tcp::io::{ListenerEvent, Observation, ObservationEnd, StopReason, Summary};
-use tatami_tcp::observer::{ObservationOutcome, ObserverStage};
-use tatami_tcp::packet::PacketError;
-use tatami_tcp::probe::{Proposal, ProposalAnomaly};
-use tatami_wire::error::{DecodeError, InvalidEncoding, MessageError};
-use tatami_wire::kexinit::OwnedKexInit;
+use tatami_ssh_tcp::initial::{InitialError, InputOverflow, SkippedMessage};
+use tatami_ssh_tcp::io::{ListenerEvent, Observation, ObservationEnd, StopReason, Summary};
+use tatami_ssh_tcp::observer::{ObservationOutcome, ObserverStage};
+use tatami_ssh_tcp::packet::PacketError;
+use tatami_ssh_tcp::probe::{Proposal, ProposalAnomaly};
+use tatami_ssh_wire::error::{DecodeError, InvalidEncoding, MessageError};
+use tatami_ssh_wire::kexinit::OwnedKexInit;
 
 const MAX_RAW_FIELD: usize = 2000;
 const MAX_SHORT_FIELD: usize = 64;

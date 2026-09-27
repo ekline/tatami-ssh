@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::gcm::AeadDirection`: `aes128-gcm@openssh.com` protected
+//! `tatami_ssh_tcp::gcm::AeadDirection`: `aes128-gcm@openssh.com` protected
 //! packets (RFC 5647 layout) against an independent sealer built directly
 //! on `aes_gcm::Aes128Gcm`.
 //!
@@ -60,14 +60,14 @@ use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{AeadInPlace, Aes128Gcm, KeyInit};
 use libfuzzer_sys::fuzz_target;
 use rand_core::RngCore;
-use tatami_fuzz_protocol::kex_support::crypto::{Gcm, HarnessRng, padding_len};
-use tatami_fuzz_protocol::tcp_support::{ChunkMode, Cursor, filler};
-use tatami_tcp::gcm::{
+use tatami_ssh_fuzz_protocol::kex_support::crypto::{Gcm, HarnessRng, padding_len};
+use tatami_ssh_fuzz_protocol::tcp_support::{ChunkMode, Cursor, filler};
+use tatami_ssh_tcp::gcm::{
     AeadDirection, BLOCK_SIZE, KEY_LEN, LENGTH_LEN, MIN_PACKET_LENGTH, NONCE_LEN, OpenError,
     OpenStep, SealError, TAG_LEN,
 };
-use tatami_tcp::packet::PacketLimits;
-use tatami_tcp::transcript::AeadKeys;
+use tatami_ssh_tcp::packet::PacketLimits;
+use tatami_ssh_tcp::transcript::AeadKeys;
 
 /// `1 + 65531 + 4 = 65536`, the default `max_packet_length`.
 const CAP_PAYLOAD_LEN: usize = 65_531;

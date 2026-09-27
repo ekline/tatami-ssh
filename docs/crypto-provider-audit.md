@@ -14,10 +14,10 @@ the local registry (`~/.cargo/registry/src/*/<crate>-<version>/Cargo.toml`)
 and against the resolved graph of this workspace:
 
 ```sh
-cargo tree -p tatami-tcp  --features kex           -e features -f '{p} {f}'
-cargo tree -p tatami-keys --features ed25519       -e features -f '{p} {f}'
-cargo tree -p tatami-quic --features quinn-backend -e features -f '{p} {f}'
-cargo tree -p tatami-keys --no-default-features --features known-hosts,openssh-key -e normal -f '{p} {f}'
+cargo tree -p tatami_ssh_tcp  --features kex           -e features -f '{p} {f}'
+cargo tree -p tatami_ssh_keys --features ed25519       -e features -f '{p} {f}'
+cargo tree -p tatami_ssh_quic --features quinn-backend -e features -f '{p} {f}'
+cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key -e normal -f '{p} {f}'
 grep -m1 rust-version ~/.cargo/registry/src/*/<crate>-<version>/Cargo.toml
 ```
 
@@ -96,7 +96,7 @@ probing) and never part of the compiled library.
 | `sha2` | 0.10.9 | none (defaults off) | unset in manifest; RustCrypto documents 1.41 for 0.10 | `digest` 0.10.7, `block-buffer`, `crypto-common`, `cpufeatures` (no-op on `thumbv7em`) | none | SHA-256 for the exchange hash, key derivation and fingerprints |
 | `aes-gcm` | 0.10.3 | `aes` (defaults off; no `alloc`, no `getrandom`) | 1.56 | `aes` 0.8.4 (1.56), `ghash` 0.5.1 (1.56), `polyval`, `ctr`, `aead` 0.5.2, `universal-hash`, `subtle` | Keys and nonces are supplied by the caller; the in-place detached API is used so no plaintext copy is made by the provider | RFC 5116/5647 AES-128-GCM with constant-time GHASH; RustCrypto AEAD API allows detached tags and in-place operation, which the SSH packet layout needs |
 | `rand_core` | 0.6.4 | none | unset (crate documents 1.56 for 0.6) | none | Defines the `RngCore`/`CryptoRng` contract that portable code accepts by injection | Version the dalek 2.x crates expect; the host adapter supplies an implementation |
-| `getrandom` | 0.2.17 | none; **only in `tatami-tcp/std`** | unset (crate documents 1.36) | OS syscalls | Host entropy for the `std` adapter only | Never present in portable builds; fallible API is surfaced rather than panicking |
+| `getrandom` | 0.2.17 | none; **only in `tatami_ssh_tcp/std`** | unset (crate documents 1.36) | OS syscalls | Host entropy for the `std` adapter only | Never present in portable builds; fallible API is surfaced rather than panicking |
 | `zeroize` | 1.9.0 | `zeroize_derive` (defaults off) | **1.85** (equals the workspace MSRV) | proc-macro | Wipes shared secrets, derived keys and ephemeral scalars on drop | Standard secret-hygiene crate |
 | `subtle` | 2.6.1 | none | unset (documents 1.60) | none | Constant-time equality for fingerprint/pin and tag comparison | Avoids early-exit comparison on secret-adjacent values |
 | `base64ct` | 1.8.3 | `alloc` | **1.85** | none | none | Constant-time base64 for `SHA256:` fingerprints; no `std` |
@@ -128,20 +128,20 @@ document's `quinn-proto + rustls` candidate is now the decision, W-31):
 | `ring` | 0.17.14 | none | 1.66.0 | C and assembly; needs a C compiler at build time. Confined to the `quinn-backend` feature. |
 
 Constraints recorded: the whole backend requires `std`; it never appears in
-default, `tcp`-only or portable builds (`cargo tree -p tatami-quic` without
+default, `tcp`-only or portable builds (`cargo tree -p tatami_ssh_quic` without
 the feature shows no crypto crates); it exists for the diagnostic handshake
 experiment only and settles no SSH-over-QUIC wire question.
 
 Round 5 signs with an SSH host key through this backend: the in-memory
 PKCS#8 is passed borrowed to `rustls::crypto::ring::sign::any_eddsa_type`;
 whatever copy `ring` keeps inside its key object is outside Tatami's control.
-Peer raw public keys are converted by `tatami_keys::spki` (pure Rust), and
+Peer raw public keys are converted by `tatami_ssh_keys::spki` (pure Rust), and
 `CertificateVerify` is verified by rustls with the provider's algorithms.
 
 ## Host-identity crates (round 5)
 
-Added behind `tatami-keys/known-hosts` (hashed hostnames) and
-`tatami-keys/openssh-key` (host private-key container), both portable
+Added behind `tatami_ssh_keys/known-hosts` (hashed hostnames) and
+`tatami_ssh_keys/openssh-key` (host private-key container), both portable
 `no_std` + `alloc`, both off by default. Checked against the registry
 manifests and sources and the resolved graph above (W-37, W-39):
 
@@ -156,7 +156,7 @@ manifests and sources and the resolved graph above (W-37, W-39):
 with `ed25519-dalek` instead), `encryption` (would pull `bcrypt-pbkdf` and
 AES/ChaCha implementations; `grep bcrypt Cargo.lock` finds nothing, so no
 KDF can run), `std`, `ecdsa`, `rsa`, `dsa`. `getrandom` is not in the graph of
-`tatami-keys --features known-hosts,openssh-key`; `check-workspace.sh`
+`tatami_ssh_keys --features known-hosts,openssh-key`; `check-workspace.sh`
 enforces that together with the absence of `rustls`/`ring`/`quinn`, of any
 `std` feature, of `hmac`/`sha1`/`ssh-key` without their features, and of
 `ssh-key`/`rustls`/`ring` in the portable `kex` facade. MSRV stays 1.85.
@@ -197,8 +197,8 @@ does. The PKCS#8 form (RFC 8410 §7 prefix plus seed) is built in
 
 ## Open items
 
-- Bare-metal (`thumbv7em-none-eabi`) build of `tatami-tcp --features kex`,
-  `tatami-keys --features ed25519` and (round 5) `tatami-keys --features
+- Bare-metal (`thumbv7em-none-eabi`) build of `tatami_ssh_tcp --features kex`,
+  `tatami_ssh_keys --features ed25519` and (round 5) `tatami_ssh_keys --features
   known-hosts,openssh-key` is pending its first observed CI run; the target
   is not installed on the development machine, where the step was skipped.
 - Round 5 code has been built and tested locally on stable (rustc 1.98.1)

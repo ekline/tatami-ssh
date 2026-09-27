@@ -74,7 +74,7 @@ print_commands() {
     say "host key fingerprint, obtained with: $SSH_KEYGEN -lf $KEY.pub"
     printf '  %s\n' "$pin"
     say "run the handshake with:"
-    printf "  cargo run -p tatami --features std,tcp,kex --bin tatami-client -- handshake 127.0.0.1 --port %s --host-key-sha256 '%s'\n" "$port" "$pin"
+    printf "  cargo run -p tatami_ssh --features std,tcp,kex --bin tatami-client -- handshake 127.0.0.1 --port %s --host-key-sha256 '%s'\n" "$port" "$pin"
     say "JSON form: append --json; wrong-pin check: change one character of the pin (exit status 1)"
 }
 

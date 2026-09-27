@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_connection::opening::OpeningEngine` driven by a bounded action
+//! `tatami_ssh_connection::opening::OpeningEngine` driven by a bounded action
 //! sequence and checked after every action against an independent model
 //! (`state_support::opening_model`) written from the module's documented
 //! contract.
@@ -80,19 +80,19 @@
 //!   stale and `next_outgoing()` is `None`.
 //! - Drained messages equal the model's queue exactly (numbers, credits
 //!   including 0 and `u32::MAX`, type-specific tails, descriptions) and
-//!   round-trip through the `tatami-wire` codecs; an undersized buffer is
+//!   round-trip through the `tatami_ssh_wire` codecs; an undersized buffer is
 //!   reported, not truncated.
 //!
 //! The local and peer number spaces are independent: selectors 0-6 make
 //! the peer pick numbers equal to ours so coinciding values are exercised.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_connection::opening::{
+use tatami_ssh_connection::opening::{
     AcceptParams, ChannelHandle, Credit, OpenParams, OpeningEngine, OpeningLimits,
 };
-use tatami_fuzz_protocol::state_support::opening_model::{Model, check_wire_roundtrip};
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_wire::channel::{ChannelOpen, ChannelOpenConfirmation, ChannelOpenFailure};
+use tatami_ssh_fuzz_protocol::state_support::opening_model::{Model, check_wire_roundtrip};
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_wire::channel::{ChannelOpen, ChannelOpenConfirmation, ChannelOpenFailure};
 
 const MAX_ACTIONS: usize = 200;
 

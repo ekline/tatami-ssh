@@ -2,7 +2,7 @@
 //! dependency of a production package.
 //!
 //! Everything here is an *oracle*: an independent restatement of the RFC
-//! grammar or wire layout that the targets use to judge `tatami-wire`. The
+//! grammar or wire layout that the targets use to judge `tatami_ssh_wire`. The
 //! reference code is deliberately written in a different shape from the
 //! production code (maximal-munch token runs, segment splitting, explicit
 //! shifts) so that a shared misunderstanding is less likely to cancel out.
@@ -103,7 +103,7 @@ pub mod namelist_ref {
     //! RFC 4251 §5 `name-list` grammar: comma-separated, non-empty names of
     //! printable US-ASCII (no commas); the list as a whole may be empty.
 
-    use tatami_wire::InvalidEncoding;
+    use tatami_ssh_wire::InvalidEncoding;
 
     /// Printable US-ASCII.
     pub fn is_printable(b: u8) -> bool {
@@ -208,7 +208,7 @@ pub mod cursor {
     //! variant with `needed`/`available`/`claimed`) that the documented
     //! `Reader` contract requires, without touching the production cursor.
 
-    use tatami_wire::DecodeError;
+    use tatami_ssh_wire::DecodeError;
 
     use crate::bytes::{be_u32, be_u64};
     use crate::namelist_ref;
@@ -312,11 +312,11 @@ pub mod cursor {
 }
 
 pub mod messages_ref {
-    //! Reference layouts for the message payloads `tatami-wire` decodes.
+    //! Reference layouts for the message payloads `tatami_ssh_wire` decodes.
     //! Field names follow the RFC definitions and must match the names the
     //! production decoders report in `MessageError::Field`.
 
-    use tatami_wire::{DecodeError, MessageError};
+    use tatami_ssh_wire::{DecodeError, MessageError};
 
     use crate::cursor::RefCursor;
 
@@ -676,8 +676,8 @@ pub mod kex_ref {
     //! RFC 8308 §2.3 `EXT_INFO`. Field names follow the RFC message
     //! definitions and must match `MessageError::Field`.
 
-    use tatami_wire::ext_info::{ExtInfoError, KnownExtension};
-    use tatami_wire::{DecodeError, MessageError};
+    use tatami_ssh_wire::ext_info::{ExtInfoError, KnownExtension};
+    use tatami_ssh_wire::{DecodeError, MessageError};
 
     use crate::cursor::RefCursor;
     use crate::namelist_ref;

@@ -125,16 +125,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "tatami-fuzz-wire-core"
+name = "tatami_ssh_fuzz_wire_core"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
- "tatami-wire",
+ "tatami_ssh_wire",
 ]
 
 [[package]]
-name = "tatami-wire"
+name = "tatami_ssh_wire"
 version = "0.1.0"
 
 [[package]]

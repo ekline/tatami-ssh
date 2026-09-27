@@ -64,7 +64,7 @@ IDENT = {
     "openssh": b"SSH-2.0-OpenSSH_9.6",
     "compat": b"SSH-1.99-Compat c",
     "openssh_ident_comments": b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.4",
-    "tatami": b"SSH-2.0-tatami_0.1.0",
+    "tatami_ssh": b"SSH-2.0-tatami_0.1.0",
     "comments_empty": b"SSH-2.0-x ",
     "comments_with_dash_and_spaces": b"SSH-2.0-tatami_0.1.0 hello-world  two spaces",
     "ssh1_version": b"SSH-1.5-OpenSSH_3.9p1",

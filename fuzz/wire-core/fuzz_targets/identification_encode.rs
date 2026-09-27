@@ -21,9 +21,9 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_wire_core::generate;
-use tatami_fuzz_wire_core::ident_ref;
-use tatami_wire::ident::{self, IdentEncodeError, Identification};
+use tatami_ssh_fuzz_wire_core::generate;
+use tatami_ssh_fuzz_wire_core::ident_ref;
+use tatami_ssh_wire::ident::{self, IdentEncodeError, Identification};
 
 const MAX_FIELD: usize = 300;
 const MAX_CAPACITY: u16 = 600;

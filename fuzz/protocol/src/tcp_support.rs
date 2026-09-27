@@ -9,9 +9,9 @@
 //! - [`ident_ref`]: an independent RFC 4253 §4.2 line reader (terminator
 //!   scanning, prelude budgets, 255-byte rule counted with the observed
 //!   terminator, content grammar, `2.0`/`1.99` policy). Oracle for
-//!   `tatami_tcp::ident`.
+//!   `tatami_ssh_tcp::ident`.
 //! - [`packet_ref`]: independent initial-packet header rules and slicing.
-//!   Oracle for `tatami_tcp::packet` and `tatami_tcp::initial`.
+//!   Oracle for `tatami_ssh_tcp::packet` and `tatami_ssh_tcp::initial`.
 //! - [`msg_ref`]: independent pre-`KEXINIT` message classification with
 //!   small reference decoders, plus a checked driver for `InitialPackets`.
 //! - [`stream_gen`]: a structured server/client stream generator with an
@@ -155,7 +155,7 @@ impl ChunkMode {
 
 /// Independent reference for the TCP identification exchange.
 pub mod ident_ref {
-    use tatami_tcp::ident::{
+    use tatami_ssh_tcp::ident::{
         IdentError, IdentLimits, InvalidIdentification, LineTerminator, VersionSupport,
     };
 
@@ -421,7 +421,7 @@ pub mod ident_ref {
 pub mod packet_ref {
     use std::ops::Range;
 
-    use tatami_tcp::packet::PacketError;
+    use tatami_ssh_tcp::packet::PacketError;
 
     /// Reference decode result; slices are expressed as ranges into the
     /// input so the caller can compare against the library's borrows.
@@ -517,11 +517,11 @@ pub mod packet_ref {
 
 /// Independent reference for pre-`KEXINIT` message handling.
 pub mod msg_ref {
-    use tatami_tcp::initial::{
+    use tatami_ssh_tcp::initial::{
         InitialError, InitialLimits, InitialPackets, InitialStep, SkippedMessage,
     };
-    use tatami_tcp::probe::ProposalAnomaly;
-    use tatami_wire::kexinit::{KexName, OwnedKexInit};
+    use tatami_ssh_tcp::probe::ProposalAnomaly;
+    use tatami_ssh_wire::kexinit::{KexName, OwnedKexInit};
 
     use super::{ChunkMode, packet_ref};
 
@@ -950,13 +950,13 @@ pub mod msg_ref {
 
 /// Common driver for the probe and observer state machines.
 pub mod drive {
-    use tatami_tcp::ident::{IdentLimits, LineTerminator, OwnedIdentification};
-    use tatami_tcp::initial::{InitialError, SkippedMessage};
-    use tatami_tcp::observer::{
+    use tatami_ssh_tcp::ident::{IdentLimits, LineTerminator, OwnedIdentification};
+    use tatami_ssh_tcp::initial::{InitialError, SkippedMessage};
+    use tatami_ssh_tcp::observer::{
         ObservationOutcome, Observer, ObserverEvent, ObserverStage, ObserverStep,
     };
-    use tatami_tcp::probe::{Probe, ProbeEnd, ProbeEvent, ProposalAnomaly, Stage, Step};
-    use tatami_wire::kexinit::OwnedKexInit;
+    use tatami_ssh_tcp::probe::{Probe, ProbeEnd, ProbeEvent, ProposalAnomaly, Stage, Step};
+    use tatami_ssh_wire::kexinit::OwnedKexInit;
 
     use super::ChunkMode;
     use super::ident_ref::{self, RefOutcome};
@@ -1435,15 +1435,15 @@ pub mod drive {
 
 /// Structured stream generation with an expectation model.
 pub mod stream_gen {
-    use tatami_tcp::ident::{
+    use tatami_ssh_tcp::ident::{
         IdentError, IdentLimits, InvalidIdentification, LineTerminator, OwnedIdentification,
         VersionSupport,
     };
-    use tatami_tcp::initial::{InitialError, SkippedMessage};
-    use tatami_tcp::packet::{PacketError, encode_initial_packet};
-    use tatami_tcp::probe::ProposalAnomaly;
-    use tatami_wire::Writer;
-    use tatami_wire::kexinit::OwnedKexInit;
+    use tatami_ssh_tcp::initial::{InitialError, SkippedMessage};
+    use tatami_ssh_tcp::packet::{PacketError, encode_initial_packet};
+    use tatami_ssh_tcp::probe::ProposalAnomaly;
+    use tatami_ssh_wire::Writer;
+    use tatami_ssh_wire::kexinit::OwnedKexInit;
 
     use super::drive::{End, Ev, Run, STAGE_PACKETS};
     use super::{Cursor, filler, ident_ref, msg_ref, packet_ref, put_string};
@@ -2276,11 +2276,11 @@ pub mod stream_gen {
     mod tests {
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        use tatami_tcp::ident::{LineTerminator, OwnedIdentification, VersionSupport};
-        use tatami_tcp::initial::SkippedMessage;
-        use tatami_tcp::observer::{Observer, ObserverConfig};
-        use tatami_tcp::packet::encode_initial_packet;
-        use tatami_tcp::probe::{Probe, ProbeConfig};
+        use tatami_ssh_tcp::ident::{LineTerminator, OwnedIdentification, VersionSupport};
+        use tatami_ssh_tcp::initial::SkippedMessage;
+        use tatami_ssh_tcp::observer::{Observer, ObserverConfig};
+        use tatami_ssh_tcp::packet::encode_initial_packet;
+        use tatami_ssh_tcp::probe::{Probe, ProbeConfig};
 
         use super::super::drive::{End, Ev, Machine, Run, STAGE_PACKETS, drive};
         use super::super::{ChunkMode, Cursor, put_string};
@@ -2358,7 +2358,7 @@ pub mod stream_gen {
 
         fn observer_limits(c: &ObserverConfig) -> ModelLimits {
             ModelLimits {
-                ident: tatami_tcp::ident::IdentLimits {
+                ident: tatami_ssh_tcp::ident::IdentLimits {
                     max_prelude_lines: 0,
                     max_prelude_bytes: 0,
                     max_prelude_line: c.max_identification_line,

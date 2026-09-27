@@ -1,7 +1,7 @@
 # QUIC observer readiness: status and corrections
 
 Status: round 4, 2026-09-20. Observer **(a)** below — the TLS/QUIC handshake
-observer — is **implemented** as `tatami-quic::diag` behind the
+observer — is **implemented** as `tatami_ssh_quic::diag` behind the
 `quinn-backend` feature (W-31), exposed as `tatami-server observe
 --transport quic` and `tatami-client handshake --transport quic` behind the
 facade feature `quic-diag` (W-35; originally separate `tatami-quic-*`
@@ -22,22 +22,22 @@ and a trusted host key over QUIC/TLS is not an SSH session.
 
 | Claim | Evidence |
 |---|---|
-| Backend: `quinn-proto` 0.11.18 (`rustls-ring`, `ring`), `rustls` 0.23.45 (`ring`, `std`, `tls12`), `rcgen` 0.13.2 for test identities; MSRV stays 1.85 | `crates/tatami-quic/Cargo.toml`, `crypto-provider-audit.md`, `cargo tree -p tatami-quic --features quinn-backend` |
-| Sans-I/O cores (`ServerCore`, `ClientCore`) driven by a blocking UDP loop; no async runtime | `crates/tatami-quic/src/diag/{server,client,udp}.rs` |
-| Full handshake completes on both ends; offered vs negotiated ALPN and SNI consistent; exporter available after completion | `tests/inmem_handshake.rs::matching_identity_and_alpn_completes_on_both_sides`, `tests/loopback.rs::matching_handshake_over_loopback`, `tatami/tests/quic_cli.rs::end_to_end_handshake_with_pin_and_exporter_probe` |
+| Backend: `quinn-proto` 0.11.18 (`rustls-ring`, `ring`), `rustls` 0.23.45 (`ring`, `std`, `tls12`), `rcgen` 0.13.2 for test identities; MSRV stays 1.85 | `crates/tatami_ssh_quic/Cargo.toml`, `crypto-provider-audit.md`, `cargo tree -p tatami_ssh_quic --features quinn-backend` |
+| Sans-I/O cores (`ServerCore`, `ClientCore`) driven by a blocking UDP loop; no async runtime | `crates/tatami_ssh_quic/src/diag/{server,client,udp}.rs` |
+| Full handshake completes on both ends; offered vs negotiated ALPN and SNI consistent; exporter available after completion | `tests/inmem_handshake.rs::matching_identity_and_alpn_completes_on_both_sides`, `tests/loopback.rs::matching_handshake_over_loopback`, `tatami_ssh/tests/quic_cli.rs::end_to_end_handshake_with_pin_and_exporter_probe` |
 | Wrong certificate pin fails at the client with `certificate_unknown` (alert 46 via rustls `CertificateError::Other`); the server records `Failed`, `ConnectionLost`, still with the offered ClientHello and the negotiated ALPN | `tests/inmem_handshake.rs::wrong_pin_fails_with_certificate_error_on_both_sides`, `tests/loopback.rs::wrong_identity_over_loopback` |
 | ALPN mismatch fails with `no_application_protocol` (alert 120, "peer doesn't support any known protocol") | `tests/inmem_handshake.rs::alpn_mismatch_fails_with_no_application_protocol`, `tests/loopback.rs::wrong_alpn_over_loopback` |
 | No listener → `TimedOut` at the client deadline, `datagrams_received == 0` | `tests/loopback.rs::no_listener_times_out_within_the_deadline`, `tests/inmem_handshake.rs::client_into_blackhole_times_out_at_its_deadline` |
-| `require_validation` → one Retry, two `Incoming`, accepted connection reports `peer_address_validated: true`, `validation_method: retry_token` | `tests/loopback.rs::require_validation_sends_retry_and_reports_validated_peer`, `tatami/tests/quic_cli.rs::require_validation_is_visible_in_records` |
+| `require_validation` → one Retry, two `Incoming`, accepted connection reports `peer_address_validated: true`, `validation_method: retry_token` | `tests/loopback.rs::require_validation_sends_retry_and_reports_validated_peer`, `tatami_ssh/tests/quic_cli.rs::require_validation_is_visible_in_records` |
 | Exporter: fails before completion (buffer untouched), equal at both ends, differs by label, context, length and connection | `tests/exporter.rs` |
 | RFC 7250 raw public keys work end to end; `peer_identity()` is the 44-byte SPKI DER; wrong SPKI pin fails; no silent downgrade in either direction; three fingerprints of one Ed25519 key differ | `tests/rpk.rs` |
 | No SSH byte on the wire: every captured datagram checked for `SSH-` | `tests/inmem_handshake.rs::assert_no_ssh_bytes` |
 | 0-RTT never attempted (`zero_rtt_attempted: false` both ends) | `tests/inmem_handshake.rs` |
-| (Round 5) SSH host key as raw public key: SSH-blob pin and `known_hosts` succeed; wrong pin, changed key, revoked key, a port-22 entry for UDP 4433 and negated entries fail; a certificate peer is refused by SSH trust; an X.509 client is refused by a host-key server; a host key cannot be presented as a certificate; a trusted key with a foreign `CertificateVerify` signature fails | `tatami-quic/tests/host_key.rs` (in-memory) |
-| (Round 5) Same key served by OpenSSH `sshd` on TCP port P and `tatami-server --host-key` on UDP port P; one `known_hosts` entry accepts both; same fingerprint as `ssh-keygen -lf`; SSHFP from the QUIC raw key equals the TCP one and `ssh-keygen -r` | `tatami/tests/host_identity.rs` (passed locally with `OpenSSH_10.2p1`; skips without OpenSSH except under `TATAMI_REQUIRE_OPENSSH=1`, which CI sets; first CI run not yet observed) |
+| (Round 5) SSH host key as raw public key: SSH-blob pin and `known_hosts` succeed; wrong pin, changed key, revoked key, a port-22 entry for UDP 4433 and negated entries fail; a certificate peer is refused by SSH trust; an X.509 client is refused by a host-key server; a host key cannot be presented as a certificate; a trusted key with a foreign `CertificateVerify` signature fails | `tatami_ssh_quic/tests/host_key.rs` (in-memory) |
+| (Round 5) Same key served by OpenSSH `sshd` on TCP port P and `tatami-server --host-key` on UDP port P; one `known_hosts` entry accepts both; same fingerprint as `ssh-keygen -lf`; SSHFP from the QUIC raw key equals the TCP one and `ssh-keygen -r` | `tatami_ssh/tests/host_identity.rs` (passed locally with `OpenSSH_10.2p1`; skips without OpenSSH except under `TATAMI_REQUIRE_OPENSSH=1`, which CI sets; first CI run not yet observed) |
 
 All of the above passed on the development machine on 2026-09-20
-(`cargo test -p tatami-quic --features quinn-backend`; `cargo test -p tatami
+(`cargo test -p tatami_ssh_quic --features quinn-backend`; `cargo test -p tatami_ssh
 --features std,tcp,quic-diag --test quic_cli`). This is a loopback experiment with
 Tatami on both ends; **no interoperability with any other QUIC or TLS
 implementation is claimed**, and the ALPN value is unregistered.
@@ -77,7 +77,7 @@ Consequences that are fixed regardless of backend:
 | SSH content | None. No identification string, no `KEXINIT`. | Identification placement and the control-stream bootstrap as decided under AQ-015, AQ-020–AQ-023, AQ-026. Not decided yet. |
 | Identity | A locally generated certificate or raw public key sufficient to complete a TLS handshake; trust decisions are out of scope. | Real identity configuration (P-06: raw public keys are the candidate) and the exporter-derived binding (P-04) — still open. |
 | Application protocol | An experimental, configurable ALPN value; no IANA registration is claimed (AQ-019 / P-08). Observing which values clients *offer* is the point. | Same value, but now it must be *agreed* (RFC 9001 §8.1 requires authenticated negotiation). |
-| Must not | Reply on UDP outside the backend; treat Initial source as peer. | Inherit TCP packet framing (`tatami-tcp::packet` is the TCP envelope, W-12), or manufacture an SSH KEX / session ID. The QUIC record rule is AQ-018 and is unwritten. |
+| Must not | Reply on UDP outside the backend; treat Initial source as peer. | Inherit TCP packet framing (`tatami_ssh_tcp::packet` is the TCP envelope, W-12), or manufacture an SSH KEX / session ID. The QUIC record rule is AQ-018 and is unwritten. |
 | Prerequisite | A backend that compiles under an explicit `std`-enabling feature. | (a) plus the mapping decisions above. |
 
 Observer (a) is implemented (§0). Observer (b) is blocked on design work,
@@ -104,13 +104,13 @@ is pinned by `Cargo.lock`, so the MSRV-drift blocker is contained, not gone.
 | Migration events | No dedicated event in 0.11; `remote_address()` is "the latest" address, plus `path_changed()`/`local_address_changed()` hooks ([Connection](https://docs.rs/quinn-proto/latest/quinn_proto/struct.Connection.html)). | `path_event_next()` → `PathEvent`; `probe_path`, `migrate`. | `on_active_path_updated`, `on_path_created`, `on_connection_migration_denied`. | Unverified. | Unverified. |
 | Certificates and raw public keys (RFC 7250) | rustls: `requires_raw_public_keys()` on `ClientCertVerifier`/`ServerCertVerifier`; `peer_certificates()` returns the raw public key as the single element when RPK is in use ([ClientCertVerifier](https://docs.rs/rustls/latest/rustls/server/danger/trait.ClientCertVerifier.html), [ConnectionCommon](https://docs.rs/rustls/latest/rustls/struct.ConnectionCommon.html)). Through quinn-proto: `Session::peer_identity()` as `Box<dyn Any>`. | `peer_cert()`, `peer_cert_chain()` (DER). RPK: unverified (BoringSSL). | `take_tls_context()`; RPK support unverified. | NSS; unverified. | Unverified. |
 | TLS exporter (RFC 5705 / RFC 8446 §7.5) | `Session::export_keying_material(output, label, context)` ([trait](https://docs.rs/quinn-proto/latest/quinn_proto/crypto/trait.Session.html)); rustls `ConnectionCommon::export_keying_material` "does not use the early exporter" and fails before handshake completion. | Not on `Connection`; `AsMut<SslRef>` (feature `boringssl-boring-crate`) may reach BoringSSL's exporter — unverified. | `on_tls_exporter_ready` event exists; the accessor it provides is unverified. | Unverified. | Unverified. |
-| Feature isolation | Yes: `quinn-proto` with `default-features = false`, `rustls-ring` or `rustls-aws-lc-rs` chosen explicitly ([quinn-proto/Cargo.toml](https://raw.githubusercontent.com/quinn-rs/quinn/main/quinn-proto/Cargo.toml)); can sit behind `tatami-quic` feature `backend-quinn = ["std", …]`. | Yes in principle, but the BoringSSL build (cmake, C++ toolchain) is heavy and MSRV 1.88 already exceeds the project's. | Feature-gated, but tokio is unconditional and MSRV 1.92 exceeds the project's. | Git-only dependency plus NSS build; hard to isolate reproducibly (W-08 lockfile). | FFI + cmake; isolatable but pulls a C toolchain and vendor TLS. |
+| Feature isolation | Yes: `quinn-proto` with `default-features = false`, `rustls-ring` or `rustls-aws-lc-rs` chosen explicitly ([quinn-proto/Cargo.toml](https://raw.githubusercontent.com/quinn-rs/quinn/main/quinn-proto/Cargo.toml)); can sit behind `tatami_ssh_quic` feature `backend-quinn = ["std", …]`. | Yes in principle, but the BoringSSL build (cmake, C++ toolchain) is heavy and MSRV 1.88 already exceeds the project's. | Feature-gated, but tokio is unconditional and MSRV 1.92 exceeds the project's. | Git-only dependency plus NSS build; hard to isolate reproducibly (W-08 lockfile). | FFI + cmake; isolatable but pulls a C toolchain and vendor TLS. |
 
 ### 3.1 Why this backend (confirmed)
 
 1. Its current release matches MSRV 1.85 and its core is sans-I/O, so no
    async runtime is committed (W-14) and the blocking, deadline-driven
-   adapter style of `tatami-tcp::io` is reused. The `quinn` convenience
+   adapter style of `tatami_ssh_tcp::io` is reused. The `quinn` convenience
    crate is not used; it drags in tokio.
 2. Address validation is first-class: an `Incoming` exists *before* any
    handshake state; `remote_address_validated()` and `may_retry()` are
@@ -159,7 +159,7 @@ coarsely (no migration event in 0.11) and is not exercised.
 | `zero_rtt_attempted`, `unexpected_streams`, `unexpected_datagrams` | Events counted and ignored | Always 0 in tests. |
 | Certificate SHA-256 (server start), pin outcome (client) | `TestIdentity`, `PinnedCertificateVerifier` | Certificate fingerprint, not an SSH host-key fingerprint. |
 | `identity_mode`; `ssh_host_key_sha256`/`ssh_host_key_algorithm` (server start, host-key mode) | `HostKeyIdentity` | SSH-blob fingerprint as `ssh-keygen -lf` prints it (round 5). |
-| Client: `identity_mode`, `trust_policy`, `known_hosts_lookup`, `ssh_host_key {algorithm, fingerprint_sha256, sshfp, blob_len}`, `host_trusted`, `trust_source`, `trust_line`, `untrusted_reason`, `trust_error`, `ssh_session: false` | `SshHostKeyVerifier` via `ClientOutcome.ssh_identity`; `tatami::trust` | Lookup name bound to the typed host and port before resolution, never to `--server-name`; SSHFP is an equivalent value, not DNS-verified. `trust_error` is the configuration code, which `untrusted_reason` repeats when no key was judged, as in the TCP report (round 5). |
+| Client: `identity_mode`, `trust_policy`, `known_hosts_lookup`, `ssh_host_key {algorithm, fingerprint_sha256, sshfp, blob_len}`, `host_trusted`, `trust_source`, `trust_line`, `untrusted_reason`, `trust_error`, `ssh_session: false` | `SshHostKeyVerifier` via `ClientOutcome.ssh_identity`; `tatami_ssh::trust` | Lookup name bound to the typed host and port before resolution, never to `--server-name`; SSHFP is an equivalent value, not DNS-verified. `trust_error` is the configuration code, which `untrusted_reason` repeats when no key was judged, as in the TCP report (round 5). |
 
 Not observed by design: stream data, SSH identification, `KEXINIT`,
 migration.
@@ -187,7 +187,7 @@ separate `tatami-quic-*` binaries were removed by W-35).
 
 | Blocker | Status |
 |---|---|
-| `std` in `tatami-quic` | Resolved as designed: `quinn-backend` enables `std`; `check-workspace.sh` verifies the backend is absent without the feature and that portable builds still pass. |
+| `std` in `tatami_ssh_quic` | Resolved as designed: `quinn-backend` enables `std`; `check-workspace.sh` verifies the backend is absent without the feature and that portable builds still pass. |
 | MSRV drift | Contained: `quinn-proto` pinned to 0.11.18 by `Cargo.lock`; 0.12 requires 1.88. Raising MSRV is a W-07 change. |
 | Crypto provider | `ring` selected for the experiment (W-31); the SSH side uses the pure-Rust set (W-29). Not unified, deliberately. |
 | Identity | rcgen test identities, or (round 5) an OpenSSH Ed25519 host key as a raw public key judged by `known_hosts`/SSH pin; P-06 mapping settled for Ed25519 only. Encrypted keys, agents/HSMs and host certificates not supported. |

@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::negotiate`: RFC 4253 §7.1 algorithm negotiation for the
+//! `tatami_ssh_tcp::negotiate`: RFC 4253 §7.1 algorithm negotiation for the
 //! first profile, strict-KEX marker pairing, `first_kex_packet_follows`
 //! evaluation, the profile check and the client's own proposal.
 //!
@@ -42,13 +42,13 @@
 //!   `Display` is non-empty for every error and direction.
 
 use libfuzzer_sys::fuzz_target;
-use tatami_fuzz_protocol::kex_support::lists::{Lists, gen_lists};
-use tatami_fuzz_protocol::kex_support::negotiate_ref;
-use tatami_fuzz_protocol::tcp_support::Cursor;
-use tatami_tcp::negotiate::{
+use tatami_ssh_fuzz_protocol::kex_support::lists::{Lists, gen_lists};
+use tatami_ssh_fuzz_protocol::kex_support::negotiate_ref;
+use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_tcp::negotiate::{
     ClientProposal, Direction, Mac, NegotiationError, StrictKex, is_aead, negotiate,
 };
-use tatami_wire::kexinit::{KexInit, KexName, classify_kex_name};
+use tatami_ssh_wire::kexinit::{KexInit, KexName, classify_kex_name};
 
 fn check_pair(client: &Lists, server: &Lists) {
     let i_c = client.payload();

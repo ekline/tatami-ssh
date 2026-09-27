@@ -1,5 +1,5 @@
 #![no_main]
-//! `tatami_tcp::handshake::ClientHandshake` driven by a structured server
+//! `tatami_ssh_tcp::handshake::ClientHandshake` driven by a structured server
 //! whose transcript the harness generates and signs itself.
 //!
 //! # Server side (all harness, providers called directly)
@@ -11,7 +11,7 @@
 //! RFC 8731 §3 layout (its own `mpint` encoding), signs `H`, builds
 //! `KEX_ECDH_REPLY` by hand, derives the RFC 4253 §7.2 keys itself and seals
 //! the protected phase with `aes_gcm` in the RFC 5647 layout. Nothing here
-//! calls `tatami_tcp::{transcript, gcm, negotiate}`.
+//! calls `tatami_ssh_tcp::{transcript, gcm, negotiate}`.
 //!
 //! # Input layout (all via a forgiving cursor; see `gen_scenario`)
 //!
@@ -74,28 +74,28 @@
 use ed25519_dalek::{Signer, SigningKey};
 use libfuzzer_sys::fuzz_target;
 use sha2::{Digest, Sha256};
-use tatami_fuzz_protocol::kex_support::crypto::{
+use tatami_ssh_fuzz_protocol::kex_support::crypto::{
     self, DirKeys, Gcm, HarnessRng, HashInputs, ed25519_key_blob, ed25519_sig_blob, string,
 };
-use tatami_fuzz_protocol::kex_support::lists::{Lists, gen_lists};
-use tatami_fuzz_protocol::kex_support::negotiate_ref;
-use tatami_fuzz_protocol::tcp_support::{ChunkMode, Cursor};
-use tatami_keys::error::{BlobError, KeyError};
-use tatami_keys::fingerprint::Sha256Fingerprint;
-use tatami_keys::trust::{
+use tatami_ssh_fuzz_protocol::kex_support::lists::{Lists, gen_lists};
+use tatami_ssh_fuzz_protocol::kex_support::negotiate_ref;
+use tatami_ssh_fuzz_protocol::tcp_support::{ChunkMode, Cursor};
+use tatami_ssh_keys::error::{BlobError, KeyError};
+use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
+use tatami_ssh_keys::trust::{
     HostTrustPolicy, PinnedSha256, TrustDecision, TrustSource, UntrustedReason,
 };
-use tatami_tcp::gcm::OpenError;
-use tatami_tcp::handshake::{
+use tatami_ssh_tcp::gcm::OpenError;
+use tatami_ssh_tcp::handshake::{
     ClientHandshake, HandshakeConfig, HandshakeInitError, HandshakeOutcome, HandshakeReport,
     LimitKind, Phase, ProtocolViolation, SkippedMessage, Step,
 };
-use tatami_tcp::ident::IdentError;
-use tatami_tcp::negotiate::{Negotiated, NegotiationError, StrictKex};
-use tatami_tcp::packet::PacketError;
-use tatami_tcp::transcript::KexError;
-use tatami_wire::ext_info::{ExtInfo, ExtInfoError, OwnedExtInfo};
-use tatami_wire::{DecodeError, InvalidEncoding, MessageError};
+use tatami_ssh_tcp::ident::IdentError;
+use tatami_ssh_tcp::negotiate::{Negotiated, NegotiationError, StrictKex};
+use tatami_ssh_tcp::packet::PacketError;
+use tatami_ssh_tcp::transcript::KexError;
+use tatami_ssh_wire::ext_info::{ExtInfo, ExtInfoError, OwnedExtInfo};
+use tatami_ssh_wire::{DecodeError, InvalidEncoding, MessageError};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const SOFTWARE: &str = "tatami_0.1.0";
@@ -1989,7 +1989,7 @@ fn check_entropy_failure(sc: &Scenario) {
     let extra = usize::from(sc.host_seed[1]) % 3 + 1;
     hs.feed(&vec![0x55u8; room + extra]);
     assert_eq!(hs.pending_bytes(), 0, "nothing copied on overflow");
-    let want = HandshakeOutcome::InputOverflow(tatami_tcp::initial::InputOverflow {
+    let want = HandshakeOutcome::InputOverflow(tatami_ssh_tcp::initial::InputOverflow {
         capacity: room,
         pending: 0,
         offered: room + extra,
