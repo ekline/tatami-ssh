@@ -61,6 +61,8 @@ pub mod json;
 pub mod quic_diag;
 pub mod server;
 pub mod text;
+#[cfg(all(feature = "std", any(feature = "kex", feature = "quic-diag")))]
+pub mod trust;
 
 #[cfg(feature = "std")]
 pub mod host;

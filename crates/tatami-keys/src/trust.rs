@@ -15,9 +15,16 @@
 //! - Never auto-enroll. Seeing a key for the first time is not a reason to
 //!   trust it; [`NoTrustPolicy`] makes that the default when no pin is
 //!   configured, so absence of configuration fails closed.
-//! - The only policy implemented is a pinned SHA-256 fingerprint
-//!   ([`PinnedSha256`]). `known_hosts` handling does not exist yet; when it
-//!   arrives it will be another implementation of the same trait.
+//! - Policies: a pinned SHA-256 fingerprint ([`PinnedSha256`]), nothing
+//!   ([`NoTrustPolicy`]), and (feature `known-hosts`) a read-only OpenSSH
+//!   `known_hosts` file bound to one lookup name
+//!   (`known_hosts::KnownHostsPolicy`). Every transport reaches the same
+//!   trait with the same [`HostIdentity`]: the complete SSH public-key blob.
+//!
+//! Configuration problems (a malformed file, an unreadable path) are not
+//! decisions: they are reported when the policy is built, before any
+//! connection, so a broken configuration can never look like "unknown
+//! host".
 //!
 //! This module is feature-free. Computing the fingerprint in a
 //! [`HostIdentity`] needs the `ed25519` feature (`sha2`); the decision
@@ -53,6 +60,32 @@ impl TrustDecision {
 pub enum TrustSource {
     /// The key's fingerprint equals a fingerprint the operator pinned.
     PinnedFingerprint,
+    /// A `known_hosts` entry applicable to the lookup name lists exactly
+    /// this public key.
+    KnownHosts {
+        /// 1-based line number of the matching entry.
+        line: usize,
+    },
+}
+
+impl TrustSource {
+    /// Stable code for reports.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            TrustSource::PinnedFingerprint => "pinned_fingerprint",
+            TrustSource::KnownHosts { .. } => "known_hosts",
+        }
+    }
+
+    /// The `known_hosts` line that established trust, if any.
+    #[must_use]
+    pub const fn line(&self) -> Option<usize> {
+        match self {
+            TrustSource::PinnedFingerprint => None,
+            TrustSource::KnownHosts { line } => Some(*line),
+        }
+    }
 }
 
 /// Why a host key was refused.
@@ -63,6 +96,77 @@ pub enum UntrustedReason {
     /// No policy can vouch for this key (for example no pin is configured).
     /// This is the fail-closed default, not an error in the configuration.
     NoPolicy,
+    /// No `known_hosts` entry applies to the lookup name. A noninteractive
+    /// client never enrolls, so this always fails.
+    UnknownHost,
+    /// Entries for this key algorithm apply to the lookup name, and none of
+    /// them lists the presented key: the host key changed (or the name
+    /// reached a different host).
+    KeyChanged {
+        /// 1-based line of the first applicable entry for the algorithm.
+        line: usize,
+    },
+    /// An applicable `@revoked` entry lists the presented key. Overrides
+    /// any positive match, whatever the line order.
+    Revoked {
+        /// 1-based line of the revocation.
+        line: usize,
+    },
+    /// Only `@cert-authority` entries apply. OpenSSH host certificates are
+    /// not supported, and a CA key is never treated as a pinned host key.
+    CertificateAuthorityOnly,
+    /// Only entries for other key algorithms apply; they confer no trust on
+    /// the presented key.
+    NoKeyForAlgorithm,
+    /// The presented identity is not a key type this policy can judge.
+    UnsupportedIdentity,
+}
+
+impl UntrustedReason {
+    /// Stable code for reports.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            UntrustedReason::FingerprintMismatch => "fingerprint_mismatch",
+            UntrustedReason::NoPolicy => "no_policy",
+            UntrustedReason::UnknownHost => "unknown_host",
+            UntrustedReason::KeyChanged { .. } => "key_changed",
+            UntrustedReason::Revoked { .. } => "revoked",
+            UntrustedReason::CertificateAuthorityOnly => "certificate_authority_only",
+            UntrustedReason::NoKeyForAlgorithm => "no_key_for_algorithm",
+            UntrustedReason::UnsupportedIdentity => "unsupported_identity",
+        }
+    }
+
+    /// The `known_hosts` line the reason refers to, if any.
+    #[must_use]
+    pub const fn line(&self) -> Option<usize> {
+        match self {
+            UntrustedReason::KeyChanged { line } | UntrustedReason::Revoked { line } => Some(*line),
+            _ => None,
+        }
+    }
+
+    /// One-line human description.
+    #[must_use]
+    pub const fn describe(&self) -> &'static str {
+        match self {
+            UntrustedReason::FingerprintMismatch => "fingerprint mismatch",
+            UntrustedReason::NoPolicy => "no trust policy",
+            UntrustedReason::UnknownHost => "host not listed in known_hosts",
+            UntrustedReason::KeyChanged { .. } => {
+                "known_hosts lists a different key for this host (key changed)"
+            }
+            UntrustedReason::Revoked { .. } => "key is revoked in known_hosts",
+            UntrustedReason::CertificateAuthorityOnly => {
+                "only @cert-authority entries apply; host certificates are not supported"
+            }
+            UntrustedReason::NoKeyForAlgorithm => {
+                "known_hosts lists this host only with other key algorithms"
+            }
+            UntrustedReason::UnsupportedIdentity => "unsupported host identity",
+        }
+    }
 }
 
 /// What a policy gets to look at: the presented host key and its
@@ -119,6 +223,11 @@ impl HostTrustPolicy for PinnedSha256 {
         }
     }
 }
+
+/// A policy that can be shared with a TLS verifier on another thread.
+pub trait SharedHostTrustPolicy: HostTrustPolicy + Send + Sync + core::fmt::Debug {}
+
+impl<T: HostTrustPolicy + Send + Sync + core::fmt::Debug + ?Sized> SharedHostTrustPolicy for T {}
 
 /// Trusts nothing. Use when no pin is configured so that the handshake
 /// fails closed instead of silently accepting the first key seen.
@@ -189,6 +298,49 @@ mod tests {
         assert!(!dynamic.decide(&identity([0; 32])).is_trusted());
         let by_ref = &PinnedSha256(Sha256Fingerprint::from_bytes([1; 32]));
         assert!(by_ref.decide(&identity([1; 32])).is_trusted());
+    }
+
+    #[test]
+    fn codes_and_lines_are_stable() {
+        assert_eq!(TrustSource::PinnedFingerprint.code(), "pinned_fingerprint");
+        assert_eq!(TrustSource::PinnedFingerprint.line(), None);
+        assert_eq!(TrustSource::KnownHosts { line: 3 }.code(), "known_hosts");
+        assert_eq!(TrustSource::KnownHosts { line: 3 }.line(), Some(3));
+        let reasons = [
+            (
+                UntrustedReason::FingerprintMismatch,
+                "fingerprint_mismatch",
+                None,
+            ),
+            (UntrustedReason::NoPolicy, "no_policy", None),
+            (UntrustedReason::UnknownHost, "unknown_host", None),
+            (
+                UntrustedReason::KeyChanged { line: 2 },
+                "key_changed",
+                Some(2),
+            ),
+            (UntrustedReason::Revoked { line: 7 }, "revoked", Some(7)),
+            (
+                UntrustedReason::CertificateAuthorityOnly,
+                "certificate_authority_only",
+                None,
+            ),
+            (
+                UntrustedReason::NoKeyForAlgorithm,
+                "no_key_for_algorithm",
+                None,
+            ),
+            (
+                UntrustedReason::UnsupportedIdentity,
+                "unsupported_identity",
+                None,
+            ),
+        ];
+        for (reason, code, line) in reasons {
+            assert_eq!(reason.code(), code);
+            assert_eq!(reason.line(), line);
+            assert!(!reason.describe().is_empty());
+        }
     }
 
     #[cfg(feature = "ed25519")]

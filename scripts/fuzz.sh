@@ -172,6 +172,7 @@ target_max_len() {
     case "$1" in
         tcp_initial_packets|tcp_probe|tcp_observer|observation_records) echo 524288 ;;
         wire_messages|input_buffer|channel_opening|json_values) echo 65536 ;;
+        openssh_private_key) echo 20480 ;;  # past the 16 KiB key-file cap
         *) echo 4096 ;;
     esac
 }

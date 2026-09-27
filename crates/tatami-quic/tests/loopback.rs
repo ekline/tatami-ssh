@@ -122,7 +122,7 @@ fn matching_handshake_over_loopback() {
     assert_eq!(summary.stats.retries_sent, 0);
     assert_eq!(summary.records_dropped, 0);
     assert_eq!(summary.abandoned, 0);
-    assert_eq!(summary.certificate_sha256, pin);
+    assert_eq!(summary.identity.certificate_sha256(), Some(pin));
     assert_eq!(observations.len(), 1);
     let o = &observations[0];
     assert_eq!(o.outcome, HandshakeOutcome::Completed);

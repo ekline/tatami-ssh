@@ -16,6 +16,13 @@
 //!   possession is enforced. It is not an accept-anything verifier.
 //! - [`PinnedRawPublicKeyVerifier`]: the RFC 7250 counterpart, pinning the
 //!   SPKI SHA-256 and verifying with `verify_tls13_signature_with_raw_key`.
+//! - [`SshHostKeyVerifier`]: RFC 7250 raw public key judged as an **SSH host
+//!   key**: the SPKI is converted strictly to the canonical `ssh-ed25519`
+//!   blob and handed to the same `HostTrustPolicy` the TCP handshake uses
+//!   (a `known_hosts` file bound to the lookup name, or an SSH `SHA256:`
+//!   pin). The policy is preloaded and immutable; the verifier does no file
+//!   or DNS I/O. `CertificateVerify` is still verified by the provider: a
+//!   matching key alone never counts as proof of possession.
 //! - Config builders producing `quinn-proto` crypto configs with 0-RTT and
 //!   resumption disabled.
 
@@ -33,8 +40,11 @@ use rustls::server::{AlwaysResolvesServerRawPublicKeys, ClientHello, ResolvesSer
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, DigitallySignedStruct, OtherError, RootCertStore, SignatureScheme};
 
+use tatami_keys::Sha256Fingerprint;
+use tatami_keys::trust::{HostIdentity, SharedHostTrustPolicy, TrustDecision, UntrustedReason};
+
 use super::ConfigError;
-use super::identity::{CertificateSha256, SpkiSha256, TestIdentity};
+use super::identity::{CertificateSha256, ServerIdentity, SpkiSha256};
 
 /// Upper bound on entries copied from any ClientHello list.
 pub const MAX_HELLO_LIST: usize = 32;
@@ -298,6 +308,185 @@ impl ServerCertVerifier for PinnedRawPublicKeyVerifier {
     }
 }
 
+/// What the SSH host-key verifier saw and decided. Public data only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshIdentityCheck {
+    /// The raw public key converted to an SSH identity and was judged.
+    Judged {
+        /// SSH public-key algorithm (always `ssh-ed25519` here).
+        algorithm: String,
+        /// The canonical SSH public-key blob.
+        blob: Vec<u8>,
+        /// OpenSSH `SHA256:` fingerprint of `blob`.
+        fingerprint: Sha256Fingerprint,
+        /// The policy's decision.
+        decision: TrustDecision,
+    },
+    /// The presented bytes are not a supported Ed25519 SPKI (for example a
+    /// certificate where a raw key was required, or malformed DER).
+    NotConvertible {
+        /// Why, from `tatami_keys::spki`.
+        reason: String,
+    },
+}
+
+impl SshIdentityCheck {
+    /// `true` when judged and trusted.
+    #[must_use]
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, SshIdentityCheck::Judged { decision, .. } if decision.is_trusted())
+    }
+}
+
+/// Where the verifier records its [`SshIdentityCheck`] for the report.
+pub type IdentitySlot = Arc<Mutex<Option<SshIdentityCheck>>>;
+
+/// SSH host-key trust for the QUIC client: a preloaded policy plus labels
+/// for reports.
+#[derive(Clone)]
+pub struct SshHostTrust {
+    /// The decision (a `known_hosts` policy bound to `lookup_name`, or an
+    /// SSH-blob `SHA256:` pin).
+    pub policy: Arc<dyn SharedHostTrustPolicy>,
+    /// Stable code of the policy: `known_hosts` or `pinned_fingerprint`.
+    pub source: &'static str,
+    /// Logical lookup name bound before connecting (`known_hosts` only).
+    pub lookup_name: Option<String>,
+}
+
+impl core::fmt::Debug for SshHostTrust {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SshHostTrust")
+            .field("source", &self.source)
+            .field("lookup_name", &self.lookup_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Error returned to rustls when the SSH host policy refuses the key.
+pub struct HostNotTrusted {
+    reason: UntrustedReason,
+}
+
+impl core::fmt::Display for HostNotTrusted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "SSH host key not trusted: {} ({})",
+            self.reason.describe(),
+            self.reason.code()
+        )
+    }
+}
+
+impl core::fmt::Debug for HostNotTrusted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for HostNotTrusted {}
+
+/// RFC 7250 raw public key judged as an SSH host key through a shared
+/// [`tatami_keys::trust::HostTrustPolicy`]. See the module docs.
+#[derive(Debug)]
+pub struct SshHostKeyVerifier {
+    trust: SshHostTrust,
+    slot: IdentitySlot,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl SshHostKeyVerifier {
+    /// Judges with `trust`, records into `slot`, verifies signatures with
+    /// `provider`'s algorithms.
+    #[must_use]
+    pub fn new(trust: SshHostTrust, slot: IdentitySlot, provider: &CryptoProvider) -> Self {
+        SshHostKeyVerifier {
+            trust,
+            slot,
+            algs: provider.signature_verification_algorithms,
+        }
+    }
+
+    fn record(&self, check: SshIdentityCheck) {
+        if let Ok(mut s) = self.slot.lock() {
+            *s = Some(check);
+        }
+    }
+}
+
+impl ServerCertVerifier for SshHostKeyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let blob = match tatami_keys::spki::spki_to_ssh_blob(end_entity.as_ref()) {
+            Ok(b) => b,
+            Err(e) => {
+                self.record(SshIdentityCheck::NotConvertible {
+                    reason: e.to_string(),
+                });
+                return Err(rustls::Error::InvalidCertificate(
+                    CertificateError::BadEncoding,
+                ));
+            }
+        };
+        let fingerprint = Sha256Fingerprint::of_blob(&blob);
+        let identity = HostIdentity {
+            algorithm: tatami_keys::blob::SSH_ED25519,
+            blob: &blob,
+            sha256: fingerprint,
+        };
+        let decision = self.trust.policy.decide(&identity);
+        self.record(SshIdentityCheck::Judged {
+            algorithm: String::from("ssh-ed25519"),
+            blob: blob.to_vec(),
+            fingerprint,
+            decision,
+        });
+        match decision {
+            TrustDecision::Trusted { .. } => Ok(ServerCertVerified::assertion()),
+            TrustDecision::Untrusted { reason } => Err(rustls::Error::InvalidCertificate(
+                CertificateError::Other(OtherError(Arc::new(HostNotTrusted { reason }))),
+            )),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General(
+            "TLS 1.2 is never negotiated over QUIC".to_string(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        // Proof of possession, independent of the trust decision above.
+        let spki = SubjectPublicKeyInfoDer::from(cert.as_ref());
+        rustls::crypto::verify_tls13_signature_with_raw_key(message, &spki, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
 /// How the server presents its identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerIdentityMode {
@@ -324,6 +513,9 @@ pub enum ClientTrust {
     RootCertificate(Vec<u8>),
     /// Accept only the RFC 7250 raw public key with this SPKI SHA-256.
     PinnedRawPublicKeySha256(SpkiSha256),
+    /// Require an RFC 7250 raw public key and judge it as an SSH host key
+    /// (`known_hosts` or SSH-blob pin). Certificates are refused.
+    SshHostKey(SshHostTrust),
 }
 
 impl ClientTrust {
@@ -334,7 +526,20 @@ impl ClientTrust {
             ClientTrust::PinnedCertificateSha256(_) => "pinned_certificate_sha256",
             ClientTrust::RootCertificate(_) => "root_certificate",
             ClientTrust::PinnedRawPublicKeySha256(_) => "pinned_raw_public_key_sha256",
+            ClientTrust::SshHostKey(t) => match t.source.as_bytes() {
+                b"known_hosts" => "ssh_host_key_known_hosts",
+                _ => "ssh_host_key_pinned_fingerprint",
+            },
         }
+    }
+
+    /// `true` when the server must present an RFC 7250 raw public key.
+    #[must_use]
+    pub const fn requires_raw_public_key(&self) -> bool {
+        matches!(
+            self,
+            ClientTrust::PinnedRawPublicKeySha256(_) | ClientTrust::SshHostKey(_)
+        )
     }
 }
 
@@ -346,24 +551,40 @@ impl ClientTrust {
 /// `server_certificate_type` extension with `RawPublicKey` (and fails the
 /// handshake for clients that do not offer it, RFC 7250 §4.1).
 pub fn server_crypto(
-    identity: &TestIdentity,
+    identity: &ServerIdentity,
     alpn: &[Vec<u8>],
     slot: HelloSlot,
     mode: ServerIdentityMode,
 ) -> Result<Arc<QuicServerConfig>, ConfigError> {
     super::validate_alpn(alpn)?;
     let provider = provider();
-    let key = provider
-        .key_provider
-        .load_private_key(identity.private_key())
-        .map_err(ConfigError::Key)?;
-    let chain = match mode {
-        ServerIdentityMode::Certificate => std::vec![identity.certificate()],
-        ServerIdentityMode::RawPublicKey | ServerIdentityMode::RawPublicKeyRecording => {
-            // RFC 7250: the "certificate" is the SubjectPublicKeyInfo DER.
+    let (key, chain) = match (identity, mode) {
+        (ServerIdentity::HostKey(_), ServerIdentityMode::Certificate) => {
+            return Err(ConfigError::IdentityMode(
+                "an SSH host key is presented only as an RFC 7250 raw public key; no certificate is manufactured",
+            ));
+        }
+        (ServerIdentity::HostKey(h), _) => (
+            h.signing_key(),
             std::vec![CertificateDer::from(
-                identity.subject_public_key_info_der().to_vec(),
-            )]
+                h.subject_public_key_info_der().to_vec()
+            )],
+        ),
+        (ServerIdentity::Test(t), mode) => {
+            let key = provider
+                .key_provider
+                .load_private_key(t.private_key())
+                .map_err(ConfigError::Key)?;
+            let chain = match mode {
+                ServerIdentityMode::Certificate => std::vec![t.certificate()],
+                ServerIdentityMode::RawPublicKey | ServerIdentityMode::RawPublicKeyRecording => {
+                    // RFC 7250: the "certificate" is the SubjectPublicKeyInfo DER.
+                    std::vec![CertificateDer::from(
+                        t.subject_public_key_info_der().to_vec(),
+                    )]
+                }
+            };
+            (key, chain)
         }
     };
     let certified = Arc::new(CertifiedKey::new(chain, key));
@@ -398,9 +619,25 @@ pub fn client_crypto(
     trust: &ClientTrust,
     alpn: &[Vec<u8>],
 ) -> Result<Arc<QuicClientConfig>, ConfigError> {
+    client_crypto_recording(trust, alpn, identity_slot())
+}
+
+/// Creates an empty identity slot.
+#[must_use]
+pub fn identity_slot() -> IdentitySlot {
+    Arc::new(Mutex::new(None))
+}
+
+/// [`client_crypto`], recording SSH host-key checks into `slot`.
+pub fn client_crypto_recording(
+    trust: &ClientTrust,
+    alpn: &[Vec<u8>],
+    slot: IdentitySlot,
+) -> Result<Arc<QuicClientConfig>, ConfigError> {
     super::validate_alpn(alpn)?;
     let provider = provider();
     let verifier: Arc<dyn ServerCertVerifier> = match trust {
+        ClientTrust::SshHostKey(t) => Arc::new(SshHostKeyVerifier::new(t.clone(), slot, &provider)),
         ClientTrust::PinnedCertificateSha256(pin) => {
             Arc::new(PinnedCertificateVerifier::new(*pin, &provider))
         }

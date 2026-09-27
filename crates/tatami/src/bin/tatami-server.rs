@@ -33,8 +33,10 @@ Usage:
   tatami-server observe [--listen ADDR] [--timeout DURATION]
                         [--max-concurrent N] [--max-connections N]
                         [--run-for DURATION] [--banner-only] [--format jsonl]
-  tatami-server observe --transport quic --alpn PROTO --identity-dir DIR
-                        [--listen ADDR] [--generate-identity]
+  tatami-server observe --transport quic --alpn PROTO
+                        (--host-key FILE | --identity-dir DIR
+                         [--generate-identity])
+                        [--listen ADDR]
                         [--require-validation] [--timeout DURATION]
                         [--max-concurrent N] [--max-connections N]
                         [--run-for DURATION] [--format jsonl]
@@ -52,7 +54,8 @@ Commands:
             not an SSH service.
 
             With --transport quic: EXPERIMENTAL. Listen for QUIC v1
-            connections on UDP, complete a TLS 1.3 handshake with a
+            connections on UDP, complete a TLS 1.3 handshake with the SSH
+            host key (--host-key, as an RFC 7250 raw public key) or a
             generated test certificate, record each attempt (source address
             and its validation state, offered vs negotiated ALPN, SNI,
             outcome) as JSON Lines on stdout, then close the connection with
@@ -93,10 +96,19 @@ Options for observe (QUIC only):
                          in preference order). The value is experimental and
                          UNREGISTERED; no interoperability with any other
                          implementation is claimed. There is no default.
-  --identity-dir DIR     Directory holding cert.pem and key.pem (required).
+  --host-key FILE        An OpenSSH Ed25519 host private key (unencrypted
+                         openssh-key-v1, e.g. /etc/ssh/ssh_host_ed25519_key;
+                         must not be group/other-accessible). Presented as
+                         an RFC 7250 raw public key: clients verify it with
+                         the same known_hosts entry or SSH fingerprint as
+                         the TCP server using that key. No certificate is
+                         made; encrypted keys are refused.
+  --identity-dir DIR     Instead: directory holding a TEST cert.pem and
+                         key.pem (X.509 diagnostic identity).
   --generate-identity    Generate a self-signed Ed25519 test identity into
                          DIR if none exists. Without this flag a missing
                          identity is an error; nothing is generated silently.
+                         Exactly one of --host-key and --identity-dir.
   --require-validation   Answer each unvalidated Initial with a Retry and
                          accept only Initials carrying the token. Validation
                          proves reachability of the source address, nothing
@@ -109,10 +121,13 @@ Output:
   overload, quic_listener_stopped. Diagnostics go to stderr. Redirect stdout
   to a file and rotate it externally for long runs.
 
-  For QUIC, the certificate SHA-256 fingerprint is printed to stderr at
-  start so a client can pin it with --cert-sha256; it is a certificate
-  fingerprint, not an SSH host-key fingerprint. Offered ClientHello values
-  in records are untrusted metadata supplied by the peer.
+  For QUIC with --identity-dir, the certificate SHA-256 fingerprint is
+  printed to stderr at start so a client can pin it with --cert-sha256; it
+  is a certificate fingerprint, not an SSH host-key fingerprint. With
+  --host-key the SSH host-key fingerprint (as ssh-keygen -lf prints it) is
+  printed instead. Offered ClientHello values in records are untrusted
+  metadata supplied by the peer. UDP 4433 is an experiment default; the
+  intended service convention is TCP and UDP 22.
 
 Binding port 22 requires OS privileges and must not displace an existing
 SSH service; this program will not change firewall or service settings.
@@ -309,6 +324,7 @@ fn parse_quic_observe(mut it: std::slice::Iter<'_, String>) -> Result<Command, U
 
     let mut alpn: Vec<Vec<u8>> = Vec::new();
     let mut identity_dir: Option<PathBuf> = None;
+    let mut host_key: Option<PathBuf> = None;
     let mut options = quic_server::Options::new(Vec::new(), PathBuf::new());
     while let Some(arg) = it.next() {
         let mut value = |flag: &str| {
@@ -319,6 +335,15 @@ fn parse_quic_observe(mut it: std::slice::Iter<'_, String>) -> Result<Command, U
             "--help" | "-h" => return Ok(Command::Help),
             "--alpn" => alpn.push(parse_alpn(value("--alpn")?)?),
             "--identity-dir" => identity_dir = Some(PathBuf::from(value("--identity-dir")?)),
+            "--host-key" => {
+                let v = value("--host-key")?;
+                if v.is_empty() || host_key.is_some() {
+                    return Err(UsageError(String::from(
+                        "--host-key takes one non-empty file",
+                    )));
+                }
+                host_key = Some(PathBuf::from(v));
+            }
             "--generate-identity" => options.generate_identity = true,
             "--listen" => options.bind = parse_listen(value("--listen")?)?,
             "--require-validation" => options.require_validation = true,
@@ -350,11 +375,25 @@ fn parse_quic_observe(mut it: std::slice::Iter<'_, String>) -> Result<Command, U
         )));
     }
     options.alpn = alpn;
-    options.identity_dir = identity_dir.ok_or_else(|| {
-        UsageError(String::from(
-            "--identity-dir is required (add --generate-identity to create a test identity there)",
-        ))
-    })?;
+    match (host_key, identity_dir) {
+        (Some(_), Some(_)) => {
+            return Err(UsageError(String::from(
+                "give exactly one of --host-key and --identity-dir",
+            )));
+        }
+        (Some(_), None) if options.generate_identity => {
+            return Err(UsageError(String::from(
+                "--generate-identity cannot be combined with --host-key (a host key is never replaced by a generated identity)",
+            )));
+        }
+        (Some(key), None) => options.host_key = Some(key),
+        (None, Some(dir)) => options.identity_dir = dir,
+        (None, None) => {
+            return Err(UsageError(String::from(
+                "an identity is required: --host-key FILE (SSH host key) or --identity-dir DIR (add --generate-identity to create a test identity there)",
+            )));
+        }
+    }
     Ok(Command::QuicObserve(Box::new(options)))
 }
 
@@ -469,10 +508,17 @@ fn observe_quic(options: quic_server::Options) -> ExitCode {
             options.identity_dir.display()
         );
     }
-    eprintln!(
-        "{NAME}: certificate SHA-256 (pin this with --cert-sha256; certificate DER hash, not an SSH host-key fingerprint): {}",
-        prepared.certificate_sha256()
-    );
+    let presented = prepared.presented_identity();
+    if let Some(cert) = presented.certificate_sha256() {
+        eprintln!(
+            "{NAME}: certificate SHA-256 (pin this with --cert-sha256; certificate DER hash, not an SSH host-key fingerprint): {cert}"
+        );
+    }
+    if let Some(fp) = presented.ssh_host_key_sha256() {
+        eprintln!(
+            "{NAME}: SSH host key ssh-ed25519 {fp} presented as an RFC 7250 raw public key (verify with --known-hosts or --host-key-sha256, as for the TCP server using this key)"
+        );
+    }
     eprintln!(
         "{NAME}: EXPERIMENTAL QUIC v1/TLS 1.3 handshake observer on {bound} (ALPN {}, unregistered; handshake timeout {:?}; max concurrent {}{}{}{}); 0-RTT disabled; not an SSH service",
         options

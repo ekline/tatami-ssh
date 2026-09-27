@@ -3,6 +3,17 @@
 //!
 //! [`run`] returns data and prints nothing. The report never contains
 //! exporter output, key material or the peer's certificate.
+//!
+//! # Trust
+//!
+//! [`Trust::Tls`] keeps the X.509/SPKI diagnostic modes. [`Trust::SshHostKey`]
+//! requires an RFC 7250 raw public key and judges it as an SSH host key with
+//! the same [`TrustConfig`] policy as the TCP handshake (an SSH-blob
+//! `SHA256:` pin or an explicit `known_hosts` file). The `known_hosts`
+//! lookup name is bound to the typed host and the requested port before
+//! name resolution; `--server-name` is only the TLS name and never
+//! redirects the lookup. A trusted key alone is not proof of possession:
+//! TLS `CertificateVerify` is verified by the provider in every mode.
 
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
@@ -10,16 +21,52 @@ use core::fmt;
 use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::time::Duration;
 
+use tatami_keys::sshfp::Sshfp;
+use tatami_keys::trust::TrustDecision;
 use tatami_quic::diag::DEFAULT_HANDSHAKE_TIMEOUT;
 use tatami_quic::diag::client::{
     ClientOutcome, DiagClientConfig, ExporterProbe, HandshakeResult, run as run_client,
 };
-use tatami_quic::diag::tls::ClientTrust;
+use tatami_quic::diag::tls::{ClientTrust, SshHostTrust, SshIdentityCheck};
 
 use super::time::millis;
 use super::{bytes_list, bytes_value};
 use crate::json::Value;
 use crate::text::escape_bytes;
+use crate::trust::TrustConfig;
+
+/// How the server's identity is judged.
+#[derive(Clone, Debug)]
+pub enum Trust {
+    /// X.509 certificate pin, test root, or SPKI pin (diagnostic modes).
+    Tls(ClientTrust),
+    /// SSH host key sent as an RFC 7250 raw public key.
+    SshHostKey(TrustConfig),
+}
+
+impl From<ClientTrust> for Trust {
+    fn from(t: ClientTrust) -> Self {
+        Trust::Tls(t)
+    }
+}
+
+impl From<TrustConfig> for Trust {
+    fn from(t: TrustConfig) -> Self {
+        Trust::SshHostKey(t)
+    }
+}
+
+impl Trust {
+    /// Stable identity-mode code for reports.
+    #[must_use]
+    pub const fn identity_mode(&self) -> &'static str {
+        match self {
+            Trust::Tls(ClientTrust::PinnedRawPublicKeySha256(_)) => "raw_public_key_spki_pin",
+            Trust::Tls(_) => "x509_certificate",
+            Trust::SshHostKey(_) => "ssh_host_key_raw_public_key",
+        }
+    }
+}
 
 /// Options for one handshake.
 #[derive(Clone, Debug)]
@@ -32,8 +79,8 @@ pub struct Options {
     pub server_name: Option<String>,
     /// ALPN values to offer (required, explicit, unregistered).
     pub alpn: Vec<Vec<u8>>,
-    /// Trust policy: a pinned certificate SHA-256 or a test root.
-    pub trust: ClientTrust,
+    /// How the server's identity is judged.
+    pub trust: Trust,
     /// Deadline for the handshake.
     pub handshake_timeout: Duration,
     /// Confirm exporter availability after completion.
@@ -43,13 +90,18 @@ pub struct Options {
 impl Options {
     /// Defaults with the required inputs.
     #[must_use]
-    pub fn new(host: impl Into<String>, port: u16, alpn: Vec<Vec<u8>>, trust: ClientTrust) -> Self {
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        alpn: Vec<Vec<u8>>,
+        trust: impl Into<Trust>,
+    ) -> Self {
         Options {
             host: host.into(),
             port,
             server_name: None,
             alpn,
-            trust,
+            trust: trust.into(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             exporter_probe: false,
         }
@@ -73,6 +125,15 @@ pub struct Report {
     pub server_name: String,
     /// Address the handshake was attempted with, if resolution succeeded.
     pub resolved: Option<SocketAddr>,
+    /// Identity mode code ([`Trust::identity_mode`]).
+    pub identity_mode: &'static str,
+    /// SSH trust source, in SSH host-key mode.
+    pub ssh_trust: Option<TrustConfig>,
+    /// The `known_hosts` lookup name bound before resolution.
+    pub lookup_name: Option<String>,
+    /// Stable code when the trust configuration was unusable
+    /// (`io_error`, `malformed_configuration`, `invalid_lookup_name`).
+    pub trust_error: Option<&'static str>,
     /// The outcome, or why no handshake could be attempted.
     pub result: Result<ClientOutcome, String>,
 }
@@ -95,7 +156,34 @@ pub fn run(options: &Options) -> Report {
         port: options.port,
         server_name: server_name.clone(),
         resolved: None,
+        identity_mode: options.trust.identity_mode(),
+        ssh_trust: None,
+        lookup_name: None,
+        trust_error: None,
         result: Err(String::from("not attempted")),
+    };
+    let trust = match &options.trust {
+        Trust::Tls(t) => t.clone(),
+        Trust::SshHostKey(config) => {
+            report.ssh_trust = Some(config.clone());
+            // The logical name: typed host and requested port, before any
+            // resolution and independent of --server-name.
+            match config.prepare(&options.host, options.port) {
+                Ok(p) => {
+                    report.lookup_name = p.lookup_name.clone();
+                    ClientTrust::SshHostKey(SshHostTrust {
+                        policy: p.policy,
+                        source: config.mode(),
+                        lookup_name: p.lookup_name,
+                    })
+                }
+                Err(e) => {
+                    report.trust_error = Some(e.code());
+                    report.result = Err(alloc::format!("trust configuration unusable: {e}"));
+                    return report;
+                }
+            }
+        }
     };
     let remote = match resolve(&options.host, options.port) {
         Ok(a) => a,
@@ -105,12 +193,7 @@ pub fn run(options: &Options) -> Report {
         }
     };
     report.resolved = Some(remote);
-    let mut config = DiagClientConfig::new(
-        remote,
-        server_name,
-        options.alpn.clone(),
-        options.trust.clone(),
-    );
+    let mut config = DiagClientConfig::new(remote, server_name, options.alpn.clone(), trust);
     config.handshake_timeout = options.handshake_timeout;
     config.exporter = options.exporter_probe.then(ExporterProbe::default);
     report.result = run_client(&config).map_err(|e| e.to_string());
@@ -168,7 +251,11 @@ impl Report {
         )?;
         match &self.result {
             Err(e) => {
-                writeln!(w, "Handshake: not attempted; {e}")?;
+                writeln!(
+                    w,
+                    "Handshake: not attempted; {}",
+                    escape_bytes(e.as_bytes())
+                )?;
             }
             Ok(o) => {
                 if let Some(l) = o.local {
@@ -194,6 +281,7 @@ impl Report {
                     None => writeln!(w, "ALPN negotiated: none")?,
                 }
                 writeln!(w, "Server identity check: {}", o.trust)?;
+                self.write_ssh_identity(w, o)?;
                 writeln!(w, "TLS version: {}", o.tls_version_note)?;
                 writeln!(
                     w,
@@ -228,8 +316,130 @@ impl Report {
             w,
             "SSH: nothing sent or expected; this is not an SSH client"
         )?;
+        if self.ssh_trust.is_some() {
+            writeln!(
+                w,
+                "SSH session: none (a trusted host key over QUIC/TLS is not an SSH session)"
+            )?;
+        }
         writeln!(w, "User authentication: not attempted")?;
         Ok(())
+    }
+
+    fn write_ssh_identity(&self, w: &mut dyn fmt::Write, o: &ClientOutcome) -> fmt::Result {
+        let Some(config) = &self.ssh_trust else {
+            return Ok(());
+        };
+        writeln!(w, "Identity mode: SSH host key as RFC 7250 raw public key")?;
+        match config {
+            TrustConfig::Pin(pin) => writeln!(w, "Trust source: SSH fingerprint pin {pin}")?,
+            TrustConfig::KnownHostsFile(path) => {
+                writeln!(
+                    w,
+                    "Trust source: known_hosts file {}",
+                    escape_bytes(path.display().to_string().as_bytes())
+                )?;
+                if let Some(name) = &self.lookup_name {
+                    writeln!(w, "Lookup name: {}", escape_bytes(name.as_bytes()))?;
+                }
+            }
+        }
+        match &o.ssh_identity {
+            Some(SshIdentityCheck::Judged {
+                algorithm,
+                blob,
+                fingerprint,
+                decision,
+            }) => {
+                writeln!(w, "SSH host key: {algorithm} {fingerprint}")?;
+                if let Ok(fp) = Sshfp::sha256_of_blob(blob) {
+                    writeln!(w, "SSHFP (equivalent value, not DNS-verified): {fp}")?;
+                }
+                writeln!(
+                    w,
+                    "Host trust: {}",
+                    crate::trust::trust_text(Some(*decision))
+                )?;
+            }
+            Some(SshIdentityCheck::NotConvertible { reason }) => {
+                writeln!(
+                    w,
+                    "SSH host key: not a supported raw public key ({})",
+                    escape_bytes(reason.as_bytes())
+                )?;
+            }
+            None => writeln!(w, "SSH host key: not received")?,
+        }
+        Ok(())
+    }
+
+    fn ssh_identity_json(&self, o: Option<&ClientOutcome>) -> Vec<(&'static str, Value)> {
+        let Some(config) = &self.ssh_trust else {
+            return Vec::new();
+        };
+        let mut out = alloc::vec![
+            ("trust_policy", Value::from(config.mode())),
+            (
+                "pinned_fingerprint_sha256",
+                config
+                    .pin()
+                    .map_or(Value::Null, |p| Value::from(p.to_string()))
+            ),
+            (
+                "known_hosts_file",
+                config
+                    .known_hosts_file()
+                    .map_or(Value::Null, |p| Value::from(p.display().to_string()))
+            ),
+            (
+                "known_hosts_lookup",
+                self.lookup_name.clone().map_or(Value::Null, Value::from)
+            ),
+        ];
+        let check = o.and_then(|o| o.ssh_identity.as_ref());
+        let (key, decision) = match check {
+            Some(SshIdentityCheck::Judged {
+                algorithm,
+                blob,
+                fingerprint,
+                decision,
+            }) => (
+                Value::object()
+                    .field("algorithm", algorithm.as_str())
+                    .field("fingerprint_sha256", fingerprint.to_string())
+                    .opt(
+                        "sshfp",
+                        Sshfp::sha256_of_blob(blob).ok().map(|f| f.to_string()),
+                    )
+                    .field("blob_len", blob.len())
+                    .build(),
+                Some(*decision),
+            ),
+            Some(SshIdentityCheck::NotConvertible { reason }) => (
+                Value::object()
+                    .field("unsupported", reason.as_str())
+                    .build(),
+                None,
+            ),
+            None => (Value::Null, None),
+        };
+        out.push(("ssh_host_key", key));
+        out.push((
+            "host_trusted",
+            decision.map_or(Value::Null, |d| Value::from(d.is_trusted())),
+        ));
+        let (source, reason, line) = match decision {
+            Some(TrustDecision::Trusted { source }) => (Some(source.code()), None, source.line()),
+            Some(TrustDecision::Untrusted { reason }) => (None, Some(reason.code()), reason.line()),
+            None => (None, self.trust_error, None),
+        };
+        out.push(("trust_source", source.map_or(Value::Null, Value::from)));
+        out.push((
+            "trust_line",
+            line.map_or(Value::Null, |l| Value::from(l as u64)),
+        ));
+        out.push(("untrusted_reason", reason.map_or(Value::Null, Value::from)));
+        out
     }
 
     /// One JSON object with the same content as [`Report::write_text`].
@@ -243,7 +453,14 @@ impl Report {
             .field("host", self.host.clone())
             .field("port", u64::from(self.port))
             .field("server_name", self.server_name.clone())
-            .opt("remote_addr", self.resolved.map(|a| a.to_string()));
+            .opt("remote_addr", self.resolved.map(|a| a.to_string()))
+            .field("identity_mode", self.identity_mode);
+        for (k, v) in self.ssh_identity_json(self.result.as_ref().ok()) {
+            rec = rec.field(k, v);
+        }
+        if let Some(code) = self.trust_error {
+            rec = rec.field("trust_error", code);
+        }
         match &self.result {
             Err(e) => {
                 rec = rec
@@ -291,6 +508,7 @@ impl Report {
             }
         }
         rec.field("user_authenticated", false)
+            .field("ssh_session", false)
             .field("application_data", false)
             .field("experimental", true)
             .build()

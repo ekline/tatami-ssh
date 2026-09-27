@@ -4,6 +4,8 @@
 
 **Date:** 2026-09-10
 
+> Implementation note (2026-09-26): this snapshot predates the implementation; current state is in `tatami-ssh-design-state-checkpoint.md` §0. The server-trust path sketched below (TLS raw public key → `known_hosts`) now exists as a diagnostic for Ed25519 host keys (round 5, `decisions.md` W-36–W-41). It is identity continuity only: no SSH bytes are carried over QUIC and there is no SSH session over QUIC yet.
+
 ---
 
 ## Project

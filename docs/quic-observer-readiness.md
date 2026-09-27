@@ -11,6 +11,13 @@ AQ-015, AQ-018–AQ-023, AQ-026). Sections 1 and 2 are kept as written in
 round 3 because they still hold; §3 records the decision, §4 the corrections
 learned by compiling and testing against the backend, §5 what (b) requires.
 
+Round 5 (2026-09-26) added an SSH host-key identity mode to observer (a):
+the server presents an OpenSSH Ed25519 host key as an RFC 7250 raw public
+key and the client judges it with the same pin or `known_hosts` policy as
+the TCP handshake (W-36–W-41). That settles the *identity mapping* for
+Ed25519; it does not make (a) an SSH-over-QUIC observer. No SSH byte is sent,
+and a trusted host key over QUIC/TLS is not an SSH session.
+
 ## 0. What was built (evidence)
 
 | Claim | Evidence |
@@ -26,6 +33,8 @@ learned by compiling and testing against the backend, §5 what (b) requires.
 | RFC 7250 raw public keys work end to end; `peer_identity()` is the 44-byte SPKI DER; wrong SPKI pin fails; no silent downgrade in either direction; three fingerprints of one Ed25519 key differ | `tests/rpk.rs` |
 | No SSH byte on the wire: every captured datagram checked for `SSH-` | `tests/inmem_handshake.rs::assert_no_ssh_bytes` |
 | 0-RTT never attempted (`zero_rtt_attempted: false` both ends) | `tests/inmem_handshake.rs` |
+| (Round 5) SSH host key as raw public key: SSH-blob pin and `known_hosts` succeed; wrong pin, changed key, revoked key, a port-22 entry for UDP 4433 and negated entries fail; a certificate peer is refused by SSH trust; an X.509 client is refused by a host-key server; a host key cannot be presented as a certificate; a trusted key with a foreign `CertificateVerify` signature fails | `tatami-quic/tests/host_key.rs` (in-memory) |
+| (Round 5) Same key served by OpenSSH `sshd` on TCP port P and `tatami-server --host-key` on UDP port P; one `known_hosts` entry accepts both; same fingerprint as `ssh-keygen -lf`; SSHFP from the QUIC raw key equals the TCP one and `ssh-keygen -r` | `tatami/tests/host_identity.rs` (passed locally with `OpenSSH_10.2p1`; skips without OpenSSH except under `TATAMI_REQUIRE_OPENSSH=1`, which CI sets; first CI run not yet observed) |
 
 All of the above passed on the development machine on 2026-09-20
 (`cargo test -p tatami-quic --features quinn-backend`; `cargo test -p tatami
@@ -149,6 +158,8 @@ coarsely (no migration event in 0.11) and is not exercised.
 | `exporter {available, len}` (client, `--exporter-probe`) | `Session::export_keying_material` after `Connected` | Output discarded; experimental label; **not** a session binding (P-04). |
 | `zero_rtt_attempted`, `unexpected_streams`, `unexpected_datagrams` | Events counted and ignored | Always 0 in tests. |
 | Certificate SHA-256 (server start), pin outcome (client) | `TestIdentity`, `PinnedCertificateVerifier` | Certificate fingerprint, not an SSH host-key fingerprint. |
+| `identity_mode`; `ssh_host_key_sha256`/`ssh_host_key_algorithm` (server start, host-key mode) | `HostKeyIdentity` | SSH-blob fingerprint as `ssh-keygen -lf` prints it (round 5). |
+| Client: `identity_mode`, `trust_policy`, `known_hosts_lookup`, `ssh_host_key {algorithm, fingerprint_sha256, sshfp, blob_len}`, `host_trusted`, `trust_source`, `trust_line`, `untrusted_reason`, `trust_error`, `ssh_session: false` | `SshHostKeyVerifier` via `ClientOutcome.ssh_identity`; `tatami::trust` | Lookup name bound to the typed host and port before resolution, never to `--server-name`; SSHFP is an equivalent value, not DNS-verified. `trust_error` is the configuration code, which `untrusted_reason` repeats when no key was judged, as in the TCP report (round 5). |
 
 Not observed by design: stream data, SSH identification, `KEXINIT`,
 migration.
@@ -161,16 +172,16 @@ migration.
 | Control-stream bootstrap: initiator, direction, recognition, first record | P-03, AQ-015 | open |
 | Bounded enclosing record rule on QUIC streams (TCP's binary packet is **not** inherited, W-12) | P-02, AQ-018 | open |
 | Session-binding construction from the exporter (label, context, length, transcript inputs, identification strings) and its proof of authentication | P-04, AQ-003, AQ-024 | exporter *availability* shown; construction open |
-| Host identity: SPKI ↔ SSH key mapping and the fingerprint an operator pins | P-06 | RPK handshake shown; mapping open (three fingerprints differ) |
+| Host identity: SPKI ↔ SSH key mapping and the fingerprint an operator pins | P-06 | Ed25519 mapping implemented in the diagnostic (round 5, W-36, W-40): strict SPKI → SSH blob, SSH-blob fingerprint and `known_hosts`, same policy as TCP. Other algorithms, host certificates and how the identity feeds the session binding remain open |
 | Channel-opening placement and stream association | AQ-026, AQ-001, AQ-004 | open |
 | ALPN value | AQ-019, P-08 | experimental `tatami-diag/0`; unregistered |
 | Interoperability partner other than Tatami itself | — | none |
 
 Until these have recorded proposals in the checkpoint, no SSH byte is sent
-over QUIC and no `--quic` option exists on `tatami-client`/`tatami-server`.
-The `tatami-quic-*` binaries state in their usage text that they are not SSH
-clients or servers (W-16 spirit: a stub must never look like a running
-service).
+over QUIC and no SSH-over-QUIC mode exists on `tatami-client`/`tatami-server`.
+The `--transport quic` usage text states that it is not an SSH client or
+service (W-16 spirit: a stub must never look like a running service; the
+separate `tatami-quic-*` binaries were removed by W-35).
 
 ## 6. Remaining blockers
 
@@ -179,6 +190,6 @@ service).
 | `std` in `tatami-quic` | Resolved as designed: `quinn-backend` enables `std`; `check-workspace.sh` verifies the backend is absent without the feature and that portable builds still pass. |
 | MSRV drift | Contained: `quinn-proto` pinned to 0.11.18 by `Cargo.lock`; 0.12 requires 1.88. Raising MSRV is a W-07 change. |
 | Crypto provider | `ring` selected for the experiment (W-31); the SSH side uses the pure-Rust set (W-29). Not unified, deliberately. |
-| Identity | rcgen test identities only; P-06 open. |
+| Identity | rcgen test identities, or (round 5) an OpenSSH Ed25519 host key as a raw public key judged by `known_hosts`/SSH pin; P-06 mapping settled for Ed25519 only. Encrypted keys, agents/HSMs and host certificates not supported. |
 | Second-opinion backend | Not done; quiche when MSRV 1.88 is acceptable. |
 | Observer (b) | Blocked on §5. |

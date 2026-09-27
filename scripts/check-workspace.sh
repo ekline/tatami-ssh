@@ -72,6 +72,33 @@ if cargo tree -p tatami-tcp --no-default-features --features kex -e features -f 
     exit 1
 fi
 
+# Portable host-identity features (round 5): known_hosts policy and OpenSSH
+# private-key decoding. Neither may pull std, a TLS stack, a resolver or
+# file I/O; the facade's host layer does the file reads.
+step cargo check -p tatami-keys --no-default-features --features known-hosts
+step cargo check -p tatami-keys --no-default-features --features openssh-key
+step cargo check -p tatami-keys --no-default-features --features known-hosts,openssh-key
+printf '\n==> verify the host-identity feature graph enables no std feature\n'
+if cargo tree -p tatami-keys --no-default-features --features known-hosts,openssh-key \
+    -e normal,build -e features -f '{p} {f}' | grep -E 'feature "std"' | grep -v semver; then
+    echo "error: a std feature is enabled in the portable host-identity graph" >&2
+    exit 1
+fi
+printf '\n==> verify portable key/trust builds pull no TLS, resolver or key-file crates\n'
+if cargo tree -p tatami-keys --no-default-features --features known-hosts,openssh-key -e normal \
+    | grep -qE 'rustls|ring|quinn|getrandom|hickory|trust-dns'; then
+    echo "error: host-only crates in the portable host-identity graph" >&2
+    exit 1
+fi
+if cargo tree -p tatami-keys --no-default-features -e normal | grep -qE 'hmac|sha1|ssh-key'; then
+    echo "error: known_hosts/openssh-key crates present without their features" >&2
+    exit 1
+fi
+if cargo tree -p tatami --no-default-features --features kex -e normal | grep -qE 'ssh-key|rustls|ring'; then
+    echo "error: private-key or TLS crates present in the portable kex facade" >&2
+    exit 1
+fi
+
 # Host-only QUIC diagnostic backend (needs a C compiler for ring).
 step cargo check -p tatami-quic --no-default-features --features quinn-backend
 printf '\n==> verify the QUIC backend is absent without its feature\n'
@@ -114,6 +141,8 @@ if [ "$run_embedded" -eq 1 ]; then
         step cargo check -p tatami-keys --no-default-features --features ed25519 --target "$EMBEDDED_TARGET"
         step cargo check -p tatami-tcp --no-default-features --features kex --target "$EMBEDDED_TARGET"
         step cargo check -p tatami --no-default-features --features kex --target "$EMBEDDED_TARGET"
+        # Portable host-identity features (round 5) with no std at all.
+        step cargo check -p tatami-keys --no-default-features --features known-hosts,openssh-key --target "$EMBEDDED_TARGET"
     elif [ "${CHECK_EMBEDDED_REQUIRED:-0}" = 1 ]; then
         echo "error: target $EMBEDDED_TARGET is not installed" >&2
         exit 1

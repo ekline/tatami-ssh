@@ -1,7 +1,8 @@
 # Cryptographic provider and QUIC backend audit
 
-Status: round 4, 2026-09-20. This audit precedes and governs the provider
-features added in this round. It selects a deliberately small first
+Status: round 4, 2026-09-20; round 5 (host identity) added 2026-09-26 in
+[Host-identity crates](#host-identity-crates-round-5). This audit precedes
+and governs the provider features added in those rounds. It selects a deliberately small first
 interoperability profile; it is not a claim that SSH's full algorithm
 requirements (RFC 9142 MUSTs, RFC 8332, etc.) are met — those gaps remain in
 `specification-inventory.md`.
@@ -16,6 +17,7 @@ and against the resolved graph of this workspace:
 cargo tree -p tatami-tcp  --features kex           -e features -f '{p} {f}'
 cargo tree -p tatami-keys --features ed25519       -e features -f '{p} {f}'
 cargo tree -p tatami-quic --features quinn-backend -e features -f '{p} {f}'
+cargo tree -p tatami-keys --no-default-features --features known-hosts,openssh-key -e normal -f '{p} {f}'
 grep -m1 rust-version ~/.cargo/registry/src/*/<crate>-<version>/Cargo.toml
 ```
 
@@ -90,7 +92,7 @@ probing) and never part of the compiled library.
 | Crate | Version | Features enabled | MSRV (`rust-version`) | Transitive notes | Entropy / secrets | Why it fits |
 |---|---|---|---|---|---|---|
 | `x25519-dalek` | 2.0.1 | `zeroize`, `static_secrets` (defaults off) | 1.60 | `curve25519-dalek` 4.1.3 (MSRV 1.60.0; `digest`, `zeroize`), `curve25519-dalek-derive` (proc-macro), `rand_core` 0.6.4 | Ephemeral secret built from 32 caller-supplied random bytes via `StaticSecret::from`; `zeroize` on drop; `Debug` on secrets is not derived | Maintained dalek-cryptography implementation of RFC 7748 X25519 with constant-time field arithmetic; `static_secrets` is needed only because the ephemeral secret is constructed from injected bytes rather than an RNG |
-| `ed25519-dalek` | 2.2.0 | `zeroize` (defaults off) | **1.81** | `ed25519` 2.2.3, `signature` 2.2.0, `sha2` | Verification only; no signing keys are created | RFC 8032 verification with the strict validation the SSH ecosystem expects; same maintained family as above |
+| `ed25519-dalek` | 2.2.0 | `zeroize` (defaults off) | **1.81** | `ed25519` 2.2.3, `signature` 2.2.0, `sha2` | Verification only; no signing keys are created (round 5: `SigningKey::from_bytes` derives the public key of a loaded host seed for a consistency check; Tatami never signs with it) | RFC 8032 verification with the strict validation the SSH ecosystem expects; same maintained family as above |
 | `sha2` | 0.10.9 | none (defaults off) | unset in manifest; RustCrypto documents 1.41 for 0.10 | `digest` 0.10.7, `block-buffer`, `crypto-common`, `cpufeatures` (no-op on `thumbv7em`) | none | SHA-256 for the exchange hash, key derivation and fingerprints |
 | `aes-gcm` | 0.10.3 | `aes` (defaults off; no `alloc`, no `getrandom`) | 1.56 | `aes` 0.8.4 (1.56), `ghash` 0.5.1 (1.56), `polyval`, `ctr`, `aead` 0.5.2, `universal-hash`, `subtle` | Keys and nonces are supplied by the caller; the in-place detached API is used so no plaintext copy is made by the provider | RFC 5116/5647 AES-128-GCM with constant-time GHASH; RustCrypto AEAD API allows detached tags and in-place operation, which the SSH packet layout needs |
 | `rand_core` | 0.6.4 | none | unset (crate documents 1.56 for 0.6) | none | Defines the `RngCore`/`CryptoRng` contract that portable code accepts by injection | Version the dalek 2.x crates expect; the host adapter supplies an implementation |
@@ -109,7 +111,8 @@ Not selected: `ring`/`aws-lc-rs` for the SSH side (C/assembly, `std`), RSA
 or ECDSA crates (out of profile), `chacha20poly1305` (the profile picks one
 AEAD; ChaCha20-Poly1305 is a natural second and is *not* Terrapin-safe
 without strict KEX, which is one more reason to land strict KEX first),
-`hmac` (no non-AEAD cipher to pair it with).
+`hmac` for SSH packets (no non-AEAD cipher to pair it with; round 5 uses
+`hmac` only for hashed `known_hosts` names, below).
 
 ## QUIC/TLS diagnostic backend (host-only)
 
@@ -129,6 +132,50 @@ default, `tcp`-only or portable builds (`cargo tree -p tatami-quic` without
 the feature shows no crypto crates); it exists for the diagnostic handshake
 experiment only and settles no SSH-over-QUIC wire question.
 
+Round 5 signs with an SSH host key through this backend: the in-memory
+PKCS#8 is passed borrowed to `rustls::crypto::ring::sign::any_eddsa_type`;
+whatever copy `ring` keeps inside its key object is outside Tatami's control.
+Peer raw public keys are converted by `tatami_keys::spki` (pure Rust), and
+`CertificateVerify` is verified by rustls with the provider's algorithms.
+
+## Host-identity crates (round 5)
+
+Added behind `tatami-keys/known-hosts` (hashed hostnames) and
+`tatami-keys/openssh-key` (host private-key container), both portable
+`no_std` + `alloc`, both off by default. Checked against the registry
+manifests and sources and the resolved graph above (W-37, W-39):
+
+| Crate | Version | Features enabled | MSRV (`rust-version`) | Transitive notes | Entropy / secrets | Why it fits |
+|---|---|---|---|---|---|---|
+| `ssh-key` | 0.6.7 | `alloc` only (defaults `ecdsa`, `rand_core`, `std` off) | 1.65 (edition 2021) | `ssh-encoding` 0.2.0 (1.60), `ssh-cipher` 0.2.0 (1.60; pulls the `cipher` 0.4 traits but no cipher implementation), `pem-rfc7468` 0.7.0 (1.60), plus the already-audited `sha2`, `signature`, `subtle`, `zeroize`, `base64ct` | Decodes the private section; its Ed25519 private key type zeroizes on drop. No RNG: `rand_core` is not enabled | Maintained RustCrypto parser for `openssh-key-v1`; decode-from-bytes API keeps file access in the host layer |
+| `hmac` | 0.12.1 | none (defaults off) | unset (edition 2018) | `digest` 0.10.7 (`mac`) | none (salts are public) | HMAC-SHA1 for `\|1\|salt\|hash` hostnames only; enables no SSH signature or MAC |
+| `sha1` | 0.10.7 | none (defaults off) | unset (edition 2018) | `digest`, `cpufeatures` 0.2.17 (already present via `sha2`) | none | Hash for the legacy hashed-hostname format only |
+
+`ssh-key` features deliberately **not** enabled: `ed25519` (would pull
+`rand_core` and its own seed→public derivation check, which Tatami performs
+with `ed25519-dalek` instead), `encryption` (would pull `bcrypt-pbkdf` and
+AES/ChaCha implementations; `grep bcrypt Cargo.lock` finds nothing, so no
+KDF can run), `std`, `ecdsa`, `rsa`, `dsa`. `getrandom` is not in the graph of
+`tatami-keys --features known-hosts,openssh-key`; `check-workspace.sh`
+enforces that together with the absence of `rustls`/`ring`/`quinn`, of any
+`std` feature, of `hmac`/`sha1`/`ssh-key` without their features, and of
+`ssh-key`/`rustls`/`ring` in the portable `kex` facade. MSRV stays 1.85.
+
+Validation split, confirmed in `ssh-key-0.6.7/src/private.rs` and
+`src/private/ed25519.rs`:
+
+| Check | Performed by |
+|---|---|
+| Magic `openssh-key-v1\0`; `nkeys == 1`; KDF must be `none` when unencrypted; `checkint1 == checkint2`; outer public key equals the private section's public key (`Error::PublicKey`); the embedded `seed \|\| public` repeats that public key; padding `1, 2, 3, …`; no trailing data | `ssh-key` |
+| Encrypted containers (cipher ≠ `none`) are returned opaque, undecrypted | `ssh-key`; Tatami maps them to `PrivateKeyError::Encrypted` |
+| Public key is the one derived from the seed (skipped by `ssh-key` without its `ed25519` feature) | Tatami (`ed25519-dalek` `SigningKey::from_bytes`) |
+| `-----BEGIN OPENSSH PRIVATE KEY-----` armor present; input ≤ 16 KiB before decoding; only `ssh-ed25519` | Tatami |
+| Regular file, size bound on the opened handle; on Unix no group/other permission bits | Tatami facade (`host::files`) |
+
+Check integers alone do not establish key consistency; the derivation check
+does. The PKCS#8 form (RFC 8410 §7 prefix plus seed) is built in
+`Zeroizing` memory and never written.
+
 ## Secret handling rules applied
 
 - Entropy is injected into portable code through `rand_core::CryptoRngCore`
@@ -142,11 +189,20 @@ experiment only and settles no SSH-over-QUIC wire question.
   fingerprint, algorithm names, sizes and outcomes. Fuzz artifacts and JSON
   records never include key material.
 - Signature verification uses `ed25519_dalek::VerifyingKey::verify_strict`.
+- Host private keys (round 5): read into a zeroizing buffer reserved past
+  the size bound so it never reallocates; the seed and the PKCS#8 form live
+  in `Zeroizing`; `Ed25519HostPrivateKey` and `HostKeyIdentity` print only
+  the public fingerprint in `Debug`; `PrivateKeyError` carries no key bytes.
+  Transient copies inside `ssh-key` and `ring` are outside Tatami's control.
 
 ## Open items
 
-- Bare-metal (`thumbv7em-none-eabi`) build of `tatami-tcp --features kex` and
-  `tatami-keys --features ed25519` is pending its first CI run.
+- Bare-metal (`thumbv7em-none-eabi`) build of `tatami-tcp --features kex`,
+  `tatami-keys --features ed25519` and (round 5) `tatami-keys --features
+  known-hosts,openssh-key` is pending its first observed CI run; the target
+  is not installed on the development machine, where the step was skipped.
+- Round 5 code has been built and tested locally on stable (rustc 1.98.1)
+  only; the Rust 1.85 CI run is pending.
 - `cargo audit` has not been executed (offline); run it before any release.
 - `ed25519-dalek` 3.x and `x25519-dalek` 3.x exist; they were not adopted
   because they move to `rand_core` 0.9 and newer MSRVs and offer nothing the

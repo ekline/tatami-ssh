@@ -474,9 +474,10 @@ pub mod handshake {
     //! TCP active handshake: options, structured report, text and JSON
     //! output.
     //!
-    //! [`run`] connects, drives `tatami_tcp::io::handshake::run_handshake`
-    //! with a pinned-fingerprint trust policy ([`PinnedSha256`]) and returns
-    //! a [`Report`]; it prints nothing. [`Report::write_text`] renders the
+    //! [`run`] prepares the trust policy ([`TrustConfig`]: an SSH `SHA256:`
+    //! pin or an explicit `known_hosts` file bound to the lookup name),
+    //! connects, drives `tatami_tcp::io::handshake::run_handshake` with it
+    //! and returns a [`Report`]; it prints nothing. [`Report::write_text`] renders the
     //! human-readable form used by `tatami-client handshake` and
     //! [`Report::to_json`] the machine-readable one (`--json`). Every
     //! peer-supplied byte string is escaped in the text form and rendered as
@@ -496,24 +497,30 @@ pub mod handshake {
     //!
     //! # Trust
     //!
-    //! The only trust source is the pin. There is no `known_hosts`, no
-    //! prompting and no enrollment; a fingerprint mismatch ends the run
-    //! before `NEWKEYS` is sent ([`HandshakeOutcome::HostNotTrusted`]).
-    //! The pin must come from an independent channel, for example
+    //! Exactly one source per run: the pin, or a `known_hosts` file named
+    //! explicitly (never `~/.ssh` implicitly). There is no prompting and no
+    //! enrollment; an untrusted key ends the run before `NEWKEYS` is sent
+    //! ([`HandshakeOutcome::HostNotTrusted`], with the reason: fingerprint
+    //! mismatch, unknown host, key changed, revoked, ...). A `known_hosts`
+    //! file that cannot be read or parsed ends the run before connecting
+    //! ([`Completion::TrustConfiguration`]). Pins and entries must come from
+    //! an independent channel, for example
     //! `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on the server.
     //!
     //! # JSON record (`schema` = 1, `event` = `tcp_handshake`)
     //!
     //! One object with, in order: `target {host, port}`, `peer`, `local`,
-    //! `pinned_fingerprint_sha256`, `phase`, `client_identification`,
+    //! `pinned_fingerprint_sha256` (pin mode), `known_hosts_file`,
+    //! `known_hosts_lookup` (`known_hosts` mode), `phase`, `client_identification`,
     //! `server_prelude_lines`, `server_identification`, `skipped_messages`,
     //! `advertised {client, server}`, `selected`, `strict_kex
     //! {offered_pre_standard, offered_standard, server_pre_standard,
     //! server_standard, negotiated}`, `kexinit_was_first_packet`,
     //! `server_guess_discarded`, `host_key {algorithm, fingerprint_sha256,
     //! blob_len}`, `fingerprint_sha256`, `host_key_signature_valid`,
-    //! `signature_error`, `trust_policy`, `host_trusted`, `trust_source`,
-    //! `untrusted_reason`, `key_exchange_completed`, `newkeys_sent`,
+    //! `signature_error`, `trust_policy` (`pinned_fingerprint` or
+    //! `known_hosts`), `host_trusted`, `trust_source`, `trust_line`,
+    //! `untrusted_reason`, `trust_error`, `key_exchange_completed`, `newkeys_sent`,
     //! `newkeys_received`, `protected_packets_sent`,
     //! `protected_packets_received`, `ext_info {received, server_sig_algs,
     //! extension_names}`, `service_accepted`, `server_disconnect`, `outcome`,
@@ -527,8 +534,7 @@ pub mod handshake {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    use tatami_keys::fingerprint::Sha256Fingerprint;
-    use tatami_keys::trust::{PinnedSha256, TrustDecision, TrustSource, UntrustedReason};
+    use tatami_keys::trust::UntrustedReason;
     use tatami_tcp::handshake::{
         HandshakeConfig, HandshakeOutcome, HandshakeReport, LimitKind, OwnedIdentification, Phase,
         ProtocolViolation, SkippedMessage,
@@ -543,6 +549,8 @@ pub mod handshake {
 
     use crate::json::Value;
     use crate::text::{escape_bytes, quoted};
+    pub use crate::trust::{TrustConfig, TrustConfigError, trust_text};
+    use tatami_keys::trust::TrustDecision;
 
     /// Options for one handshake.
     #[derive(Clone, Debug)]
@@ -552,8 +560,8 @@ pub mod handshake {
         pub host: String,
         /// TCP port.
         pub port: u16,
-        /// The only host-key fingerprint that will be trusted.
-        pub pin: Sha256Fingerprint,
+        /// How the host key is judged (exactly one source).
+        pub trust: TrustConfig,
         /// Host timing policy (connect deadline, overall deadline).
         pub io: HandshakeIo,
         /// Portable handshake configuration (markers, limits, service).
@@ -561,13 +569,14 @@ pub mod handshake {
     }
 
     impl Options {
-        /// Options with the library's default deadlines and limits.
+        /// Options with the library's default deadlines and limits. `trust`
+        /// may be a `Sha256Fingerprint` (pin) or a [`TrustConfig`].
         #[must_use]
-        pub fn new(host: impl Into<String>, port: u16, pin: Sha256Fingerprint) -> Self {
+        pub fn new(host: impl Into<String>, port: u16, trust: impl Into<TrustConfig>) -> Self {
             Options {
                 host: host.into(),
                 port,
-                pin,
+                trust: trust.into(),
                 io: HandshakeIo::default(),
                 config: HandshakeConfig::default(),
             }
@@ -639,6 +648,9 @@ pub mod handshake {
         },
         /// No connection could be established.
         ConnectFailed(ConnectError),
+        /// The trust configuration (a `known_hosts` file) could not be
+        /// used. Detected before connecting; nothing was sent.
+        TrustConfiguration(TrustConfigError),
         /// Connected, but the handshake could not start (socket addresses
         /// unreadable, invalid configured identification, or OS entropy
         /// failure). No byte was exchanged.
@@ -673,6 +685,7 @@ pub mod handshake {
                 Completion::TimedOut { .. } => "timed_out",
                 Completion::Io { .. } => "io_error",
                 Completion::ConnectFailed(_) => "connect_failed",
+                Completion::TrustConfiguration(_) => "trust_configuration_error",
                 Completion::NotStarted(_) => "not_started",
             }
         }
@@ -716,8 +729,10 @@ pub mod handshake {
         pub host: String,
         /// Requested port.
         pub port: u16,
-        /// The pinned fingerprint the run was configured with.
-        pub pin: Sha256Fingerprint,
+        /// The trust source the run was configured with.
+        pub trust: TrustConfig,
+        /// The `known_hosts` lookup name bound before connecting.
+        pub lookup_name: Option<String>,
         /// Address that actually connected, if any.
         pub peer: Option<SocketAddr>,
         /// Local address, if connected.
@@ -739,11 +754,16 @@ pub mod handshake {
             self.completion.is_complete()
         }
 
-        fn unconnected(options: &Options, completion: Completion) -> Self {
+        fn unconnected(
+            options: &Options,
+            lookup_name: Option<String>,
+            completion: Completion,
+        ) -> Self {
             Report {
                 host: options.host.clone(),
                 port: options.port,
-                pin: options.pin,
+                trust: options.trust.clone(),
+                lookup_name,
                 peer: None,
                 local: None,
                 handshake: None,
@@ -758,18 +778,32 @@ pub mod handshake {
     /// resolution caveat). Never prints.
     #[must_use]
     pub fn run(options: &Options) -> Report {
+        // Bind the logical lookup name before any resolution or connect.
+        let prepared = match options.trust.prepare(&options.host, options.port) {
+            Ok(p) => p,
+            Err(e) => {
+                return Report::unconnected(options, None, Completion::TrustConfiguration(e));
+            }
+        };
+        let lookup_name = prepared.lookup_name.clone();
         let stream = match options.io.connect(&options.host, options.port) {
             Ok(s) => s,
-            Err(e) => return Report::unconnected(options, Completion::ConnectFailed(e)),
+            Err(e) => {
+                return Report::unconnected(options, lookup_name, Completion::ConnectFailed(e));
+            }
         };
-        let policy = PinnedSha256(options.pin);
-        match run_handshake(stream, options.config.clone(), &policy, &options.io) {
-            Ok(run) => from_run(options, run),
-            Err(e) => Report::unconnected(options, Completion::NotStarted(e)),
+        match run_handshake(
+            stream,
+            options.config.clone(),
+            &*prepared.policy,
+            &options.io,
+        ) {
+            Ok(run) => from_run(options, lookup_name, run),
+            Err(e) => Report::unconnected(options, lookup_name, Completion::NotStarted(e)),
         }
     }
 
-    fn from_run(options: &Options, run: HandshakeRun) -> Report {
+    fn from_run(options: &Options, lookup_name: Option<String>, run: HandshakeRun) -> Report {
         let completion = match run.end {
             HandshakeEnd::Finished(outcome) => Completion::from_outcome(outcome),
             HandshakeEnd::TimedOut {
@@ -784,7 +818,8 @@ pub mod handshake {
         Report {
             host: options.host.clone(),
             port: options.port,
-            pin: options.pin,
+            trust: options.trust.clone(),
+            lookup_name,
             peer: Some(run.peer),
             local: Some(run.local),
             handshake: Some(run.report),
@@ -858,7 +893,7 @@ pub mod handshake {
             write_negotiation(w, h, &self.completion)?;
             write_strict_kex(w, h)?;
             write_host_key(w, h)?;
-            write_trust(w, self.pin, h)?;
+            write_trust(w, &self.trust, self.lookup_name.as_deref(), h)?;
 
             writeln!(w, "Protected transport:")?;
             writeln!(w, "  NEWKEYS sent: {}", yes_no(h.newkeys_sent))?;
@@ -1184,27 +1219,36 @@ pub mod handshake {
 
     fn write_trust(
         w: &mut dyn fmt::Write,
-        pin: Sha256Fingerprint,
+        trust: &TrustConfig,
+        lookup_name: Option<&str>,
         h: &HandshakeReport,
     ) -> fmt::Result {
         writeln!(w, "Host trust:")?;
-        writeln!(w, "  source: pinned fingerprint (--host-key-sha256)")?;
-        writeln!(w, "  pinned: {pin}")?;
+        write_trust_source(w, trust, lookup_name)?;
         writeln!(w, "  result: {}", trust_text(h.trust))
     }
 
-    fn trust_text(t: Option<TrustDecision>) -> &'static str {
-        match t {
-            Some(TrustDecision::Trusted {
-                source: TrustSource::PinnedFingerprint,
-            }) => "trusted",
-            Some(TrustDecision::Untrusted {
-                reason: UntrustedReason::FingerprintMismatch,
-            }) => "untrusted (fingerprint mismatch)",
-            Some(TrustDecision::Untrusted {
-                reason: UntrustedReason::NoPolicy,
-            }) => "untrusted (no policy)",
-            None => "not decided (host key not verified)",
+    fn write_trust_source(
+        w: &mut dyn fmt::Write,
+        trust: &TrustConfig,
+        lookup_name: Option<&str>,
+    ) -> fmt::Result {
+        match trust {
+            TrustConfig::Pin(pin) => {
+                writeln!(w, "  source: pinned fingerprint (--host-key-sha256)")?;
+                writeln!(w, "  pinned: {pin}")
+            }
+            TrustConfig::KnownHostsFile(path) => {
+                writeln!(
+                    w,
+                    "  source: known_hosts file (--known-hosts) {}",
+                    escape_bytes(path.display().to_string().as_bytes())
+                )?;
+                match lookup_name {
+                    Some(name) => writeln!(w, "  lookup name: {}", escape_bytes(name.as_bytes())),
+                    None => writeln!(w, "  lookup name: (not bound)"),
+                }
+            }
         }
     }
 
@@ -1230,8 +1274,8 @@ pub mod handshake {
     fn completion_line(c: &Completion, h: Option<&HandshakeReport>) -> String {
         match c {
             Completion::Complete => String::from(
-                "completed; key exchange, host-key verification, pinned-fingerprint \
-                 match and service request all succeeded",
+                "completed; key exchange, host-key verification, host trust \
+                 and service request all succeeded",
             ),
             Completion::HostNotTrusted {
                 reason: UntrustedReason::FingerprintMismatch,
@@ -1239,9 +1283,21 @@ pub mod handshake {
                 "host key not trusted; presented fingerprint does not match \
                  --host-key-sha256 (no NEWKEYS sent)",
             ),
-            Completion::HostNotTrusted {
-                reason: UntrustedReason::NoPolicy,
-            } => String::from("host key not trusted; no trust policy (no NEWKEYS sent)"),
+            Completion::HostNotTrusted { reason } => alloc::format!(
+                "host key not trusted; {}{} (no NEWKEYS sent)",
+                reason.describe(),
+                reason
+                    .line()
+                    .map(|l| alloc::format!(" at known_hosts line {l}"))
+                    .unwrap_or_default()
+            ),
+            // The error names an operator-supplied path: escape it like
+            // every other untrusted text in the report.
+            Completion::TrustConfiguration(e) => alloc::format!(
+                "not started; trust configuration unusable ({}): {}",
+                e.code(),
+                escape_bytes(e.to_string().as_bytes())
+            ),
             Completion::SignatureInvalid => {
                 String::from("host signature over the exchange hash is invalid")
             }
@@ -1340,17 +1396,22 @@ pub mod handshake {
         #[must_use]
         pub fn to_json(&self) -> Value {
             let h = self.handshake.as_ref();
-            let (trust_source, untrusted_reason) = match h.and_then(|h| h.trust) {
-                Some(TrustDecision::Trusted {
-                    source: TrustSource::PinnedFingerprint,
-                }) => (Some("pinned_fingerprint"), None),
-                Some(TrustDecision::Untrusted {
-                    reason: UntrustedReason::FingerprintMismatch,
-                }) => (None, Some("fingerprint_mismatch")),
-                Some(TrustDecision::Untrusted {
-                    reason: UntrustedReason::NoPolicy,
-                }) => (None, Some("no_policy")),
-                None => (None, None),
+            let (trust_source, mut untrusted_reason, trust_line) = match h.and_then(|h| h.trust) {
+                Some(TrustDecision::Trusted { source }) => {
+                    (Some(source.code()), None, source.line())
+                }
+                Some(TrustDecision::Untrusted { reason }) => {
+                    (None, Some(reason.code()), reason.line())
+                }
+                None => (None, None, None),
+            };
+            // Stable code, as in the QUIC report; the message is in `outcome`.
+            let trust_error = match &self.completion {
+                Completion::TrustConfiguration(e) => {
+                    untrusted_reason = Some(e.code());
+                    Some(e.code())
+                }
+                _ => None,
             };
             let negotiation_error_code = match &self.completion {
                 Completion::NegotiationFailed(e) => Some(e.code()),
@@ -1367,7 +1428,17 @@ pub mod handshake {
                 )
                 .opt("peer", self.peer.map(|a| a.to_string()))
                 .opt("local", self.local.map(|a| a.to_string()))
-                .field("pinned_fingerprint_sha256", self.pin.to_string())
+                .opt(
+                    "pinned_fingerprint_sha256",
+                    self.trust.pin().map(|p| p.to_string()),
+                )
+                .opt(
+                    "known_hosts_file",
+                    self.trust
+                        .known_hosts_file()
+                        .map(|p| p.display().to_string()),
+                )
+                .opt("known_hosts_lookup", self.lookup_name.clone())
                 .opt("phase", h.map(|h| h.phase.code()))
                 .opt(
                     "client_identification",
@@ -1439,13 +1510,15 @@ pub mod handshake {
                     "signature_error",
                     h.and_then(|h| h.signature_error.as_deref()),
                 )
-                .field("trust_policy", "pinned_fingerprint")
+                .field("trust_policy", self.trust.mode())
                 .opt(
                     "host_trusted",
                     h.and_then(|h| h.trust).map(|t| t.is_trusted()),
                 )
                 .opt("trust_source", trust_source)
+                .opt("trust_line", trust_line)
                 .opt("untrusted_reason", untrusted_reason)
+                .opt("trust_error", trust_error)
                 .field(
                     "key_exchange_completed",
                     h.is_some_and(|h| h.newkeys_sent && h.newkeys_received),
@@ -1632,11 +1705,41 @@ pub mod handshake {
     mod tests {
         use super::*;
         use std::net::TcpListener;
+        use tatami_keys::fingerprint::Sha256Fingerprint;
 
         fn pin() -> Sha256Fingerprint {
             "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8"
                 .parse()
                 .unwrap()
+        }
+
+        /// Regression (fuzz `handshake_report_json`): a known_hosts path
+        /// with control bytes reached the text report unescaped. The
+        /// file is never read: reading fails first.
+        #[test]
+        fn trust_configuration_error_text_is_escaped() {
+            let options = Options::new(
+                "127.0.0.1",
+                22,
+                TrustConfig::KnownHostsFile(std::path::PathBuf::from(
+                    "/nonexistent/k\u{1b}[31mh\u{7}",
+                )),
+            );
+            let report = run(&options);
+            assert!(matches!(
+                report.completion,
+                Completion::TrustConfiguration(_)
+            ));
+            assert!(report.peer.is_none(), "nothing may be connected");
+            let mut text = String::new();
+            report.write_text(&mut text).unwrap();
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n'),
+                "{text:?}"
+            );
+            assert!(text.contains("trust_configuration_error"), "{text}");
+            let json = report.to_json().to_json();
+            assert!(json.contains("\"untrusted_reason\":\"io_error\""), "{json}");
         }
 
         #[test]

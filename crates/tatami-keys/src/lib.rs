@@ -17,17 +17,21 @@
 //! | [`fingerprint`] | type: none; compute/text: `ed25519` | `Sha256Fingerprint`, `SHA256:` base64 rendering and parsing |
 //! | [`trust`] | none (`HostIdentity::from_blob`: `ed25519`) | `HostTrustPolicy`, `TrustDecision`, `PinnedSha256`, `NoTrustPolicy` |
 //! | [`ed25519`] | `ed25519` | `Ed25519PublicKey`, `Ed25519Signature`, `HostKey`; verification with `ed25519-dalek` `verify_strict` |
+//! | [`spki`] | `ed25519` | Strict Ed25519 `SubjectPublicKeyInfo` ⇄ `ssh-ed25519` blob conversion (RFC 8410 / RFC 7250 identity) |
+//! | [`sshfp`] | `ed25519` | SSHFP values (RFC 4255/6594/7479) from a blob; no DNS |
+//! | [`known_hosts`] | `known-hosts` | Read-only, bounded OpenSSH `known_hosts` parser and `KnownHostsPolicy` |
+//! | [`openssh_key`] | `openssh-key` | Unencrypted Ed25519 `openssh-key-v1` host private keys, PKCS#8 in memory |
 //!
 //! # What is not implemented
 //!
-//! - Signing of any kind. There are no private keys in this crate.
+//! - Signing. The only private-key support is decoding an Ed25519 host key
+//!   so a TLS stack can sign with it; encrypted keys are rejected.
 //! - RSA (`ssh-rsa`, `rsa-sha2-*`), ECDSA (`ecdsa-sha2-nistp*`), DSA, or
 //!   Ed448. Unknown algorithms are reported with their name preserved.
-//! - OpenSSH certificates (`*-cert-v01@openssh.com`).
-//! - `known_hosts` files, host-key prompting, or enrollment. The only trust
-//!   policy is a pinned fingerprint; the default is to trust nothing.
-//! - `SubjectPublicKeyInfo` conversion for a future raw-public-key TLS
-//!   binding.
+//! - OpenSSH certificates (`*-cert-v01@openssh.com`) and
+//!   `@cert-authority` trust.
+//! - Host-key prompting, enrollment or writing `known_hosts`; reading
+//!   `$HOME/.ssh` or system files implicitly.
 //!
 //! # Provider
 //!
@@ -56,6 +60,14 @@ pub mod blob;
 pub mod ed25519;
 pub mod error;
 pub mod fingerprint;
+#[cfg(feature = "known-hosts")]
+pub mod known_hosts;
+#[cfg(feature = "openssh-key")]
+pub mod openssh_key;
+#[cfg(feature = "ed25519")]
+pub mod spki;
+#[cfg(feature = "ed25519")]
+pub mod sshfp;
 pub mod trust;
 
 pub use blob::{PublicKeyBlob, SignatureBlob};

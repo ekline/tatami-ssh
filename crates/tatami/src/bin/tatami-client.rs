@@ -29,11 +29,13 @@ const USAGE: &str = "\
 Usage:
   tatami-client probe HOST [--port PORT] [--connect-timeout DURATION]
                            [--read-timeout DURATION]
-  tatami-client handshake HOST --host-key-sha256 'SHA256:...' [--port PORT]
+  tatami-client handshake HOST (--host-key-sha256 'SHA256:...' |
+                           --known-hosts FILE) [--port PORT]
                            [--connect-timeout DURATION] [--timeout DURATION]
                            [--no-ext-info] [--no-strict-kex] [--json]
   tatami-client handshake HOST --transport quic --alpn PROTO
-                           (--cert-sha256 FINGERPRINT | --root-cert FILE)
+                           (--host-key-sha256 'SHA256:...' | --known-hosts FILE
+                            | --cert-sha256 FINGERPRINT | --root-cert FILE)
                            [--port PORT] [--server-name NAME]
                            [--exporter-probe] [--timeout DURATION] [--json]
   tatami-client --help
@@ -48,9 +50,10 @@ Commands:
   handshake   With --transport tcp (the default): connect to HOST:PORT and
               perform the first interoperability profile's key exchange
               (curve25519-sha256, ssh-ed25519, aes128-gcm@openssh.com, strict
-              KEX): verify the host signature, compare the host key's SHA-256
-              fingerprint with the pin given by --host-key-sha256, exchange
-              NEWKEYS, request the ssh-userauth service and disconnect.
+              KEX): verify the host signature, decide trust with the pin
+              (--host-key-sha256) or the known_hosts file (--known-hosts),
+              exchange NEWKEYS, request the ssh-userauth service and
+              disconnect.
               No user is ever authenticated. Requires a build with
               --features std,tcp,kex.
 
@@ -61,7 +64,10 @@ Commands:
               stream is opened and no datagram is sent, so nothing SSH (no
               identification, no KEXINIT) can be sent; this is
               not an SSH client and not an SSH-over-QUIC client. 0-RTT and
-              session resumption are disabled. Requires a build with
+              session resumption are disabled. With --host-key-sha256 or
+              --known-hosts the server must present its SSH host key as an
+              RFC 7250 raw public key, judged exactly as on TCP; a trusted
+              key is still not an SSH session. Requires a build with
               --features std,tcp,quic-diag.
 
 Options (probe):
@@ -72,12 +78,19 @@ Options (probe):
 Options (handshake, TCP):
   --transport tcp            Select the SSH transport handshake (default)
   --host-key-sha256 'SHA256:...'
-                             REQUIRED. The only host-key fingerprint that will
-                             be trusted: 'SHA256:' followed by 43 unpadded
+                             The only host-key fingerprint that will be
+                             trusted: 'SHA256:' followed by 43 unpadded
                              base64 characters, as printed by ssh-keygen.
                              Obtain it independently of this connection, for
                              example on the server itself:
                                ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+  --known-hosts FILE         Instead of a pin, an OpenSSH known_hosts file,
+                             read-only. Looked up as HOST (port 22) or
+                             [HOST]:PORT, lowercased; supports patterns,
+                             negation, hashed names and @revoked. Unknown
+                             hosts fail; nothing is prompted or written.
+                             ~/.ssh/known_hosts is never read implicitly.
+                             Exactly one of --host-key-sha256/--known-hosts.
   --port PORT                TCP port (default 22)
   --connect-timeout DURATION Deadline for the whole connect phase (default 10s)
   --timeout DURATION         Overall deadline from connect to the outcome,
@@ -92,6 +105,13 @@ Options (handshake --transport quic):
                              several, in preference order). Experimental,
                              UNREGISTERED; no interoperability with any other
                              implementation is claimed. There is no default.
+  Exactly one trust option:
+  --host-key-sha256 'SHA256:...'
+                             SSH host-key fingerprint (same meaning as on
+                             TCP); requires an RFC 7250 raw public key.
+  --known-hosts FILE         known_hosts file (same rules as on TCP; the
+                             lookup uses HOST and --port, never
+                             --server-name); requires a raw public key.
   --cert-sha256 FP           Accept only the server certificate whose DER
                              hashes to FP ('SHA256:' + 43 unpadded base64
                              chars, as printed by
@@ -102,7 +122,9 @@ Options (handshake --transport quic):
   --root-cert FILE           Instead of a pin, trust certificates chaining to
                              the single PEM certificate in FILE and valid for
                              --server-name. No system trust store is used.
-  --port PORT                UDP port (default 4433)
+  --port PORT                UDP port (default 4433, an experiment default;
+                             the intended service convention is TCP and UDP
+                             22, which share one known_hosts entry)
   --server-name NAME         TLS server name (default HOST). A DNS name is
                              sent as SNI; an IP literal is not.
   --exporter-probe           After completion, call the TLS exporter with an
@@ -291,7 +313,7 @@ fn parse_tcp_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, 
 
     let mut host: Option<String> = None;
     let mut port = 22u16;
-    let mut pin: Option<Sha256Fingerprint> = None;
+    let mut trust: Option<handshake::TrustConfig> = None;
     let mut io = tatami::tcp::io::handshake::HandshakeIo {
         connect_timeout: Duration::from_secs(10),
         overall_timeout: Duration::from_secs(10),
@@ -305,9 +327,14 @@ fn parse_tcp_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, 
             "--port" => port = parse_port(value(&mut it, "--port")?)?,
             "--host-key-sha256" => {
                 let v = value(&mut it, "--host-key-sha256")?;
-                pin = Some(Sha256Fingerprint::parse(v).map_err(|e| {
+                let pin = Sha256Fingerprint::parse(v).map_err(|e| {
                     UsageError(format!("invalid --host-key-sha256 {v:?}: {e}; {PIN_HELP}"))
-                })?);
+                })?;
+                set_once(&mut trust, handshake::TrustConfig::Pin(pin), ONE_SSH_TRUST)?;
+            }
+            "--known-hosts" => {
+                let v = value(&mut it, "--known-hosts")?;
+                set_once(&mut trust, known_hosts_config(v)?, ONE_SSH_TRUST)?;
             }
             "--connect-timeout" => {
                 io.connect_timeout = parse_duration(value(&mut it, "--connect-timeout")?)?;
@@ -331,15 +358,39 @@ fn parse_tcp_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, 
         }
     }
     let host = check_host(host, "handshake")?;
-    let pin = pin.ok_or_else(|| {
+    let trust = trust.ok_or_else(|| {
         UsageError(format!(
-            "handshake requires --host-key-sha256 'SHA256:...'; {PIN_HELP}"
+            "handshake requires --host-key-sha256 'SHA256:...' or --known-hosts FILE; {PIN_HELP}"
         ))
     })?;
-    let mut options = handshake::Options::new(host, port, pin);
+    let mut options = handshake::Options::new(host, port, trust);
     options.io = io;
     options.config = config;
     Ok(Command::Handshake { options, json })
+}
+
+#[cfg(feature = "kex")]
+const ONE_SSH_TRUST: &str = "give exactly one trust option (--host-key-sha256 or --known-hosts)";
+
+/// Sets a trust option once; a second one is a usage error, so policies are
+/// never combined by accident.
+#[cfg(any(feature = "kex", feature = "quic-diag"))]
+fn set_once<T>(slot: &mut Option<T>, value: T, message: &str) -> Result<(), UsageError> {
+    if slot.is_some() {
+        return Err(UsageError(String::from(message)));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+#[cfg(any(feature = "kex", feature = "quic-diag"))]
+fn known_hosts_config(v: &str) -> Result<tatami::trust::TrustConfig, UsageError> {
+    if v.is_empty() {
+        return Err(UsageError(String::from("--known-hosts requires a file")));
+    }
+    Ok(tatami::trust::TrustConfig::KnownHostsFile(
+        std::path::PathBuf::from(v),
+    ))
 }
 
 #[cfg(not(feature = "quic-diag"))]
@@ -376,16 +427,19 @@ fn read_root_cert(path: &str) -> Result<Vec<u8>, UsageError> {
 
 #[cfg(feature = "quic-diag")]
 fn parse_quic_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, UsageError> {
+    use tatami::keys::fingerprint::Sha256Fingerprint;
     use tatami::quic::diag::identity::CertificateSha256;
     use tatami::quic::diag::tls::ClientTrust;
+    use tatami::quic_diag::client::Trust;
+    use tatami::trust::TrustConfig;
 
-    const ONE_TRUST: &str = "give exactly one of --cert-sha256 or --root-cert";
+    const ONE_TRUST: &str = "give exactly one trust option (--host-key-sha256, --known-hosts, --cert-sha256 or --root-cert)";
 
     let mut host: Option<String> = None;
     let mut port: u16 = 4433;
     let mut server_name: Option<String> = None;
     let mut alpn: Vec<Vec<u8>> = Vec::new();
-    let mut trust: Option<ClientTrust> = None;
+    let mut trust: Option<Trust> = None;
     let mut timeout = Duration::from_secs(5);
     let mut exporter_probe = false;
     let mut json = false;
@@ -405,17 +459,31 @@ fn parse_quic_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command,
                 let v = value(&mut it, "--cert-sha256")?;
                 let fp = CertificateSha256::parse(v)
                     .map_err(|e| UsageError(format!("invalid --cert-sha256 {v:?}: {e}")))?;
-                if trust.is_some() {
-                    return Err(UsageError(String::from(ONE_TRUST)));
-                }
-                trust = Some(ClientTrust::PinnedCertificateSha256(fp));
+                set_once(
+                    &mut trust,
+                    ClientTrust::PinnedCertificateSha256(fp).into(),
+                    ONE_TRUST,
+                )?;
             }
             "--root-cert" => {
                 let v = value(&mut it, "--root-cert")?;
                 if trust.is_some() {
                     return Err(UsageError(String::from(ONE_TRUST)));
                 }
-                trust = Some(ClientTrust::RootCertificate(read_root_cert(v)?));
+                trust = Some(ClientTrust::RootCertificate(read_root_cert(v)?).into());
+            }
+            "--host-key-sha256" => {
+                let v = value(&mut it, "--host-key-sha256")?;
+                let pin = Sha256Fingerprint::parse(v).map_err(|e| {
+                    UsageError(format!(
+                        "invalid --host-key-sha256 {v:?}: {e}; expected the SSH host-key fingerprint ('SHA256:' + 43 unpadded base64 characters, as printed by ssh-keygen -lf)"
+                    ))
+                })?;
+                set_once(&mut trust, TrustConfig::Pin(pin).into(), ONE_TRUST)?;
+            }
+            "--known-hosts" => {
+                let v = value(&mut it, "--known-hosts")?;
+                set_once(&mut trust, known_hosts_config(v)?.into(), ONE_TRUST)?;
             }
             "--exporter-probe" => exporter_probe = true,
             "--timeout" => timeout = parse_duration(value(&mut it, "--timeout")?)?,
@@ -442,7 +510,7 @@ fn parse_quic_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command,
     }
     let trust = trust.ok_or_else(|| {
         UsageError(String::from(
-            "a trust anchor is required: --cert-sha256 FINGERPRINT (from the server's stderr) or --root-cert FILE",
+            "a trust anchor is required: --host-key-sha256 or --known-hosts (SSH host key), or --cert-sha256 FINGERPRINT (from the server's stderr) or --root-cert FILE (X.509 test identity)",
         ))
     })?;
     let mut options = quic_client::Options::new(host, port, alpn, trust);
@@ -463,13 +531,13 @@ fn emit(text: &str) -> Result<(), std::io::Error> {
 
 #[cfg(feature = "kex")]
 fn run_handshake(options: &handshake::Options, json: bool) -> ExitCode {
+    let trust = match &options.trust {
+        handshake::TrustConfig::Pin(pin) => format!("pin {pin}"),
+        handshake::TrustConfig::KnownHostsFile(p) => format!("known_hosts {}", p.display()),
+    };
     eprintln!(
-        "{NAME}: handshaking with {}:{} (connect timeout {:?}, overall timeout {:?}, pin {})",
-        options.host,
-        options.port,
-        options.io.connect_timeout,
-        options.io.overall_timeout,
-        options.pin
+        "{NAME}: handshaking with {}:{} (connect timeout {:?}, overall timeout {:?}, {trust})",
+        options.host, options.port, options.io.connect_timeout, options.io.overall_timeout,
     );
     let report = handshake::run(options);
     let text = if json {
@@ -666,7 +734,7 @@ mod tests {
         };
         assert_eq!(o.host, "2001:db8::10");
         assert_eq!(o.port, 2222);
-        assert_eq!(o.pin.to_string(), PIN);
+        assert_eq!(o.trust.pin().unwrap().to_string(), PIN);
         assert_eq!(o.io.overall_timeout, Duration::from_secs(3));
         assert_eq!(o.io.connect_timeout, Duration::from_secs(1));
         assert!(!o.config.advertise_ext_info);
@@ -871,7 +939,10 @@ mod tests {
         assert_eq!(o.port, 4434);
         assert_eq!(o.effective_server_name(), "example.test");
         assert_eq!(o.alpn, vec![b"tatami-diag/0".to_vec()]);
-        assert!(matches!(o.trust, ClientTrust::PinnedCertificateSha256(_)));
+        assert!(matches!(
+            o.trust,
+            tatami::quic_diag::client::Trust::Tls(ClientTrust::PinnedCertificateSha256(_))
+        ));
         assert!(o.exporter_probe);
         assert_eq!(o.handshake_timeout, Duration::from_secs(2));
         assert!(json);
@@ -925,7 +996,7 @@ mod tests {
             &["h", "--alpn", "x", "--cert-sha256", PIN, "--bogus"],
             &["h", "--alpn", "x", "--cert-sha256", PIN, "extra"],
             &["h", "--alpn", "x", "--root-cert", "/nonexistent/root.pem"],
-            // TCP-only options are not accepted by the QUIC transport.
+            // Trust options are never combined.
             &[
                 "h",
                 "--alpn",
@@ -935,6 +1006,18 @@ mod tests {
                 "--host-key-sha256",
                 PIN,
             ],
+            &[
+                "h",
+                "--alpn",
+                "x",
+                "--known-hosts",
+                "kh",
+                "--host-key-sha256",
+                PIN,
+            ],
+            &["h", "--alpn", "x", "--known-hosts", ""],
+            &["h", "--alpn", "x", "--host-key-sha256", "SHA256:short"],
+            // TCP-only options are not accepted by the QUIC transport.
             &["h", "--alpn", "x", "--cert-sha256", PIN, "--no-strict-kex"],
             &[
                 "h",
@@ -948,6 +1031,82 @@ mod tests {
         ] {
             assert!(q(rest).is_err(), "{rest:?}");
         }
+    }
+
+    #[cfg(feature = "quic-diag")]
+    #[test]
+    fn parses_quic_ssh_host_key_trust() {
+        use tatami::quic_diag::client::Trust;
+        use tatami::trust::TrustConfig;
+
+        let parse = |extra: &[&str]| {
+            let mut a = vec!["handshake", "h", "--transport", "quic", "--alpn", "x"];
+            a.extend_from_slice(extra);
+            match parse_args(&args(&a)).unwrap() {
+                Command::QuicHandshake { options, .. } => options,
+                _ => panic!(),
+            }
+        };
+        let o = parse(&["--host-key-sha256", PIN]);
+        let Trust::SshHostKey(TrustConfig::Pin(p)) = &o.trust else {
+            panic!("{:?}", o.trust)
+        };
+        assert_eq!(p.to_string(), PIN);
+        assert_eq!(o.trust.identity_mode(), "ssh_host_key_raw_public_key");
+        let o = parse(&[
+            "--known-hosts",
+            "/some/known_hosts",
+            "--server-name",
+            "tls.example",
+        ]);
+        assert!(matches!(
+            &o.trust,
+            Trust::SshHostKey(TrustConfig::KnownHostsFile(p)) if p.to_str() == Some("/some/known_hosts")
+        ));
+        // --server-name stays a TLS parameter.
+        assert_eq!(o.effective_server_name(), "tls.example");
+        assert_eq!(o.host, "h");
+    }
+
+    #[cfg(feature = "kex")]
+    #[test]
+    fn parses_tcp_known_hosts_and_refuses_two_trust_options() {
+        let Command::Handshake { options: o, .. } = parse_args(&args(&[
+            "handshake",
+            "h",
+            "--known-hosts",
+            "/some/known_hosts",
+        ]))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            o.trust.known_hosts_file().and_then(|p| p.to_str()),
+            Some("/some/known_hosts")
+        );
+        let e = parse_args(&args(&[
+            "handshake",
+            "h",
+            "--known-hosts",
+            "kh",
+            "--host-key-sha256",
+            PIN,
+        ]))
+        .err()
+        .unwrap()
+        .0;
+        assert!(e.contains("exactly one"), "{e}");
+        assert!(
+            parse_args(&args(&[
+                "handshake",
+                "h",
+                "--host-key-sha256",
+                PIN,
+                "--host-key-sha256",
+                PIN
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
 # Fuzzing
 
-Status: rounds 3–4, 2026-09-20. Coverage-guided libFuzzer harnesses exist for
+Status: rounds 3–5, 2026-09-26. Coverage-guided libFuzzer harnesses exist for
 every implemented protocol surface, including (round 4) the KEX/service/
 EXT_INFO codecs, key and signature blobs, algorithm negotiation, AES-GCM
-packet protection and the complete client handshake state machine. Nothing
+packet protection and the complete client handshake state machine, and
+(round 5) strict SPKI conversion, `known_hosts` parsing/matching/decisions
+and the OpenSSH private-key validation adapter. Nothing
 here fuzzes the upstream TLS/QUIC stack, authentication or SFTP (see
 [Future targets](#future-targets)); the QUIC diagnostic adapter is covered by
 deterministic in-memory tests rather than a libFuzzer target (see
@@ -19,7 +21,7 @@ lockfile, `fuzz_targets/`, committed `seeds/` and ignored `corpus/`,
 | Workspace | Crate under test | Features | Why separate |
 |---|---|---|---|
 | `fuzz/wire-core` | `tatami-wire` | defaults off, **no `alloc`** | Proves the allocation-free configuration; the harness is `std` but the library is not. `cargo tree -e features` in that directory shows `tatami-wire` with no features. |
-| `fuzz/protocol` | `tatami-tcp` (`std,kex`), `tatami-keys` (`ed25519`), `tatami-connection`, `tatami` (`std,tcp,kex`), `tatami-wire` (`alloc`) | explicit | State machines, reports and owned helpers. `serde_json` and the harness-side crypto (`ed25519-dalek` with signing, `x25519-dalek`, `aes-gcm`, `sha2`, `rand_core`) are present only here, as independent oracles and as the fuzz "server". |
+| `fuzz/protocol` | `tatami-tcp` (`std,kex`), `tatami-keys` (`ed25519,known-hosts,openssh-key`), `tatami-connection`, `tatami` (`std,tcp,kex`), `tatami-wire` (`alloc`) | explicit | State machines, reports and owned helpers. `serde_json` and the harness-side crypto (`ed25519-dalek` with signing, `x25519-dalek`, `aes-gcm`, `sha2`, `rand_core`, and `sha1` under the harness's own RFC 2104 HMAC) are present only here, as independent oracles and as the fuzz "server". |
 
 Harness dependencies (`libfuzzer-sys`, `arbitrary`, `serde_json`, the
 harness-side crypto crates) never appear in any production `Cargo.toml`
@@ -93,6 +95,7 @@ Arguments after `--` are passed to libFuzzer verbatim (no `eval`). `run`
 prepends `-timeout`, `-rss_limit_mb` and a per-target `-max_len` (4 KiB for
 byte-oriented wire targets, 64 KiB for structured state targets, 512 KiB for
 the TCP stream targets so the 64 KiB packet cap and aggregate budgets are
+reachable, 20 KiB for `openssh_private_key` so its 16 KiB key-file cap is
 reachable); user arguments override them.
 
 **Replay semantics, verified:** libFuzzer with `-runs=0` and a corpus
@@ -107,7 +110,12 @@ seeds.
 An oracle is a rule that detects wrong behaviour; "did not panic" is the
 floor, not the oracle. Every target below has an independent reference
 written from the specification or the documented contract, not a copy of the
-library's code structure.
+library's code structure. The round-5 targets follow
+`fuzz-target-recipe.md`: each top comment states the API and input,
+limits and outcomes, the properties with their independent fixtures, and
+what is not covered; structure-aware generation is used only where raw
+mutation cannot reach the success path (valid base64 Ed25519 blobs,
+consistent private-key containers), and the reason is recorded there.
 
 | Target | Workspace | Input | Oracles |
 |---|---|---|---|
@@ -128,7 +136,10 @@ library's code structure.
 | `tcp_negotiation` (round 4) | protocol | client and server KEXINIT lists from pools of real methods, unknown names, all six markers and empty lists; `ClientProposal::encode` round trip | Independent RFC 4253 §7.1 model: first client name in the server list with markers excluded; MAC skipped when the selected cipher is an AEAD; `none` compression; strict-KEX pairing only for the same spelling (mixed spellings never enable); `ext_info` iff the server offered `ext-info-s`; guess correctness = first real method and first host-key algorithm equal; exact `Result` incl. `Direction` and every `StrictKex` field; `ClientProposal::encode` equals hand assembly; `check_profile` |
 | `tcp_gcm_packets` (round 4) | protocol | key/nonce from fuzz; sealed streams delivered under three chunk schedules; byte flips; truncation; huge/misaligned length claims; counters near `u64::MAX`; a 65 536-byte cap packet | Independent `Aes128Gcm` sealer in the harness (length prefix as AAD, padding to 16 with minimum 4, big-endian u64 nonce increment) agrees with `seal`; `open` round-trips payloads and counters; the four clear length bytes alone decide `TooLarge`/`TooSmall`/`Misaligned` (never `NeedMore`); any flipped byte → `TagMismatch`; truncated → `NeedMore`, never `Complete`; the buffer is byte-identical and no counter is spent on any failure; `CounterExhausted` exactly at the boundary. Characterised: a `BadPadding` rejection after a verified tag does spend one counter and is terminal |
 | `tcp_handshake` (round 4) | protocol | a harness *server* (its own X25519, exchange hash, mpint conversion, Ed25519 signing, RFC 4253 §7.2 derivation and AES-GCM) generates one transcript per input: identification ± prelude, KEXINIT from pools with markers/strict spellings and sometimes a wrong guess, optional IGNORE/DEBUG/UNIMPLEMENTED at chosen points, correct or corrupted `KEX_ECDH_REPLY` (bad signature, wrong `K_S` algorithm, all-zero `Q_S`, trailing bytes), `NEWKEYS`, then protected `EXT_INFO`/`SERVICE_ACCEPT` (right or wrong service)/`DISCONNECT`/`KEXINIT` (rekey), optional protected byte flip, EOF; fuzz-chosen trust decision; deterministic client RNG | The harness predicts the `HandshakeOutcome` code for every scenario (strict violation iff strict negotiated and a disallowed message precedes NEWKEYS; `SignatureInvalid` iff corrupted; `HostNotTrusted` iff `Untrusted`, and then no NEWKEYS bytes in the client output; `NegotiationFailed` per the negotiation model; `Completed` iff all valid and the accepted service is `ssh-userauth`; `RekeyNotSupported` iff server KEXINIT after NEWKEYS; `TagMismatch` iff a protected byte flipped); `user_authenticated` always false; protected packet counts vs the model; `session_id` equals the harness hash; the client's protected output is decrypted with the harness keys and its message numbers checked against the modelled sequence — message 50 (`USERAUTH_REQUEST`) never appears; byte-at-a-time ≡ chunked; `room()` respected; bounded driver panics on livelock |
-| `handshake_report_json` (round 4) | protocol | `tatami::client::handshake::Report` built from its public fields with mutated peer text and every `Completion` variant | `to_json` parses with `serde_json`; closed key set at every level with a fixed shape (`null`, never absent); closed `outcome_code`/phase/error-code sets; `user_authenticated` and `rekey_supported` false; fingerprint text form; `write_text` invariants (escaped peer text, fixed trailing lines) |
+| `handshake_report_json` (round 4; extended round 5) | protocol | `tatami::client::handshake::Report` built from its public fields with mutated peer text and every `Completion` variant (18, incl. `TrustConfiguration`); pin or `known_hosts` trust mode; every `UntrustedReason` | `to_json` parses with `serde_json`; closed key set at every level with a fixed shape (`null`, never absent); closed 18-code `outcome_code`/phase/error-code sets; `trust_policy` equals the mode, pin fields vs `known_hosts_file`/`known_hosts_lookup` mutually `null`; `trust_error` non-null iff a trust-configuration error, then both it and `untrusted_reason` equal its code; `untrusted_reason` of `HostNotTrusted` is `reason.code()`; `user_authenticated` and `rekey_supported` false; fingerprint text form; `write_text` invariants (escaped peer text, fixed trailing lines) |
+| `spki_conversion` (round 5) | protocol | selector byte: raw bytes into `ed25519_public_key_from_spki`, `spki_to_ssh_blob`, `ssh_blob_to_spki`; or a 32-byte seed whose derived key is wrapped canonically | Accepted **iff** the input is the hand-written 12-byte prefix `302a300506032b6570032100` plus 32 bytes `ed25519-dalek` accepts (one DER encoding per key, so a complete oracle with no DER code in the harness); accepted inputs map to the hand-layout blob and back to the same bytes; `spki_to_ssh_blob` fails exactly when parsing fails; `ssh_blob_to_spki` accepts exactly a hand-layout valid blob; an SPKI is never accepted as a blob or vice versa. Error variant precedence is not asserted |
+| `known_hosts` (round 5) | protocol | a small description decoded into `known_hosts` text (≤ 9 lines, ≤ 3 patterns, markers, K0/K1/K2/`ssh-rsa` keys, hashed names, one optional malformed line of five kinds), a lookup among four host/port pairs and an offered key; tail = glob check | Injected malformed line fails the file with exactly its line number and kind (never skipped, also in `@revoked`); `applies_to` equals the harness view (textbook DP glob on lowercased patterns, negation excludes, harness HMAC-SHA1 for hashed names); `decide` equals the contract (applicable revocation wins, else first applicable listing line trusts, else `key_changed`/`no_key_for_algorithm`/`certificate_authority_only`/`unknown_host`); unrelated appended entry leaves the decision unchanged; reversed lines keep the outcome code; an appended applicable `@revoked` line forces `revoked` at that line; a CA line with the offered key never trusts; `glob_match` equals the DP matcher |
+| `openssh_private_key` (round 5) | protocol | selector byte: raw key text (bounded by `-max_len`), or `seed, kind, x` building a PROTOCOL.key container with an independent writer, then one of 11 tampers | Any accepted key: public = `ed25519-dalek` derivation from the seed in its PKCS#8, PKCS#8 = RFC 8410 prefix `302e020100300506032b657004220420` + 32 bytes, `ssh_blob()` = hand layout. Structured: untampered accepted with exactly the fuzz seed; consistent-but-underived public keys → `PublicKeyMismatch` (the check `ssh-key` skips); outer/embedded mismatch, checkint mismatch, two keys, KDF on unencrypted, bad padding, trailing bytes, truncation → `Malformed`; `aes256-ctr`+`bcrypt` → `Encrypted` in well under 50 ms (no KDF linked) |
 
 Entry points covered by these targets or by deterministic tests:
 
@@ -142,6 +153,10 @@ Entry points covered by these targets or by deterministic tests:
 | `tatami_tcp::probe::Probe`, `observer::Observer` | `tcp_probe`, `tcp_observer` |
 | `tatami_wire::primitives::{read_mpint, write_mpint_positive}`, `kex::*`, `transport::{ServiceRequest, ServiceAccept}`, `ext_info::*` | `wire_kex_codecs` |
 | `tatami_keys::{blob, ed25519::HostKey, fingerprint, trust::PinnedSha256}` | `key_blobs`, unit tests with RFC 8032 vectors |
+| `tatami_keys::spki::*` | `spki_conversion`; unit tests pin the exact error per rejection class |
+| `tatami_keys::known_hosts::{KnownHosts::parse, policy_for, lookup_name, glob_match, Entry::applies_to}`, `KnownHostsPolicy::decide` | `known_hosts`; `Limits` errors and exact semantics in unit tests; `ssh-keygen -F` agreement in `tatami/tests/host_identity.rs` |
+| `tatami_keys::openssh_key::Ed25519HostPrivateKey::from_openssh` | `openssh_private_key` (`-max_len` 20 KiB reaches the 16 KiB `TooLarge` path); unit tests |
+| `tatami_keys::sshfp`, `tatami::trust`, `tatami::host::files`, `tatami_quic::diag::{identity::HostKeyIdentity, tls::SshHostKeyVerifier}`, `tatami::quic_diag` report/`--host-key` loading | unit tests, `tatami-quic/tests/host_key.rs` (in-memory), `tatami/tests/host_identity.rs` (OpenSSH); not libFuzzer targets |
 | `tatami_tcp::negotiate::{negotiate, ClientProposal}` | `tcp_negotiation` |
 | `tatami_tcp::gcm::AeadDirection::{seal, open}` | `tcp_gcm_packets` |
 | `tatami_tcp::transcript::*`, `handshake::ClientHandshake` | `tcp_handshake` (plus deterministic scripted-I/O tests and the OpenSSH interoperability tests in `tatami-tcp/tests/openssh_handshake.rs`) |
@@ -187,10 +202,19 @@ than truncated JSON.
 ## Seeds, corpora and artifacts
 
 `fuzz/<ws>/seeds/<target>/` holds small, individually named regression and
-deep-state fixtures (434 files across 18 targets, ~2 MB, including one 65 536-byte maximum
+deep-state fixtures (495 files across 21 targets, ~2.3 MB, including one 65 536-byte maximum
 packet). Provenance: hand-constructed from RFC layouts by the harness authors;
-the wire-core set is regenerable with `fuzz/wire-core/seeds/generate_seeds.py`.
-No traffic captures, keys or credentials. Seeds named `regression_*` come from
+the wire-core set is regenerable with `fuzz/wire-core/seeds/generate_seeds.py`
+and the round-5 key seeds (`spki_conversion` 17, `known_hosts` 27,
+`openssh_private_key` 15) deterministically with
+`fuzz/protocol/seeds/generate_key_seeds.py`: SPKI fixtures written by hand
+from RFC 8410 §4/§10.1 with one field changed per malformed seed;
+`known_hosts` and structured private-key seeds are descriptions whose keys
+are derived at run time; the raw private-key seeds are three throwaway
+`ssh-keygen` (OpenSSH_10.2p1) test fixtures (Ed25519, encrypted Ed25519,
+ECDSA) and a PKCS#8 PEM, all also used by the unit tests in
+`crates/tatami-keys/src/openssh_key.rs`. No traffic captures, real host keys
+or credentials. Seeds named `regression_*` come from
 minimized findings (see below). Evolved corpora (`corpus/`), crash artifacts
 (`artifacts/`) and coverage data are ignored by Git; CI preserves corpora in a
 bounded cache for trusted runs only and minimizes them with `cargo fuzz cmin`.
@@ -220,6 +244,7 @@ On a crash, timeout or oracle failure libFuzzer writes an artifact under
 | Probe driver reported a write-phase deadline as `RunEnd::Io` while the listener reported the same case as `TimedOut` | production (adapter) | Unified to `RunEnd::TimedOut`; the write path now recomputes its timeout between partial writes; scripted I/O tests cover both |
 | `handle_open_confirmation` did not reject a peer `sender_channel` already in use by another live channel | production (round-3 observation, fixed round 4) | `locate_reply`/`consume_reply` split; `DuplicatePeerNumber` rejected before any state change for live and late confirmations (tombstone kept); four regressions; the fuzz model now derives peer-number liveness from its own sets (`peer_number_live`) and asserts the invariant independently; seed `regression_duplicate_peer_number_on_confirmation` |
 | Scheduled `tcp_probe` failures (runs [35580802901](https://github.com/ekline/tatami-ssh/actions/runs/35580802901), [35705609489](https://github.com/ekline/tatami-ssh/actions/runs/35705609489)): `stream_gen::check_expectation` required exact event equality even when an unterminated description had a raw trailing tail, which the parser (correctly) decodes as packets; a tail holding a valid `SSH_MSG_IGNORE` added one `Skipped(Ignored)` event the model does not describe | harness | Fixed: with a raw tail after a nonterminal description, the modeled events must be an exact prefix and any further events must be packet-stage (`Skipped`); exact equality otherwise. Driver agreement, terminal and identification checks unchanged. Regression seed `regression_raw_tail_ignore` (hand-reduced 27-byte input, in `tcp_probe` and `tcp_observer`; the original CI artifacts were not available locally); harness unit tests in `tcp_support::stream_gen::tests`, run by `scripts/fuzz.sh lint`, include negative checks that missing and forbidden extra events still fail |
+| Round 5, `handshake_report_json`: the TCP report's text form printed a trust-configuration error containing the operator-supplied `known_hosts` path unescaped, so control bytes reached the terminal | production | Fixed: the message is escaped in `crates/tatami/src/client.rs`, and the QUIC report's "not attempted" line likewise; regression test `trust_configuration_error_text_is_escaped`; seeds `handshake_report_json/regression_trust_error_path_escaped_*`. No findings in `spki_conversion`, `known_hosts` or `openssh_private_key` |
 | Round-4 harness bugs (all fixed, none production): `wire_kex_codecs` expected the lazy EXT_INFO iterator to stop before yielding its terminal error; `tcp_gcm_packets` seeded a counter at `u64::MAX` in the general path; `tcp_handshake` model omitted that `kexinit_was_first_packet` is recorded before the KEXINIT body decodes (minimized input kept as `seeds/tcp_handshake/regression_malformed_kexinit_first_recorded`); `handshake_report_json` assumed optional keys are absent rather than `null` | harness | Fixed; oracle sabotage checks (little-endian assembler, mpint sign-byte rule, mixed strict spellings) each made replay fail as intended |
 
 ## Deterministic host I/O tests
@@ -255,6 +280,12 @@ libFuzzer target wraps it: the state that Tatami owns is a thin driver over
 quinn-proto, and a mutation campaign over TLS records would be fuzzing the
 upstream stack, which this project does not claim to do. Tatami's own
 adapter states, deadlines and limits are covered by the enumerated tests.
+The round-5 SSH host-key verifier is covered the same way
+(`tests/host_key.rs`: pin and `known_hosts` success; changed, revoked,
+unknown and negated entries; certificate peer refused; X.509 client refused
+by a host-key server; a host key cannot be presented as a certificate; a
+trusted key with a foreign `CertificateVerify` signature fails); the SPKI
+conversion it relies on is fuzzed by `spki_conversion`.
 
 ## CI policy
 
@@ -363,8 +394,28 @@ directory before the instrumented run: cargo-fuzz runs each directory as a
 separate process writing the same `default-<target>.profraw`, so a second
 directory used to overwrite the first profile.
 
+Round 5, same host and **local fallback configuration** (stable rustc
+1.98.1 with `RUSTC_BOOTSTRAP=1`, sanitizer `none` — **not** ASan —
+cargo-fuzz 0.13.1): `scripts/fuzz.sh lint` passed; `build` succeeded;
+`replay` of all 21 targets passed; then 60 s campaigns with `-seed=5`:
+
+| Target | 60 s execs | findings |
+|---|---|---|
+| spki_conversion | 5 643 088 | 0 |
+| known_hosts | 202 540 | 0 |
+| openssh_private_key | 2 045 669 | 0 |
+| handshake_report_json (after the fix above) | 163 494 | 0 |
+
+These campaigns predate the `openssh_private_key` `-max_len` change and ran
+with 4096, so they did not reach `TooLarge`. After the follow-up fixes (TCP
+`trust_error` code, the new `-max_len`), `lint`, `build` and `replay` of all
+21 targets passed again; no campaign was rerun.
+
+No round-5 coverage figures are recorded here.
+
 ASan runs and the pinned nightly were not executed locally (no rustup on the
-development machine); they run in CI. No coverage percentage is a goal in
+development machine); they run in CI, and for the round-5 targets that CI
+evidence has not yet been observed. No coverage percentage is a goal in
 itself.
 
 ## Future targets
@@ -373,7 +424,7 @@ Recorded so the next slices arrive with harnesses, not claimed as fuzzed:
 
 | Future surface | Target requirements |
 |---|---|
-| `known_hosts`/`authorized_keys` policy, RSA/ECDSA/certificate blobs | Policy engine model with distinct host-trust vs user-authorization decisions; further blob layouts; never a private key in a corpus (Ed25519 blobs, signatures, fingerprints and the pinned policy are covered by `key_blobs`) |
+| `authorized_keys` policy, RSA/ECDSA/certificate blobs, `@cert-authority` | Policy engine model with distinct host-trust vs user-authorization decisions; further blob layouts; never a real private key in a corpus (Ed25519 blobs, signatures, fingerprints and the pinned policy are covered by `key_blobs`; the `known_hosts` subset by `known_hosts`; only synthetic test keys appear in `openssh_private_key`) |
 | Rekeying and general sessions | Rekey state model (second exchange hash distinct from the session id), sequence-number and counter behaviour across re-keys, key-usage limits; the diagnostic currently refuses rekey and is fuzzed only for that refusal |
 | Userauth (`tatami-auth`) | Method state machines with a model of allowed transitions; signature-input construction against hand-assembled bytes; session-identifier provenance preserved |
 | QUIC stream association and flow control | Association registry model (stream IDs vs SSH numbers), pending/refused stream reclamation, SSH-window vs QUIC-credit separation; only after the record format (AQ-018) exists |

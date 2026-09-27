@@ -31,10 +31,12 @@
 //!   as the QUIC idle timeout; the server is bounded by `max_concurrent`,
 //!   `max_connections` and `run_for`; records flow through a bounded channel
 //!   with drop counting (W-22).
-//! - **Identity.** A generated Ed25519 test identity ([`identity`]). The
-//!   client trusts either a pinned certificate SHA-256 or an explicit test
-//!   root; there is no system trust store. Pin comparison is the only trust
-//!   decision made, and only its *outcome* is reported.
+//! - **Identity.** Either a generated Ed25519 X.509 test identity, or an SSH
+//!   Ed25519 host key presented as an RFC 7250 raw public key
+//!   ([`identity`]). The client trusts a pinned certificate SHA-256, an
+//!   explicit test root, a pinned SPKI SHA-256, or — for SSH host keys — the
+//!   same `known_hosts`/SSH-fingerprint policy the TCP handshake uses. There
+//!   is no system trust store.
 //!
 //! # Address validation, Retry and identity are three different things
 //!
@@ -51,8 +53,8 @@
 //!
 //! | Module | Contents |
 //! |---|---|
-//! | [`identity`] | `TestIdentity` (rcgen Ed25519 self-signed cert, PEM persistence), certificate fingerprint, SPKI helpers |
-//! | [`tls`] | rustls glue: recording `ResolvesServerCert`, pinned verifiers, QUIC crypto configs |
+//! | [`identity`] | `TestIdentity` (rcgen Ed25519 self-signed cert, PEM persistence), `HostKeyIdentity` (SSH host key as raw public key), certificate fingerprint |
+//! | [`tls`] | rustls glue: recording `ResolvesServerCert`, pinned verifiers, SSH host-key verifier, QUIC crypto configs |
 //! | [`server`] | `DiagServerConfig`, sans-I/O `ServerCore`, `DiagServer` (bound UDP socket, blocking run), events |
 //! | [`client`] | `DiagClientConfig`, sans-I/O `ClientCore`, blocking `run`, `ClientOutcome` |
 //! | [`inmem`] | Two cores exchanging datagrams through queues, for tests |
@@ -113,6 +115,8 @@ pub enum ConfigError {
     ServerName(String),
     /// The exporter probe length is zero or over 255 bytes.
     Exporter(&'static str),
+    /// The identity cannot be presented in the requested mode.
+    IdentityMode(&'static str),
 }
 
 impl core::fmt::Display for ConfigError {
@@ -126,6 +130,7 @@ impl core::fmt::Display for ConfigError {
             ConfigError::Quic(e) => write!(f, "QUIC crypto configuration rejected: {e}"),
             ConfigError::ServerName(n) => write!(f, "invalid server name {n:?}"),
             ConfigError::Exporter(why) => write!(f, "invalid exporter probe: {why}"),
+            ConfigError::IdentityMode(why) => write!(f, "invalid identity mode: {why}"),
         }
     }
 }

@@ -35,7 +35,7 @@ fn cryptos(identity: &TestIdentity) -> (Arc<QuicClientConfig>, Arc<QuicServerCon
     )
     .unwrap();
     let server = server_crypto(
-        identity,
+        &identity.clone().into(),
         &[ALPN.to_vec()],
         hello_slot(),
         ServerIdentityMode::Certificate,

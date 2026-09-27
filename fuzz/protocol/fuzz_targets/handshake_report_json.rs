@@ -5,9 +5,11 @@
 //! # Input layout
 //!
 //! ```text
-//! byte 0     completion selector (17 variants incl. host-side ends)
+//! byte 0     completion selector (18 variants incl. host-side ends)
 //! byte 1     bit 0: attach a `HandshakeReport`; bit 1: peer/local present;
-//!            bit 2: elapsed present; bit 3: signal EOF to the state machine
+//!            bit 2: elapsed present; bit 3: signal EOF to the state machine;
+//!            bit 4: `known_hosts` trust mode (else pin); bits 5-7: untrusted
+//!            reason / trust-configuration error selector
 //! u16        port
 //! 32 bytes   pin digest
 //! u8 + bytes host name (len mod 40, lossy text)
@@ -29,10 +31,15 @@
 //!   elapsed, `peer`/`local` iff connected).
 //! - `schema == 1`, `event == "tcp_handshake"`, `user_authenticated == false`,
 //!   `rekey_supported == false`, `outcome_code == completion.code()` from
-//!   the closed 17-string set, `negotiation_error_code` from the closed
+//!   the closed 18-string set, `negotiation_error_code` from the closed
 //!   six-string set, `phase` from the closed seven-string set, `target`
-//!   echoes host/port, `pinned_fingerprint_sha256` is `SHA256:` + 43
-//!   unpadded base64 characters equal to `pin.to_string()`,
+//!   echoes host/port, `trust_policy == trust.mode()`; in pin mode
+//!   `pinned_fingerprint_sha256` is `SHA256:` + 43 unpadded base64 characters
+//!   equal to `pin.to_string()` and the `known_hosts_*` fields are `null`;
+//!   in `known_hosts` mode the reverse, with `known_hosts_lookup` echoing the
+//!   bound name; `trust_error` is non-null iff the completion is a trust
+//!   configuration error, and then `untrusted_reason` is its code;
+//!   `untrusted_reason` of `HostNotTrusted` is `reason.code()`,
 //!   `key_exchange_completed == newkeys_sent && newkeys_received`, counters
 //!   echo the report, `host_key.fingerprint_sha256 == fingerprint_sha256`.
 //! - `write_text` succeeds, contains `user_authenticated: false`,
@@ -44,12 +51,16 @@ use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value as J;
-use tatami::client::handshake::{Completion, Report};
+use std::path::PathBuf;
+
+use tatami::client::handshake::{Completion, Report, TrustConfig, TrustConfigError};
+use tatami::host::files::FileError;
 use tatami_fuzz_protocol::kex_support::base64;
 use tatami_fuzz_protocol::kex_support::crypto::HarnessRng;
 use tatami_fuzz_protocol::kex_support::negotiate_ref;
 use tatami_fuzz_protocol::tcp_support::Cursor;
 use tatami_keys::fingerprint::Sha256Fingerprint;
+use tatami_keys::known_hosts::{KnownHostsError, LookupNameError, Malformed};
 use tatami_keys::trust::UntrustedReason;
 use tatami_tcp::handshake::{
     ClientHandshake, HandshakeConfig, HandshakeOutcome, HandshakeReport, LimitKind, Phase,
@@ -59,7 +70,7 @@ use tatami_tcp::initial::InputOverflow;
 use tatami_tcp::io::ConnectError;
 use tatami_tcp::negotiate::{Direction, NegotiationError};
 
-const OUTCOME_CODES: [&str; 17] = [
+const OUTCOME_CODES: [&str; 18] = [
     "completed",
     "host_not_trusted",
     "signature_invalid",
@@ -76,6 +87,7 @@ const OUTCOME_CODES: [&str; 17] = [
     "timed_out",
     "io_error",
     "connect_failed",
+    "trust_configuration_error",
     "not_started",
 ];
 
@@ -98,6 +110,8 @@ const ALLOWED_KEYS: &[&str] = &[
     "peer",
     "local",
     "pinned_fingerprint_sha256",
+    "known_hosts_file",
+    "known_hosts_lookup",
     "phase",
     "client_identification",
     "server_prelude_lines",
@@ -115,7 +129,9 @@ const ALLOWED_KEYS: &[&str] = &[
     "trust_policy",
     "host_trusted",
     "trust_source",
+    "trust_line",
     "untrusted_reason",
+    "trust_error",
     "key_exchange_completed",
     "newkeys_sent",
     "newkeys_received",
@@ -192,7 +208,11 @@ const ALLOWED_KEYS: &[&str] = &[
 
 /// Keys that are `null` when the datum is unknown (the record is a fixed
 /// shape).
-const OPTIONAL_KEYS: [&str; 21] = [
+const OPTIONAL_KEYS: [&str; 25] = [
+    "known_hosts_file",
+    "known_hosts_lookup",
+    "trust_line",
+    "trust_error",
     "peer",
     "local",
     "phase",
@@ -247,14 +267,23 @@ fn io_error(sel: u8) -> std::io::Error {
     std::io::Error::new(kind, "harness error text")
 }
 
-fn completion(sel: u8, phase: Phase, addr: SocketAddr) -> Completion {
-    match sel % 17 {
+fn completion(sel: u8, reason_sel: u8, phase: Phase, addr: SocketAddr) -> Completion {
+    match sel % 18 {
         0 => Completion::Complete,
         1 => Completion::HostNotTrusted {
-            reason: if sel & 0x80 != 0 {
-                UntrustedReason::FingerprintMismatch
-            } else {
-                UntrustedReason::NoPolicy
+            reason: match reason_sel % 8 {
+                0 => UntrustedReason::FingerprintMismatch,
+                1 => UntrustedReason::NoPolicy,
+                2 => UntrustedReason::UnknownHost,
+                3 => UntrustedReason::KeyChanged {
+                    line: usize::from(sel),
+                },
+                4 => UntrustedReason::Revoked {
+                    line: usize::from(reason_sel),
+                },
+                5 => UntrustedReason::CertificateAuthorityOnly,
+                6 => UntrustedReason::NoKeyForAlgorithm,
+                _ => UntrustedReason::UnsupportedIdentity,
             },
         },
         2 => Completion::SignatureInvalid,
@@ -300,6 +329,20 @@ fn completion(sel: u8, phase: Phase, addr: SocketAddr) -> Completion {
             1 => ConnectError::Resolve(io_error(sel)),
             2 => ConnectError::AllAttemptsFailed(vec![(addr, io_error(sel))]),
             _ => ConnectError::TimedOut(vec![(addr, io_error(sel)), (addr, io_error(sel >> 1))]),
+        }),
+        16 => Completion::TrustConfiguration(match reason_sel % 3 {
+            0 => TrustConfigError::LookupName(LookupNameError::InvalidCharacter),
+            1 => TrustConfigError::Malformed {
+                path: PathBuf::from("kh\u{1}"),
+                error: KnownHostsError::Malformed {
+                    line: usize::from(sel),
+                    what: Malformed::Base64,
+                },
+            },
+            _ => TrustConfigError::File(FileError::TooLarge {
+                path: PathBuf::from("kh"),
+                limit: 1 << 20,
+            }),
         }),
         _ => Completion::NotStarted(io_error(sel)),
     }
@@ -413,12 +456,23 @@ fuzz_target!(|data: &[u8]| {
     } else {
         SocketAddr::from((Ipv6Addr::LOCALHOST, port))
     };
-    let completion = completion(sel, phase, addr);
+    let completion = completion(sel, flags >> 5, phase, addr);
+    let known_hosts_mode = flags & 0x10 != 0;
+    let lookup = format!("[{host}]:{port}");
+    let (trust, lookup_name) = if known_hosts_mode {
+        (
+            TrustConfig::KnownHostsFile(PathBuf::from("fixture_known_hosts")),
+            Some(lookup.clone()),
+        )
+    } else {
+        (TrustConfig::Pin(pin), None)
+    };
     let connected = flags & 2 != 0;
     let report = Report {
         host: host.clone(),
         port,
-        pin,
+        trust,
+        lookup_name,
         peer: connected.then_some(addr),
         local: connected.then_some(SocketAddr::from((
             Ipv4Addr::LOCALHOST,
@@ -443,7 +497,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(json["target"]["port"], J::from(u64::from(port)));
     assert_eq!(json["user_authenticated"], J::Bool(false));
     assert_eq!(json["rekey_supported"], J::Bool(false));
-    assert_eq!(json["trust_policy"], "pinned_fingerprint");
+    assert_eq!(json["trust_policy"], report.trust.mode());
     let code = json["outcome_code"]
         .as_str()
         .expect("outcome_code is a string");
@@ -452,10 +506,30 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(report.is_complete(), code == "completed");
     assert_eq!(report.completion.is_complete(), report.is_complete());
     assert!(json["outcome"].as_str().is_some_and(|s| !s.is_empty()));
-    check_fingerprint_text(
-        json["pinned_fingerprint_sha256"].as_str().expect("string"),
-        &pin,
-    );
+    if known_hosts_mode {
+        assert_eq!(json["trust_policy"], "known_hosts");
+        assert!(json["pinned_fingerprint_sha256"].is_null());
+        assert_eq!(json["known_hosts_file"], "fixture_known_hosts");
+        assert_eq!(json["known_hosts_lookup"], J::String(lookup));
+    } else {
+        assert_eq!(json["trust_policy"], "pinned_fingerprint");
+        check_fingerprint_text(
+            json["pinned_fingerprint_sha256"].as_str().expect("string"),
+            &pin,
+        );
+        assert!(json["known_hosts_file"].is_null());
+        assert!(json["known_hosts_lookup"].is_null());
+    }
+    match &report.completion {
+        Completion::TrustConfiguration(e) => {
+            assert_eq!(json["trust_error"], e.code());
+            assert_eq!(json["untrusted_reason"], e.code());
+            assert!(
+                ["io_error", "malformed_configuration", "invalid_lookup_name"].contains(&e.code())
+            );
+        }
+        _ => assert!(json["trust_error"].is_null()),
+    }
     // Optional data is `null`, never absent and never guessed.
     for k in OPTIONAL_KEYS {
         assert!(
@@ -501,6 +575,13 @@ fuzz_target!(|data: &[u8]| {
                 "service_accepted",
                 "server_disconnect",
             ] {
+                // A trust-configuration error (checked above) reports its
+                // code as `untrusted_reason` without any handshake.
+                if k == "untrusted_reason"
+                    && matches!(report.completion, Completion::TrustConfiguration(_))
+                {
+                    continue;
+                }
                 assert!(
                     json[k].is_null(),
                     "{k} without a handshake report must be null"

@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use tatami_quic::diag::client::{DiagClientConfig, ExporterProbe, HandshakeResult};
 use tatami_quic::diag::identity::{
-    ED25519_SPKI_PREFIX, SpkiSha256, TestIdentity, raw_ed25519_to_spki, spki_ed25519_to_raw,
+    ED25519_SPKI_PREFIX, ServerIdentity, SpkiSha256, TestIdentity, raw_ed25519_to_spki,
+    spki_ed25519_to_raw,
 };
 use tatami_quic::diag::inmem::Pair;
 use tatami_quic::diag::inmem::raw_handshake;
@@ -129,7 +130,7 @@ fn raw_public_key_peer_identity_is_the_spki_and_x509_peer_identity_is_the_certif
         )
         .unwrap(),
         server_crypto(
-            &id,
+            &id.clone().into(),
             &[ALPN.to_vec()],
             hello_slot(),
             ServerIdentityMode::RawPublicKey,
@@ -187,7 +188,7 @@ fn raw_public_key_peer_identity_is_the_spki_and_x509_peer_identity_is_the_certif
         )
         .unwrap(),
         server_crypto(
-            &id,
+            &id.clone().into(),
             &[ALPN.to_vec()],
             hello_slot(),
             ServerIdentityMode::Certificate,
@@ -302,6 +303,9 @@ fn raw_public_key_client_against_x509_server_fails() {
         Some(&["RawPublicKey".to_string()][..])
     );
     // A certificate's SHA-256 is never an SPKI's.
-    let cert_as_spki = SpkiSha256::of_der(sc.identity.certificate_der());
+    let ServerIdentity::Test(test_id) = &sc.identity else {
+        panic!("test identity expected");
+    };
+    let cert_as_spki = SpkiSha256::of_der(test_id.certificate_der());
     assert_ne!(cert_as_spki, pin);
 }

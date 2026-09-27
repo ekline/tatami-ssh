@@ -18,7 +18,10 @@ use quinn_proto::crypto::rustls::HandshakeData;
 use quinn_proto::{Connection, ConnectionHandle, DatagramEvent, Endpoint, Event, VarInt};
 
 use super::server::connection_error_text;
-use super::tls::{ClientTrust, ServerNameKind, check_server_name, client_crypto};
+use super::tls::{
+    ClientTrust, IdentitySlot, ServerNameKind, SshIdentityCheck, check_server_name,
+    client_crypto_recording, identity_slot,
+};
 use super::udp::{recv_with_timeout, send_all};
 use super::{
     ConfigError, DEFAULT_HANDSHAKE_TIMEOUT, Datagram, QUIC_VERSION_1, endpoint_config,
@@ -191,6 +194,9 @@ pub struct ClientOutcome {
     pub datagrams_sent: u64,
     /// Datagrams received from the socket.
     pub datagrams_received: u64,
+    /// What the SSH host-key verifier saw and decided (SSH host-key trust
+    /// modes only; `None` if the server never presented a key).
+    pub ssh_identity: Option<SshIdentityCheck>,
 }
 
 impl ClientOutcome {
@@ -214,6 +220,7 @@ pub struct ClientCore {
     outcome: ClientOutcome,
     decided: bool,
     buf: Vec<u8>,
+    identity_slot: IdentitySlot,
 }
 
 impl ClientCore {
@@ -224,7 +231,8 @@ impl ClientCore {
         out: &mut Vec<Datagram>,
     ) -> Result<Self, ConfigError> {
         let name_kind = config.validate()?;
-        let crypto = client_crypto(&config.trust, &config.alpn)?;
+        let slot = identity_slot();
+        let crypto = client_crypto_recording(&config.trust, &config.alpn, slot.clone())?;
         let mut client_config = quinn_proto::ClientConfig::new(crypto);
         client_config.transport_config(transport_config(config.handshake_timeout)?);
         client_config.version(QUIC_VERSION_1);
@@ -253,6 +261,7 @@ impl ClientCore {
             zero_rtt_attempted: false,
             datagrams_sent: 0,
             datagrams_received: 0,
+            ssh_identity: None,
         };
         let mut core = ClientCore {
             endpoint,
@@ -266,6 +275,7 @@ impl ClientCore {
             outcome,
             decided: false,
             buf: Vec::with_capacity(1500),
+            identity_slot: slot,
         };
         core.drive(now, out);
         Ok(core)
@@ -376,6 +386,9 @@ impl ClientCore {
 
     fn decide(&mut self, now: Instant) {
         self.decided = true;
+        if let Ok(mut s) = self.identity_slot.lock() {
+            self.outcome.ssh_identity = s.take();
+        }
         self.outcome.elapsed = now.saturating_duration_since(self.started);
         self.outcome.zero_rtt_attempted = self.conn.has_0rtt();
     }

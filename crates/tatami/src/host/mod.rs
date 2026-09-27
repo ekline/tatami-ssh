@@ -6,5 +6,6 @@
 //! is not portable and is not presented as such.
 
 pub mod environment;
+pub mod files;
 pub mod process;
 pub mod pty;

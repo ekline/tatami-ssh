@@ -45,3 +45,7 @@ rcgen = { version = "0.13.2", default-features = false, features = ["ring", "pem
 ring = { version = "0.17.14", default-features = false, optional = true }
 sha2 = { version = "0.10.9", default-features = false, optional = true }
 base64ct = { version = "1.6", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+# Test-only: the known_hosts policy the facade shares with this backend.
+tatami-keys = { workspace = true, features = ["known-hosts"] }

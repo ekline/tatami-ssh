@@ -13,7 +13,7 @@ decisions. Protocol design state lives in
 
 ## Status
 
-Early. What runs today (round 4, 2026-09-20):
+Early. What runs today (round 5, 2026-09-26):
 
 - **`tatami-client probe`** — connects to an SSH server, sends a client
   identification, and reports the server's identification and its initial
@@ -27,8 +27,9 @@ Early. What runs today (round 4, 2026-09-20):
   It observes early peer offers; it is **not an SSH service**.
 - **`tatami-client handshake`** (feature `kex`) — a genuine SSH transport
   handshake against a real server: `curve25519-sha256` key exchange,
-  `ssh-ed25519` host-key signature verification, an operator-supplied
-  fingerprint pin, `aes128-gcm@openssh.com` protected packets in both
+  `ssh-ed25519` host-key signature verification, host trust from an
+  operator-supplied fingerprint pin or an explicitly named `known_hosts`
+  file, `aes128-gcm@openssh.com` protected packets in both
   directions, strict KEX, `EXT_INFO` receive, `SERVICE_REQUEST` /
   `SERVICE_ACCEPT` for `ssh-userauth`, then a protected `DISCONNECT`. It
   never authenticates a user and never rekeys. Verified against a local
@@ -37,21 +38,29 @@ Early. What runs today (round 4, 2026-09-20):
   --transport quic`** (feature `quic-diag`) — a QUIC v1 + TLS 1.3
   **handshake observer experiment** on `quinn-proto` + `rustls`, built into
   the same two binaries. It completes and reports handshakes; it carries
-  **no SSH bytes** and is not SSH over QUIC.
+  **no SSH bytes** and is not SSH over QUIC. Since round 5 the server can
+  present an OpenSSH Ed25519 host key as an RFC 7250 raw public key, which
+  the client judges with the same pin or `known_hosts` entry as on TCP
+  ([below](#one-host-identity-across-tcp-and-quic)).
 
 Library pieces behind that: bounded SSH primitive codecs (including `mpint`)
 and `KEXINIT` / `KEX_ECDH_*` / `NEWKEYS` / `EXT_INFO` / service / transport /
 channel-opening codecs (`tatami-wire`); key and signature blobs, Ed25519
-verification, `SHA256:` fingerprints and the pinned trust policy
-(`tatami-keys`); identification and packet framing, negotiation, exchange
-hash and key derivation, AES-GCM packet protection, the probe/observer and
-handshake state machines, and blocking host adapters (`tatami-tcp`); a pure
+verification, `SHA256:` fingerprints, the trust policies (pin and read-only
+`known_hosts`), strict Ed25519 SPKI conversion, SSHFP values and unencrypted
+OpenSSH Ed25519 private-key decoding (`tatami-keys`); identification and
+packet framing, negotiation, exchange hash and key derivation, AES-GCM packet
+protection, the probe/observer and handshake state machines, and blocking
+host adapters (`tatami-tcp`); a pure
 channel-opening engine (`tatami-connection`); the QUIC diagnostic backend
-(`tatami-quic`, feature `quinn-backend`); and reporting (`tatami`).
+(`tatami-quic`, feature `quinn-backend`); and reporting, bounded file reads
+and trust selection (`tatami`).
 
-Not implemented: user authentication, rekeying, `known_hosts`, RSA/ECDSA or
-certificate host keys, compression, any cipher other than
-`aes128-gcm@openssh.com`, channels and data flow, PTY/exec/forwarding/SFTP,
+Not implemented: user authentication, rekeying, a TCP SSH server handshake,
+writing or enrolling `known_hosts` (or reading `~/.ssh` implicitly),
+`@cert-authority` and host certificates, encrypted host keys, RSA/ECDSA host
+keys, compression, any cipher other than `aes128-gcm@openssh.com`, channels
+and data flow, PTY/exec/forwarding/SFTP,
 and SSH over QUIC (the ALPN value is experimental and unregistered; record
 framing, control stream and session binding are open).
 
@@ -163,13 +172,22 @@ cargo run -p tatami --features std,tcp,kex --bin tatami-client -- \
 #          [--no-strict-kex] [--json]
 ```
 
-The pin is **required** and is the only trust decision. Take it from the
-server's own public key file (or another out-of-band source); never from a
-scan, a previous `probe` run, or the connection being pinned. A valid
-signature proves the peer holds the key; the pin decides whether that key is
-the expected one. Both are reported separately (`host_key_signature_valid`,
-`host_trusted`) and both gate `NEWKEYS`. There is no `known_hosts` reading,
-no prompt and no enrollment (`docs/decisions.md` W-32).
+Exactly one trust source is **required**: the pin, or `--known-hosts FILE`
+(read-only; see
+[One host identity across TCP and QUIC](#one-host-identity-across-tcp-and-quic)).
+Take the pin or entry from the server's own public key file (or another
+out-of-band source); never from a scan, a previous `probe` run, or the
+connection being checked. A valid signature proves the peer holds the key;
+the trust source decides whether that key is the expected one. Both are
+reported separately (`host_key_signature_valid`, `host_trusted`, with
+`trust_source`/`trust_line` or `untrusted_reason`) and both gate `NEWKEYS`.
+`untrusted_reason` lists every structured trust failure in one field: a
+policy reason (`fingerprint_mismatch`, `unknown_host`, `key_changed`,
+`revoked`, ...) once a key was judged, or the configuration code (`io_error`,
+`malformed_configuration`, `invalid_lookup_name`, also in `trust_error`) when
+no decision was made; the message is in `outcome`.
+`~/.ssh/known_hosts` is never read implicitly; there is no prompt and no
+enrollment (`docs/decisions.md` W-32, W-37).
 
 What it does: identification exchange, `KEXINIT` (offering exactly
 `curve25519-sha256`, `ssh-ed25519`, `aes128-gcm@openssh.com`, `none`, plus the
@@ -185,9 +203,10 @@ rekey (a server `KEXINIT` after `NEWKEYS` ends the run as
 other algorithm (`docs/decisions.md` W-29, W-33).
 
 Exit status: `0` only for `Completed`; `1` for any other outcome (untrusted
-host key, mismatched pin, negotiation failure, protocol error, timeout,
-connection refused); `2` usage error. The text report or `--json` object goes
-to stdout, progress to stderr; no key material appears in either.
+host key, mismatched pin, unusable `known_hosts` file, negotiation failure,
+protocol error, timeout, connection refused); `2` usage error. The text
+report or `--json` object goes to stdout, progress to stderr; no key
+material appears in either.
 
 A reproducible local fixture starts an ephemeral-key OpenSSH sshd on loopback
 and prints the exact pin and command:
@@ -202,7 +221,8 @@ scripts/openssh-fixture.sh stop     # kills sshd, deletes the key
 Observed against `OpenSSH_10.2p1` during development
 (`crates/tatami-tcp/tests/openssh_handshake.rs`,
 `crates/tatami/tests/handshake_cli.rs`; the tests skip when
-`/usr/sbin/sshd` is absent): default sshd — `Completed`, strict KEX
+`/usr/sbin/sshd` is absent, unless `TATAMI_REQUIRE_OPENSSH=1` makes that a
+failure, as CI sets it): default sshd — `Completed`, strict KEX
 negotiated under `kex-strict-s-v00@openssh.com`, `EXT_INFO` with
 `server-sig-algs` received, sshd log `Received disconnect …: tatami
 diagnostic complete [preauth]`; wrong pin — `HostNotTrusted`, no `NEWKEYS`
@@ -249,7 +269,81 @@ binding). Records are JSON Lines (`quic_listener_started`,
 `quic_handshake_observation`, `overload`, `quic_listener_stopped`). Exit
 status follows the TCP tools: 0 clean/complete, 1 failure or timeout, 2
 usage. What it settled and did not settle is in
-`docs/quic-observer-readiness.md`.
+`docs/quic-observer-readiness.md`. Instead of the test certificate the
+server can present an SSH host key (`--host-key`, next section).
+
+## One host identity across TCP and QUIC
+
+The same OpenSSH Ed25519 host key can serve an OpenSSH `sshd` on TCP and the
+QUIC diagnostic on UDP, and the client accepts both with one `known_hosts`
+entry (round 5). Build with `--features std,tcp,kex,quic-diag`:
+
+```sh
+# QUIC: the key sshd uses on TCP, presented as an RFC 7250 raw public key.
+cargo run -p tatami --features std,tcp,kex,quic-diag --bin tatami-server -- \
+  observe --transport quic --listen 127.0.0.1:2222 \
+  --alpn tatami-diag/0 --host-key /path/to/ssh_host_ed25519_key
+
+# TCP (sshd on 127.0.0.1:2222) and QUIC (UDP 2222) under the same entry.
+cargo run -p tatami --features std,tcp,kex,quic-diag --bin tatami-client -- \
+  handshake 127.0.0.1 --transport tcp --port 2222 \
+  --known-hosts /path/to/fixture_known_hosts
+
+cargo run -p tatami --features std,tcp,kex,quic-diag --bin tatami-client -- \
+  handshake 127.0.0.1 --transport quic --port 2222 \
+  --alpn tatami-diag/0 --known-hosts /path/to/fixture_known_hosts
+```
+
+- **Identity.** The complete SSH public-key blob, on both transports. The
+  QUIC client converts the server's raw public key strictly to that blob and
+  applies the same policy object as TCP; TLS `CertificateVerify` (QUIC) and
+  the signature over the exchange hash (TCP) are still verified. On QUIC,
+  `--host-key-sha256` is the SSH fingerprint `ssh-keygen -lf` prints, not a
+  certificate or SPKI hash; the SSH modes require a raw public key and refuse
+  a certificate, and `--cert-sha256`/`--root-cert` are unchanged. Reports
+  show the SSH fingerprint and the SSHFP value (`4 2 <hex>`, as `ssh-keygen
+  -r` prints) as fingerprint equivalence only: no DNS lookup or DNSSEC
+  validation takes place (W-36, W-40).
+- **Lookup name.** The host as typed, lowercased; `[host]:port` unless the
+  port is 22 (OpenSSH's rule), bound before connecting. TCP and UDP on the
+  same port number share an entry; different ports do not. The resolved
+  address, `--server-name` and QUIC path changes never replace it. The
+  intended convention is TCP 22 plus UDP 22; UDP 4433 is only the
+  experiment's default (W-38).
+- **`known_hosts` subset.** Read-only, explicit file only. Comments,
+  comma-separated patterns with `*`/`?`, `!` negation, `[host]:port`, hashed
+  `|1|` names and `@revoked`. An applicable revocation wins regardless of
+  line order; several keys per host (rotation) are allowed; unknown hosts
+  fail. Any malformed line or unknown marker (including in `@revoked`)
+  rejects the whole file before connecting (`trust_configuration_error`,
+  with the line number). `@cert-authority` and other-algorithm lines never
+  confer trust. Limits: 1 MiB, 16 KiB per line, 10 000 entries, 256 patterns
+  per line. Stricter than OpenSSH by design (W-37, W-41).
+- **Host key.** Unencrypted Ed25519 `openssh-key-v1` only, at most 16 KiB.
+  Encrypted keys are refused with a specific error and there is no
+  passphrase input. On Unix the file must not be group/other-accessible
+  (checked on the opened file); other platforms get no permission check.
+  The key is converted in memory; no certificate or copy is written.
+  `--host-key` excludes `--identity-dir`/`--generate-identity` (W-39).
+
+This demonstrates **identity continuity**, not SSH over QUIC: a trusted host
+key over QUIC/TLS is not an SSH session. No SSH byte crosses QUIC, no user is
+authenticated, and the QUIC report says `ssh_session: false`. Tatami has no
+TCP SSH server; OpenSSH is the TCP side.
+
+Observed during development (`crates/tatami/tests/host_identity.rs`, real
+`sshd` and `tatami-server --host-key` on the same TCP/UDP port number, one
+entry; skips when `/usr/sbin/sshd` or `ssh-keygen` is absent, fails instead
+with `TATAMI_REQUIRE_OPENSSH=1`) against
+`OpenSSH_10.2p1`: both transports report the fingerprint `ssh-keygen -lf`
+prints and the SSHFP value `ssh-keygen -r` prints; changed key, unknown host,
+wrong port, a port-22 entry for another port, negation, revocation before and
+after the positive line, a malformed file (no connection made) and replaced
+server keys fail; `ssh-keygen -H` hashed entries and rotation work; a
+certificate server is refused; bad host-key files (permissions, encrypted,
+a public key) and conflicting identity options are refused at startup; the
+file is never modified; matching agrees with `ssh-keygen -F` on 16 plain and
+hashed queries.
 
 ## Checks
 
@@ -258,19 +352,26 @@ scripts/check-workspace.sh
 ```
 
 Runs formatting, Clippy, the feature matrix (including `kex`, `std,tcp,kex`,
-`quic-diag`), tests, docs and (when the `thumbv7em-none-eabi` target is
-installed) core/alloc-only builds, including `tatami-tcp --features kex` and
-`tatami-keys --features ed25519` with no standard library. CI runs it on Rust
-1.85.0 and stable; the bare-metal build of the crypto features is a CI gate
-whose first run had not been observed at this writing
+`quic-diag`, `tatami-keys` `known-hosts`/`openssh-key`), dependency-graph
+checks (no `std`, TLS, resolver or `getrandom` crates in the portable key
+graphs; no private-key or TLS crates in the portable `kex` facade), tests,
+docs and (when the `thumbv7em-none-eabi` target is installed) core/alloc-only
+builds, including `tatami-tcp --features kex` and `tatami-keys --features
+known-hosts,openssh-key` with no standard library. CI runs it on Rust 1.85.0
+and stable, with OpenSSH installed and `TATAMI_REQUIRE_OPENSSH=1` so the
+OpenSSH interoperability tests fail rather than skip. Round 5 ran it locally
+on stable only (rustc 1.98.1, 529 tests, none skipped; bare-metal step
+skipped, target not installed); the 1.85, bare-metal and CI OpenSSH runs
+(non-root `sshd` on the runner included) are gates not yet observed
 (`docs/crypto-provider-audit.md`).
 
 ## Fuzzing
 
-Eighteen coverage-guided libFuzzer targets live in isolated workspaces under
+Twenty-one coverage-guided libFuzzer targets live in isolated workspaces under
 `fuzz/` and cover the implemented parsers, encoders and state machines
-(including negotiation, GCM packets, key blobs and the handshake) with
-independent oracles. See `docs/fuzzing.md` for setup, commands, oracles,
+(including negotiation, GCM packets, key blobs, the handshake, SPKI
+conversion, `known_hosts` and the private-key loader) with independent
+oracles. See `docs/fuzzing.md` for setup, commands, oracles,
 seeds, findings and CI policy. Quick start with rustup (`cargo-fuzz` is
 installed with **stable** and run under the pinned nightly, W-34):
 
@@ -286,15 +387,30 @@ Ordinary `cargo test` never depends on nightly, cargo-fuzz or the corpora.
 
 ## Next milestones
 
-1. **TCP:** full rekeying (client- and server-initiated, key rollover under
-   strict KEX) and `publickey` user authentication; then a `session` channel
-   with `exec`, data, window accounting, `EOF`/`CLOSE`; then local, remote
-   and SOCKS forwarding (`direct-tcpip`, `tcpip-forward`/`forwarded-tcpip`).
-2. **QUIC:** bootstrap (identification placement, control stream), the
-   exporter-derived session binding and its userauth integration, and the
-   channel-to-stream mapping — each measured against the TCP behaviour above,
-   not designed in isolation. No SSH-over-QUIC option exists.
-3. **After that:** PTY sessions and SFTP v3 (`docs/decisions.md` W-25).
+1. **Reusable TCP transport and rekeying:** both initiators, strict-KEX key
+   rollover, byte/time limits, preservation of the first session identifier,
+   and an interface userauth can use instead of the diagnostic's exit.
+2. **QUIC mapping proposal, then implementation:** identification placement,
+   control-stream bootstrap, bounded record framing, exporter binding and
+   userauth inputs, channel/stream association (one channel per
+   bidirectional stream, in-stream data framing), ordering and errors —
+   security-sensitive binding decisions written down and reviewed first. No
+   SSH-over-QUIC option exists.
+3. **Hostname resolution review:** an explicit shared resolver interface
+   instead of `ToSocketAddrs` (TCP) and first-address (QUIC); deadlines,
+   A/AAAA racing, caching, search domains, split DNS; explicit DNSSEC and
+   SSHFP policy. The logical trust name stays separate (W-38).
+4. **First authenticated command:** `publickey` userauth, channel data and
+   windows, stdout/stderr, `EOF`/`CLOSE` and exit status against OpenSSH,
+   then over QUIC; server privilege/process boundaries specified first. Git,
+   PTY, forwarding/SOCKS and SFTP v3 (W-25) follow.
 
-Pending gates: the remote fuzz CI run with ASan after the W-34 install fix,
-and the first CI bare-metal build of the `kex`/`ed25519` features.
+Also deferred: encrypted host keys, signing agents/HSMs, `@cert-authority`
+and host certificates, implicit `~/.ssh` files and enrollment, and SSHFP/DNSSEC
+verification.
+
+Pending gates: the remote fuzz CI run with ASan (including the round-5
+targets), Rust 1.85 on the round-5 code, the first CI bare-metal build of
+the `kex`/`ed25519`/`known-hosts`/`openssh-key` features, and the first CI run
+of the OpenSSH tests with `TATAMI_REQUIRE_OPENSSH=1` (non-root `sshd` on the
+runner is unverified).

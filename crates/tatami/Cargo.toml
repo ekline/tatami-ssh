@@ -17,11 +17,20 @@ tcp = ["dep:tatami-tcp"]
 quic = ["dep:tatami-quic"]
 # Portable TCP key exchange, host-key verification and packet protection
 # (first interoperability profile; see docs/crypto-provider-audit.md).
-kex = ["tcp", "tatami-tcp?/kex", "tatami-keys/ed25519"]
+# Also enables read-only known_hosts parsing (portable), used by
+# `tatami-client handshake --known-hosts` with `std`.
+kex = ["tcp", "tatami-tcp?/kex", "tatami-keys/ed25519", "tatami-keys/known-hosts"]
 # Host-only QUIC/TLS diagnostic handshake backend (quinn-proto + rustls).
 # Requires std; pulls ring (C/asm). Adds `--transport quic` to the
-# tatami-client and tatami-server binaries (which also need `tcp`).
-quic-diag = ["std", "quic", "tatami-quic?/quinn-backend"]
+# tatami-client and tatami-server binaries (which also need `tcp`), with
+# SSH host keys as RFC 7250 raw public keys (OpenSSH key files, known_hosts).
+quic-diag = [
+    "std",
+    "quic",
+    "tatami-quic?/quinn-backend",
+    "tatami-keys/known-hosts",
+    "tatami-keys/openssh-key",
+]
 
 [dependencies]
 tatami-keys = { workspace = true }
@@ -34,6 +43,8 @@ tatami-quic = { workspace = true, optional = true }
 # Test-only: an independent JSON parser to validate JSON Lines output.
 # MSRV 1.56; never a dependency of any library target.
 serde_json = "1"
+# Test-only: decoding fixture public keys.
+base64ct = { version = "1.6", features = ["alloc"] }
 
 [[bin]]
 name = "tatami-client"

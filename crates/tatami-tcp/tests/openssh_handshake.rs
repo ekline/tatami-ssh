@@ -41,6 +41,10 @@ fn is_executable(path: &str) -> bool {
 fn openssh_available(test: &str) -> bool {
     for bin in [SSHD, SSH_KEYGEN] {
         if !is_executable(bin) {
+            assert!(
+                std::env::var_os("TATAMI_REQUIRE_OPENSSH").is_none(),
+                "{test}: {bin} is not executable but TATAMI_REQUIRE_OPENSSH is set"
+            );
             eprintln!(
                 "SKIP {test}: {bin} is not executable; OpenSSH interoperability not exercised"
             );

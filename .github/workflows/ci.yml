@@ -35,7 +35,17 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install OpenSSH (interoperability fixtures)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+          # Privilege-separation directory sshd expects even when it runs
+          # unprivileged on a loopback test port.
+          sudo mkdir -p /run/sshd
+          /usr/sbin/sshd -V 2>&1 || true
       - name: Workspace checks
         run: scripts/check-workspace.sh
         env:
           CHECK_EMBEDDED_REQUIRED: "1"
+          # OpenSSH interop tests must run, never skip, in CI.
+          TATAMI_REQUIRE_OPENSSH: "1"

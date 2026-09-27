@@ -2,5 +2,6 @@
 //! dependency of a production package.
 
 pub mod kex_support;
+pub mod keys_support;
 pub mod state_support;
 pub mod tcp_support;

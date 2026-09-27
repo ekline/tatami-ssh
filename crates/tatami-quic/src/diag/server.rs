@@ -40,7 +40,7 @@ use quinn_proto::{
     Incoming, VarInt,
 };
 
-use super::identity::{CertificateSha256, TestIdentity};
+use super::identity::{PresentedIdentity, ServerIdentity};
 use super::tls::{ClientHelloRecord, HelloSlot, ServerIdentityMode, hello_slot, server_crypto};
 use super::udp::{recv_with_timeout, send_all};
 use super::{
@@ -65,9 +65,10 @@ pub struct DiagServerConfig {
     /// explicit**: there is no default value; an empty list is rejected.
     /// Values are experimental and unregistered (AQ-019 / P-08).
     pub alpn: Vec<Vec<u8>>,
-    /// The test identity presented to clients.
-    pub identity: TestIdentity,
-    /// How the identity is presented (certificate by default).
+    /// The identity presented to clients.
+    pub identity: ServerIdentity,
+    /// How the identity is presented: certificate by default for a test
+    /// identity; always a raw public key for an SSH host key.
     pub identity_mode: ServerIdentityMode,
     /// Per-connection deadline from acceptance to handshake completion;
     /// also the QUIC idle timeout.
@@ -95,14 +96,21 @@ pub struct DiagServerConfig {
 }
 
 impl DiagServerConfig {
-    /// Defaults for everything except the two required inputs.
+    /// Defaults for everything except the two required inputs. An SSH host
+    /// key starts in `RawPublicKeyRecording` mode; a test identity in
+    /// `Certificate` mode.
     #[must_use]
-    pub fn new(identity: TestIdentity, alpn: Vec<Vec<u8>>) -> Self {
+    pub fn new(identity: impl Into<ServerIdentity>, alpn: Vec<Vec<u8>>) -> Self {
+        let identity = identity.into();
+        let identity_mode = match identity {
+            ServerIdentity::Test(_) => ServerIdentityMode::Certificate,
+            ServerIdentity::HostKey(_) => ServerIdentityMode::RawPublicKeyRecording,
+        };
         DiagServerConfig {
             bind: SocketAddr::from(([127, 0, 0, 1], 4433)),
             alpn,
             identity,
-            identity_mode: ServerIdentityMode::Certificate,
+            identity_mode,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             require_validation: false,
             max_connections: None,
@@ -118,6 +126,13 @@ impl DiagServerConfig {
     /// Checks limits and durations without touching the network.
     pub fn validate(&self) -> Result<(), ConfigError> {
         super::validate_alpn(&self.alpn)?;
+        if matches!(self.identity, ServerIdentity::HostKey(_))
+            && self.identity_mode == ServerIdentityMode::Certificate
+        {
+            return Err(ConfigError::IdentityMode(
+                "an SSH host key is presented only as an RFC 7250 raw public key; no certificate is manufactured",
+            ));
+        }
         if self.handshake_timeout.is_zero() {
             return Err(ConfigError::BadDuration("handshake_timeout"));
         }
@@ -356,8 +371,8 @@ pub struct CoreStats {
 pub struct Summary {
     /// Bound address.
     pub bound: SocketAddr,
-    /// Certificate fingerprint presented.
-    pub certificate_sha256: CertificateSha256,
+    /// Identity presented.
+    pub identity: PresentedIdentity,
     /// Counters.
     pub stats: CoreStats,
     /// Records that could not be queued.
@@ -379,8 +394,9 @@ pub enum ServerEvent {
     Started {
         /// Bound address.
         bound: SocketAddr,
-        /// Certificate fingerprint, so a client can pin it.
-        certificate_sha256: CertificateSha256,
+        /// The presented identity (certificate or SSH host-key
+        /// fingerprint), so a client can pin or list it.
+        identity: PresentedIdentity,
         /// ALPN values accepted.
         alpn: Vec<Vec<u8>>,
     },
@@ -444,7 +460,7 @@ pub struct ServerCore {
     stats: CoreStats,
     pending: Vec<HandshakeObservation>,
     accepting: bool,
-    certificate_sha256: CertificateSha256,
+    presented: PresentedIdentity,
 }
 
 impl ServerCore {
@@ -480,7 +496,7 @@ impl ServerCore {
             stats: CoreStats::default(),
             pending: Vec::new(),
             accepting: true,
-            certificate_sha256: config.identity.certificate_sha256_fingerprint(),
+            presented: config.identity.presented(),
         })
     }
 
@@ -490,10 +506,10 @@ impl ServerCore {
         self.stats
     }
 
-    /// Fingerprint of the presented certificate.
+    /// The presented identity.
     #[must_use]
-    pub fn certificate_sha256(&self) -> CertificateSha256 {
-        self.certificate_sha256
+    pub fn presented_identity(&self) -> PresentedIdentity {
+        self.presented
     }
 
     /// Handshakes in progress (not yet decided).
@@ -915,10 +931,10 @@ impl DiagServer {
         self.bound
     }
 
-    /// Fingerprint of the certificate that will be presented.
+    /// The identity that will be presented.
     #[must_use]
-    pub fn certificate_sha256(&self) -> CertificateSha256 {
-        self.core.certificate_sha256()
+    pub fn presented_identity(&self) -> PresentedIdentity {
+        self.core.presented_identity()
     }
 
     /// Handle for stopping the run from another thread.
@@ -965,7 +981,7 @@ impl DiagServer {
         emit(
             ServerEvent::Started {
                 bound: self.bound,
-                certificate_sha256: self.core.certificate_sha256(),
+                identity: self.core.presented_identity(),
                 alpn: self.config.alpn.clone(),
             },
             &mut records_dropped,
@@ -1057,7 +1073,7 @@ impl DiagServer {
         }
         let summary = Summary {
             bound: self.bound,
-            certificate_sha256: self.core.certificate_sha256(),
+            identity: self.core.presented_identity(),
             stats,
             records_dropped,
             abandoned,

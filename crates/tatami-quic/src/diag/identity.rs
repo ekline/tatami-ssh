@@ -1,9 +1,15 @@
-//! Generated Ed25519 **test** identity for the diagnostic handshake.
+//! Server identities for the diagnostic handshake.
 //!
-//! The identity is a self-signed X.509 certificate produced by `rcgen`
-//! (`PKCS_ED25519`) with its PKCS#8 private key. It exists only so a TLS 1.3
-//! handshake can complete; it is not a production identity (P-06 remains
-//! open) and no trust decision beyond an explicit pin is derived from it.
+//! - [`TestIdentity`]: a generated self-signed X.509 certificate (`rcgen`,
+//!   `PKCS_ED25519`) with its PKCS#8 key. It exists only so an X.509 TLS 1.3
+//!   handshake can complete; no trust beyond an explicit pin or test root is
+//!   derived from it.
+//! - [`HostKeyIdentity`]: an SSH Ed25519 host key presented as an RFC 7250
+//!   raw public key. The same key an OpenSSH server uses on TCP; no
+//!   certificate is manufactured for it.
+//!
+//! SPKI conversion is delegated to `tatami_keys::spki`, the one
+//! authoritative implementation.
 //!
 //! # Three fingerprints that are not the same thing
 //!
@@ -35,14 +41,7 @@ pub const CERT_FILE: &str = "cert.pem";
 /// File name of the PEM PKCS#8 private key inside an identity directory.
 pub const KEY_FILE: &str = "key.pem";
 
-/// Fixed 12-byte prefix of an Ed25519 `SubjectPublicKeyInfo` (RFC 8410 §4):
-/// `SEQUENCE(42) { SEQUENCE(5) { OID 1.3.101.112 }, BIT STRING(33) { 0 pad, key } }`.
-pub const ED25519_SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
-
-/// Total length of an Ed25519 SPKI DER.
-pub const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
+pub use tatami_keys::spki::{ED25519_SPKI_LEN, ED25519_SPKI_PREFIX, SpkiError};
 
 /// Failure to create, store or load a test identity.
 #[derive(Debug)]
@@ -65,6 +64,8 @@ pub enum IdentityError {
     },
     /// The key is not an Ed25519 PKCS#8 key this experiment supports.
     UnsupportedKey,
+    /// The private key's public half is not the expected SSH host key.
+    HostKeyMismatch,
     /// The identity directory already contains an identity.
     AlreadyExists(PathBuf),
     /// No identity in the directory and generation was not requested.
@@ -83,6 +84,9 @@ impl core::fmt::Display for IdentityError {
             }
             IdentityError::UnsupportedKey => {
                 f.write_str("identity key is not an Ed25519 PKCS#8 key")
+            }
+            IdentityError::HostKeyMismatch => {
+                f.write_str("the signing key's public key is not the expected SSH host key")
             }
             IdentityError::AlreadyExists(p) => write!(
                 f,
@@ -224,49 +228,167 @@ impl core::fmt::Display for FingerprintParseError {
 
 impl std::error::Error for FingerprintParseError {}
 
-/// Why an SPKI could not be reduced to a raw Ed25519 key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpkiError {
-    /// Length is not 44 bytes.
-    Length(usize),
-    /// The 12-byte prefix is not the Ed25519 `SubjectPublicKeyInfo` header.
-    Prefix,
-}
-
-impl core::fmt::Display for SpkiError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            SpkiError::Length(n) => write!(f, "SPKI is {n} bytes, Ed25519 SPKI is 44"),
-            SpkiError::Prefix => f.write_str("SPKI prefix is not the Ed25519 header (RFC 8410 §4)"),
-        }
-    }
-}
-
-impl std::error::Error for SpkiError {}
-
 /// Extracts the 32-byte Ed25519 public key from its `SubjectPublicKeyInfo`
-/// DER by checking the exact fixed prefix of RFC 8410 §4. This is a typed
-/// conversion, not a parser: any other algorithm or encoding is rejected.
+/// DER via the strict parser in `tatami_keys::spki` (any other algorithm,
+/// parameters, unused bits, non-canonical DER or an invalid point is
+/// rejected).
 pub fn spki_ed25519_to_raw(spki: &[u8]) -> Result<[u8; 32], SpkiError> {
-    if spki.len() != ED25519_SPKI_LEN {
-        return Err(SpkiError::Length(spki.len()));
-    }
-    let (prefix, key) = spki.split_at(ED25519_SPKI_PREFIX.len());
-    if prefix != ED25519_SPKI_PREFIX {
-        return Err(SpkiError::Prefix);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(key);
-    Ok(out)
+    tatami_keys::spki::ed25519_public_key_from_spki(spki).map(|k| *k.as_bytes())
 }
 
-/// Wraps a raw Ed25519 public key in its `SubjectPublicKeyInfo` DER.
+/// Wraps a raw Ed25519 public key in its `SubjectPublicKeyInfo` DER. The
+/// bytes are not validated as a point; use `tatami_keys::spki` for that.
 #[must_use]
 pub fn raw_ed25519_to_spki(key: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ED25519_SPKI_LEN);
     out.extend_from_slice(&ED25519_SPKI_PREFIX);
     out.extend_from_slice(key);
     out
+}
+
+/// An SSH Ed25519 host key presented over TLS as an RFC 7250 raw public
+/// key.
+///
+/// Built from the PKCS#8 form of the key (produced in memory by
+/// `tatami_keys::openssh_key`) and the expected SSH public-key blob. The
+/// provider loads the key from a **borrowed** buffer and the resulting
+/// public key must equal the expected one, so a mismatched pair is refused
+/// before any socket exists. This type holds no secret bytes itself; the
+/// signing key lives inside the provider (`ring`), whose internal copies are
+/// outside this crate's control.
+#[derive(Clone)]
+pub struct HostKeyIdentity {
+    signing: std::sync::Arc<dyn rustls::sign::SigningKey>,
+    spki: [u8; ED25519_SPKI_LEN],
+    ssh_blob: [u8; tatami_keys::blob::ED25519_BLOB_LEN],
+}
+
+impl core::fmt::Debug for HostKeyIdentity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostKeyIdentity")
+            .field("ssh_host_key_sha256", &self.ssh_fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostKeyIdentity {
+    /// Loads `pkcs8` with the backend provider and checks that its public
+    /// key is `expected_ssh_blob`.
+    pub fn from_pkcs8(pkcs8: &[u8], expected_ssh_blob: &[u8]) -> Result<Self, IdentityError> {
+        let der = PrivatePkcs8KeyDer::from(pkcs8);
+        let signing = rustls::crypto::ring::sign::any_eddsa_type(&der)
+            .map_err(|_| IdentityError::UnsupportedKey)?;
+        let spki_der = signing.public_key().ok_or(IdentityError::UnsupportedKey)?;
+        let key = tatami_keys::spki::ed25519_public_key_from_spki(spki_der.as_ref())
+            .map_err(|_| IdentityError::UnsupportedKey)?;
+        let ssh_blob = tatami_keys::spki::ssh_blob_of(&key);
+        if ssh_blob.as_slice() != expected_ssh_blob {
+            return Err(IdentityError::HostKeyMismatch);
+        }
+        Ok(HostKeyIdentity {
+            signing,
+            spki: tatami_keys::spki::ed25519_spki(&key),
+            ssh_blob,
+        })
+    }
+
+    /// The provider signing key.
+    #[must_use]
+    pub fn signing_key(&self) -> std::sync::Arc<dyn rustls::sign::SigningKey> {
+        self.signing.clone()
+    }
+
+    /// The SPKI DER sent as the raw public key.
+    #[must_use]
+    pub fn subject_public_key_info_der(&self) -> &[u8] {
+        &self.spki
+    }
+
+    /// The canonical `ssh-ed25519` public-key blob.
+    #[must_use]
+    pub fn ssh_blob(&self) -> &[u8] {
+        &self.ssh_blob
+    }
+
+    /// OpenSSH `SHA256:` fingerprint of the host key.
+    #[must_use]
+    pub fn ssh_fingerprint(&self) -> tatami_keys::Sha256Fingerprint {
+        tatami_keys::Sha256Fingerprint::of_blob(&self.ssh_blob)
+    }
+}
+
+/// What a diagnostic server presents.
+#[derive(Clone, Debug)]
+pub enum ServerIdentity {
+    /// A generated X.509 test certificate (or its SPKI in the raw-key
+    /// experiment modes).
+    Test(TestIdentity),
+    /// An SSH host key, always as an RFC 7250 raw public key.
+    HostKey(HostKeyIdentity),
+}
+
+impl From<TestIdentity> for ServerIdentity {
+    fn from(id: TestIdentity) -> Self {
+        ServerIdentity::Test(id)
+    }
+}
+
+impl From<HostKeyIdentity> for ServerIdentity {
+    fn from(id: HostKeyIdentity) -> Self {
+        ServerIdentity::HostKey(id)
+    }
+}
+
+impl ServerIdentity {
+    /// The public description reported in records.
+    #[must_use]
+    pub fn presented(&self) -> PresentedIdentity {
+        match self {
+            ServerIdentity::Test(t) => {
+                PresentedIdentity::Certificate(t.certificate_sha256_fingerprint())
+            }
+            ServerIdentity::HostKey(h) => PresentedIdentity::SshHostKey(h.ssh_fingerprint()),
+        }
+    }
+}
+
+/// Public description of the server identity, for records and logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentedIdentity {
+    /// SHA-256 of the X.509 certificate DER (not an SSH fingerprint).
+    Certificate(CertificateSha256),
+    /// OpenSSH `SHA256:` fingerprint of the SSH host key sent as a raw
+    /// public key.
+    SshHostKey(tatami_keys::Sha256Fingerprint),
+}
+
+impl PresentedIdentity {
+    /// Stable code for reports.
+    #[must_use]
+    pub const fn mode(&self) -> &'static str {
+        match self {
+            PresentedIdentity::Certificate(_) => "x509_test_certificate",
+            PresentedIdentity::SshHostKey(_) => "ssh_host_key_raw_public_key",
+        }
+    }
+
+    /// The certificate fingerprint, in certificate mode.
+    #[must_use]
+    pub const fn certificate_sha256(&self) -> Option<CertificateSha256> {
+        match self {
+            PresentedIdentity::Certificate(c) => Some(*c),
+            PresentedIdentity::SshHostKey(_) => None,
+        }
+    }
+
+    /// The SSH host-key fingerprint, in host-key mode.
+    #[must_use]
+    pub const fn ssh_host_key_sha256(&self) -> Option<tatami_keys::Sha256Fingerprint> {
+        match self {
+            PresentedIdentity::Certificate(_) => None,
+            PresentedIdentity::SshHostKey(f) => Some(*f),
+        }
+    }
 }
 
 /// A self-signed Ed25519 certificate with its private key.
@@ -611,10 +733,19 @@ mod tests {
 
     #[test]
     fn spki_conversion_rejects_other_encodings() {
-        assert_eq!(spki_ed25519_to_raw(&[0u8; 43]), Err(SpkiError::Length(43)));
-        let mut bad = raw_ed25519_to_spki(&[7u8; 32]);
+        assert!(matches!(
+            spki_ed25519_to_raw(&[0u8; 43]),
+            Err(SpkiError::UnexpectedTag { .. })
+        ));
+        let id = TestIdentity::generate_ed25519(&names()).unwrap();
+        let mut bad = id.subject_public_key_info_der().to_vec();
         bad[8] = 0x71; // Ed448 OID would be 1.3.101.113
-        assert_eq!(spki_ed25519_to_raw(&bad), Err(SpkiError::Prefix));
+        assert_eq!(
+            spki_ed25519_to_raw(&bad),
+            Err(SpkiError::UnsupportedAlgorithm {
+                known: Some("Ed448")
+            })
+        );
         let blob = TestIdentity::generate_ed25519(&names())
             .unwrap()
             .ssh_ed25519_blob();
@@ -694,6 +825,41 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_identity_checks_the_expected_blob() {
+        // An rcgen PKCS#8 Ed25519 key stands in for a converted host key.
+        let id = TestIdentity::generate_ed25519(&names()).unwrap();
+        let pkcs8 = id.key.secret_pkcs8_der().to_vec();
+        let blob = id.ssh_ed25519_blob();
+        let host = HostKeyIdentity::from_pkcs8(&pkcs8, &blob).unwrap();
+        assert_eq!(host.ssh_blob(), blob.as_slice());
+        assert_eq!(
+            host.subject_public_key_info_der(),
+            id.subject_public_key_info_der()
+        );
+        assert_eq!(
+            host.ssh_fingerprint(),
+            tatami_keys::Sha256Fingerprint::of_blob(&blob)
+        );
+        let other = TestIdentity::generate_ed25519(&names())
+            .unwrap()
+            .ssh_ed25519_blob();
+        assert!(matches!(
+            HostKeyIdentity::from_pkcs8(&pkcs8, &other),
+            Err(IdentityError::HostKeyMismatch)
+        ));
+        assert!(matches!(
+            HostKeyIdentity::from_pkcs8(&pkcs8[..pkcs8.len() - 1], &blob),
+            Err(IdentityError::UnsupportedKey)
+        ));
+        let dbg = std::format!("{host:?}");
+        assert!(dbg.contains("ssh_host_key_sha256"));
+        assert_eq!(
+            ServerIdentity::from(host).presented().mode(),
+            "ssh_host_key_raw_public_key"
+        );
     }
 
     #[test]
