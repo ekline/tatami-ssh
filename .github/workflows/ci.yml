@@ -20,7 +20,7 @@ jobs:
           - "1.85.0"
           - stable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain
         run: |
           rustup toolchain install ${{ matrix.toolchain }} --profile minimal \
@@ -28,7 +28,7 @@ jobs:
           rustup default ${{ matrix.toolchain }}
           cargo --version
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
