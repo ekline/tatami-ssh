@@ -31,6 +31,12 @@ quic-diag = [
     "tatami_ssh_keys/known-hosts",
     "tatami_ssh_keys/openssh-key",
 ]
+# Legacy OpenSSH hashed host names (`|1|salt|hash`, HMAC-SHA1) in
+# `--known-hosts` files. Off by default and deliberately not part of `kex` or
+# `quic-diag`: without it a hashed entry is an explicit
+# `unsupported_configuration` error. SHA-1 is reachable only through
+# `tatami_ssh_openssh_compat` (checked by scripts/check-sha1-boundary.py).
+openssh-hashed-hosts = ["tatami_ssh_keys/openssh-hashed-hosts"]
 
 [dependencies]
 tatami_ssh_keys = { workspace = true }

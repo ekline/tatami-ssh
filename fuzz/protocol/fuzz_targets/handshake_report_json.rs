@@ -60,7 +60,7 @@ use tatami_ssh_fuzz_protocol::kex_support::crypto::HarnessRng;
 use tatami_ssh_fuzz_protocol::kex_support::negotiate_ref;
 use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
 use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
-use tatami_ssh_keys::known_hosts::{KnownHostsError, LookupNameError, Malformed};
+use tatami_ssh_keys::known_hosts::{KnownHostsError, LookupNameError, Malformed, Unsupported};
 use tatami_ssh_keys::trust::UntrustedReason;
 use tatami_ssh_tcp::handshake::{
     ClientHandshake, HandshakeConfig, HandshakeOutcome, HandshakeReport, LimitKind, Phase,
@@ -330,8 +330,15 @@ fn completion(sel: u8, reason_sel: u8, phase: Phase, addr: SocketAddr) -> Comple
             2 => ConnectError::AllAttemptsFailed(vec![(addr, io_error(sel))]),
             _ => ConnectError::TimedOut(vec![(addr, io_error(sel)), (addr, io_error(sel >> 1))]),
         }),
-        16 => Completion::TrustConfiguration(match reason_sel % 3 {
+        16 => Completion::TrustConfiguration(match reason_sel % 4 {
             0 => TrustConfigError::LookupName(LookupNameError::InvalidCharacter),
+            3 => TrustConfigError::Malformed {
+                path: PathBuf::from("kh"),
+                error: KnownHostsError::Unsupported {
+                    line: usize::from(sel),
+                    what: Unsupported::HashedHostnames,
+                },
+            },
             1 => TrustConfigError::Malformed {
                 path: PathBuf::from("kh\u{1}"),
                 error: KnownHostsError::Malformed {
@@ -525,7 +532,13 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(json["trust_error"], e.code());
             assert_eq!(json["untrusted_reason"], e.code());
             assert!(
-                ["io_error", "malformed_configuration", "invalid_lookup_name"].contains(&e.code())
+                [
+                    "io_error",
+                    "malformed_configuration",
+                    "unsupported_configuration",
+                    "invalid_lookup_name"
+                ]
+                .contains(&e.code())
             );
         }
         _ => assert!(json["trust_error"].is_null()),

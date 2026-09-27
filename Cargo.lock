@@ -756,12 +756,20 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "ed25519-dalek",
- "hmac",
- "sha1",
  "sha2",
  "ssh-key",
+ "tatami_ssh_openssh_compat",
  "tatami_ssh_wire",
  "zeroize",
+]
+
+[[package]]
+name = "tatami_ssh_openssh_compat"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "hmac",
+ "sha1",
 ]
 
 [[package]]

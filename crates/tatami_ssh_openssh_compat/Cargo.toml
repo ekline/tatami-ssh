@@ -1,0 +1,18 @@
+[package]
+name = "tatami_ssh_openssh_compat"
+description = "Legacy OpenSSH hashed known_hosts hostname matching (HMAC-SHA1) for Tatami"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The only package in the workspace allowed to depend on `hmac` or a SHA-1
+# implementation; its only allowed dependent is `tatami_ssh_keys` (feature
+# `openssh-hashed-hosts`). Enforced by scripts/check-sha1-boundary.py; see
+# docs/crypto-provider-audit.md before changing versions or features.
+[dependencies]
+hmac = { version = "0.12.1", default-features = false }
+sha1 = { version = "0.10.7", default-features = false }
+base64ct = { version = "1.6", default-features = false }

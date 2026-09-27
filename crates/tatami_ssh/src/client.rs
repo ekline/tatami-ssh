@@ -503,7 +503,9 @@ pub mod handshake {
     //! ([`HandshakeOutcome::HostNotTrusted`], with the reason: fingerprint
     //! mismatch, unknown host, key changed, revoked, ...). A `known_hosts`
     //! file that cannot be read or parsed ends the run before connecting
-    //! ([`Completion::TrustConfiguration`]). Pins and entries must come from
+    //! ([`Completion::TrustConfiguration`]); so does a hashed `|1|` entry in
+    //! a build without `openssh-hashed-hosts` (`unsupported_configuration`).
+    //! Pins and entries must come from
     //! an independent channel, for example
     //! `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on the server.
     //!

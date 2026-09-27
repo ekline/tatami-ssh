@@ -39,6 +39,10 @@ fi
 step cargo fmt --all -- --check
 step cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 step cargo clippy --workspace --all-targets --all-features -- -D warnings
+# `--all-features` enables openssh-hashed-hosts; lint the code paths of the
+# ordinary build (hashed entries unsupported) too.
+step cargo clippy -p tatami_ssh_keys --all-targets --no-default-features --features known-hosts,openssh-key -- -D warnings
+step cargo clippy -p tatami_ssh --all-targets --no-default-features --features std,tcp,kex,quic-diag -- -D warnings
 
 # tatami_ssh_wire is the only shared package with a feature; check both states.
 # The allocation-free path is checked in isolation: when other workspace
@@ -78,22 +82,39 @@ fi
 step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts
 step cargo check -p tatami_ssh_keys --no-default-features --features openssh-key
 step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key
+# Legacy hashed known_hosts names (round 6): the only SHA-1 user is the
+# portable tatami_ssh_openssh_compat crate, behind openssh-hashed-hosts.
+step cargo check -p tatami_ssh_openssh_compat
+step cargo check -p tatami_ssh_keys --no-default-features --features openssh-hashed-hosts
+step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts
 printf '\n==> verify the host-identity feature graph enables no std feature\n'
-if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key \
+if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts \
     -e normal,build -e features -f '{p} {f}' | grep -E 'feature "std"' | grep -v semver; then
     echo "error: a std feature is enabled in the portable host-identity graph" >&2
     exit 1
 fi
 printf '\n==> verify portable key/trust builds pull no TLS, resolver or key-file crates\n'
-if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key -e normal \
+if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts -e normal \
     | grep -qE 'rustls|ring|quinn|getrandom|hickory|trust-dns'; then
     echo "error: host-only crates in the portable host-identity graph" >&2
     exit 1
 fi
-if cargo tree -p tatami_ssh_keys --no-default-features -e normal | grep -qE 'hmac|sha1|ssh-key'; then
+if cargo tree -p tatami_ssh_keys --no-default-features -e normal | grep -qE 'hmac|sha1|ssh-key|tatami_ssh_openssh_compat'; then
     echo "error: known_hosts/openssh-key crates present without their features" >&2
     exit 1
 fi
+if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key -e normal \
+    | grep -qE 'hmac|sha1|tatami_ssh_openssh_compat'; then
+    echo "error: HMAC/SHA-1 present in known-hosts without openssh-hashed-hosts" >&2
+    exit 1
+fi
+
+# SHA-1 boundary (round 6): resolved facade graphs with compatibility on and
+# off, allowed dependents and call sites, the compat crate's public API; the
+# self-test proves each rule reports a representative violation. See the
+# rule list at the top of the script and docs/crypto-provider-audit.md.
+step python3 scripts/check-sha1-boundary.py --self-test
+step python3 scripts/check-sha1-boundary.py
 if cargo tree -p tatami_ssh --no-default-features --features kex -e normal | grep -qE 'ssh-key|rustls|ring'; then
     echo "error: private-key or TLS crates present in the portable kex facade" >&2
     exit 1
@@ -108,7 +129,8 @@ if cargo tree -p tatami_ssh_quic --no-default-features --features std -e normal 
 fi
 
 # Facade feature matrix from docs/architecture.md.
-for features in "" std tcp quic tcp,quic std,tcp std,quic std,tcp,quic kex std,tcp,kex quic-diag quic-diag,tcp std,tcp,kex,quic-diag; do
+for features in "" std tcp quic tcp,quic std,tcp std,quic std,tcp,quic kex std,tcp,kex quic-diag quic-diag,tcp std,tcp,kex,quic-diag \
+    openssh-hashed-hosts kex,openssh-hashed-hosts std,tcp,kex,quic-diag,openssh-hashed-hosts; do
     if [ -z "$features" ]; then
         step cargo check -p tatami_ssh --no-default-features
     else
@@ -124,6 +146,11 @@ step cargo build -p tatami_ssh --no-default-features --features std,tcp,quic-dia
 step cargo build -p tatami_ssh --no-default-features --features std,tcp,kex,quic-diag --bins
 
 step cargo test --workspace --all-features
+# `--all-features` enables openssh-hashed-hosts; also test the ordinary
+# configuration where a hashed known_hosts entry is an unsupported-format
+# error (unit tests, facade trust and the OpenSSH identity tests).
+step cargo test -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key
+step cargo test -p tatami_ssh --no-default-features --features std,tcp,kex,quic-diag
 step env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
 # Core/alloc-only check: catches accidental transitive std use that a host
@@ -143,6 +170,10 @@ if [ "$run_embedded" -eq 1 ]; then
         step cargo check -p tatami_ssh --no-default-features --features kex --target "$EMBEDDED_TARGET"
         # Portable host-identity features (round 5) with no std at all.
         step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key --target "$EMBEDDED_TARGET"
+        # Legacy hashed-hostname compatibility (round 6) with no std at all.
+        step cargo check -p tatami_ssh_openssh_compat --target "$EMBEDDED_TARGET"
+        step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts --target "$EMBEDDED_TARGET"
+        step cargo check -p tatami_ssh --no-default-features --features kex,openssh-hashed-hosts --target "$EMBEDDED_TARGET"
     elif [ "${CHECK_EMBEDDED_REQUIRED:-0}" = 1 ]; then
         echo "error: target $EMBEDDED_TARGET is not installed" >&2
         exit 1

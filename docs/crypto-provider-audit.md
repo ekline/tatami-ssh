@@ -111,8 +111,9 @@ Not selected: `ring`/`aws-lc-rs` for the SSH side (C/assembly, `std`), RSA
 or ECDSA crates (out of profile), `chacha20poly1305` (the profile picks one
 AEAD; ChaCha20-Poly1305 is a natural second and is *not* Terrapin-safe
 without strict KEX, which is one more reason to land strict KEX first),
-`hmac` for SSH packets (no non-AEAD cipher to pair it with; round 5 uses
-`hmac` only for hashed `known_hosts` names, below).
+`hmac` for SSH packets (no non-AEAD cipher to pair it with; `hmac` is used
+only for hashed `known_hosts` names, inside `tatami_ssh_openssh_compat`,
+see the SHA-1 boundary below).
 
 ## QUIC/TLS diagnostic backend (host-only)
 
@@ -140,16 +141,17 @@ Peer raw public keys are converted by `tatami_ssh_keys::spki` (pure Rust), and
 
 ## Host-identity crates (round 5)
 
-Added behind `tatami_ssh_keys/known-hosts` (hashed hostnames) and
-`tatami_ssh_keys/openssh-key` (host private-key container), both portable
-`no_std` + `alloc`, both off by default. Checked against the registry
-manifests and sources and the resolved graph above (W-37, W-39):
+Added behind `tatami_ssh_keys/openssh-key` (host private-key container)
+and, since round 6, `tatami_ssh_openssh_compat` (hashed hostnames; reached
+only through `tatami_ssh_keys/openssh-hashed-hosts`), all portable
+`no_std`, all off by default. Checked against the registry manifests and
+sources and the resolved graph above (W-37, W-39, W-42):
 
 | Crate | Version | Features enabled | MSRV (`rust-version`) | Transitive notes | Entropy / secrets | Why it fits |
 |---|---|---|---|---|---|---|
 | `ssh-key` | 0.6.7 | `alloc` only (defaults `ecdsa`, `rand_core`, `std` off) | 1.65 (edition 2021) | `ssh-encoding` 0.2.0 (1.60), `ssh-cipher` 0.2.0 (1.60; pulls the `cipher` 0.4 traits but no cipher implementation), `pem-rfc7468` 0.7.0 (1.60), plus the already-audited `sha2`, `signature`, `subtle`, `zeroize`, `base64ct` | Decodes the private section; its Ed25519 private key type zeroizes on drop. No RNG: `rand_core` is not enabled | Maintained RustCrypto parser for `openssh-key-v1`; decode-from-bytes API keeps file access in the host layer |
-| `hmac` | 0.12.1 | none (defaults off) | unset (edition 2018) | `digest` 0.10.7 (`mac`) | none (salts are public) | HMAC-SHA1 for `\|1\|salt\|hash` hostnames only; enables no SSH signature or MAC |
-| `sha1` | 0.10.7 | none (defaults off) | unset (edition 2018) | `digest`, `cpufeatures` 0.2.17 (already present via `sha2`) | none | Hash for the legacy hashed-hostname format only |
+| `hmac` | 0.12.1 | none (defaults off) | unset (edition 2018) | `digest` 0.10.7 (`mac`) | none (salts are public) | HMAC-SHA1 for `\|1\|salt\|hash` hostnames only (`verify_slice`, constant time); dependency of `tatami_ssh_openssh_compat` only |
+| `sha1` | 0.10.7 | none (defaults off) | unset (edition 2018) | `digest`, `cpufeatures` 0.2.17 (already present via `sha2`) | none | Hash for the legacy hashed-hostname format only; dependency of `tatami_ssh_openssh_compat` only |
 
 `ssh-key` features deliberately **not** enabled: `ed25519` (would pull
 `rand_core` and its own seed→public derivation check, which Tatami performs
@@ -160,6 +162,62 @@ KDF can run), `std`, `ecdsa`, `rsa`, `dsa`. `getrandom` is not in the graph of
 enforces that together with the absence of `rustls`/`ring`/`quinn`, of any
 `std` feature, of `hmac`/`sha1`/`ssh-key` without their features, and of
 `ssh-key`/`rustls`/`ring` in the portable `kex` facade. MSRV stays 1.85.
+
+## SHA-1 boundary (round 6)
+
+SHA-1 appears in Tatami for exactly one purpose: matching OpenSSH hashed
+host names (`|1|salt|HMAC-SHA1(salt, name)`, written by `ssh-keygen -H` /
+`HashKnownHosts`) in operator `known_hosts` files. No SSH signature
+(`ssh-rsa` RSA/SHA-1, `ssh-dss`), key exchange (`diffie-hellman-group*-sha1`),
+MAC (`hmac-sha1*`), fingerprint, pin, SSHFP digest (type 1) or TLS
+exporter/signature operation uses it.
+
+- **Code.** `tatami_ssh_openssh_compat` (portable, `no_std`, no `alloc`,
+  `forbid(unsafe_code)`) depends on `hmac` 0.12.1, `sha1` 0.10.7 and
+  `base64ct` 1.x (defaults off). Its public API is only
+  `matches_hashed_hostname(stored_field, lookup_name) -> Result<bool,
+  HashedHostnameError>` and the error enum: it validates the whole
+  `|1|salt|hash` field (canonical padded base64, 20-byte salt and digest,
+  field ≤ 128 bytes, name ≤ 1024 bytes) and compares with `verify_slice`.
+  No writer, digest/HMAC function, hash state or re-export.
+- **Feature.** `tatami_ssh_keys/openssh-hashed-hosts` (forwarded by the
+  facade's `openssh-hashed-hosts`); off by default and not part of `kex`
+  or `quic-diag`. Without it, any hashed entry, including `@revoked` and
+  `@cert-authority` lines, is `KnownHostsError::Unsupported` and the
+  facade reports `unsupported_configuration` before connecting. Plaintext
+  `known_hosts`, SHA-256 fingerprints/pins, SSHFP and all handshakes work
+  without it.
+- **Dependency enforcement** (`scripts/check-sha1-boundary.py`, run by
+  `check-workspace.sh`, with a `--self-test` of every rule): the resolved
+  facade graphs (`cargo tree -e normal --target all`) for
+  `std,tcp,kex,quic-diag,openssh-hashed-hosts` and `kex,openssh-hashed-hosts`
+  reach `sha1`/`sha-1`/`sha1_smol`/`sha1-asm`/`sha1-checked` only through
+  the compat crate, which only `tatami_ssh_keys` reaches; for
+  `std,tcp,kex,quic-diag`, `std,tcp,kex`, `kex`, `std,tcp`, `quic-diag` and
+  no features, neither the compat crate nor any SHA-1 package is reachable.
+  From `cargo metadata` (resolved package ids and declared package names,
+  so renames do not hide edges): only `tatami_ssh_keys` depends on the
+  compat crate, and no other workspace package depends directly on `hmac`
+  or a SHA-1 package. Sources: the compat crate's public items are exactly
+  the two above; within `tatami_ssh_keys` only `src/known_hosts.rs` names
+  the compat crate (or a manifest rename of it).
+- **Algorithm configuration** (tests, separate from the graph):
+  `tatami_ssh_tcp/tests/algorithm_policy.rs` checks that no advertised
+  KEXINIT list contains a SHA-1 or DSA name (`ssh-rsa` is refused in the
+  host-key/signature list only; as a public-key blob type it stays legal
+  for RSA/SHA-2), that fingerprints and pins are SHA-256 (`ssh-keygen -lf`
+  fixture) and that SSHFP uses fingerprint type 2 only (a `4 1` record is
+  refused). `tatami_ssh_quic/tests/tls_algorithm_policy.rs` checks that the
+  provider's and every verifier's signature schemes exclude
+  `RSA_PKCS1_SHA1`/`ECDSA_SHA1_Legacy`, that no `_SHA` cipher suite exists,
+  and that rustls's QUIC mode refuses a configuration without TLS 1.3 (the
+  diagnostic configs enable TLS 1.3 only).
+- **Limit of the claim.** The bundled TLS backend (`ring`, under
+  `quic-diag`) contains SHA-1 code internally (for example for legacy
+  signature verification it never offers here). Dependency checks cannot
+  prove the physical absence of every SHA-1 instruction in a binary; the
+  enforceable boundary is the dependency graph above plus the enabled
+  algorithm configuration.
 
 Validation split, confirmed in `ssh-key-0.6.7/src/private.rs` and
 `src/private/ed25519.rs`:
@@ -204,6 +262,8 @@ does. The PKCS#8 form (RFC 8410 §7 prefix plus seed) is built in
 - Round 5 code has been built and tested locally on stable (rustc 1.98.1)
   only; the Rust 1.85 CI run is pending.
 - `cargo audit` has not been executed (offline); run it before any release.
+- Round 6 (SHA-1 boundary): the new crate adds no registry package; its
+  `hmac`/`sha1`/`base64ct` versions are the ones already locked.
 - `ed25519-dalek` 3.x and `x25519-dalek` 3.x exist; they were not adopted
   because they move to `rand_core` 0.9 and newer MSRVs and offer nothing the
   profile needs.

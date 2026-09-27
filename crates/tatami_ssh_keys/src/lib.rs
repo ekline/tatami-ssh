@@ -19,7 +19,7 @@
 //! | [`ed25519`] | `ed25519` | `Ed25519PublicKey`, `Ed25519Signature`, `HostKey`; verification with `ed25519-dalek` `verify_strict` |
 //! | [`spki`] | `ed25519` | Strict Ed25519 `SubjectPublicKeyInfo` ⇄ `ssh-ed25519` blob conversion (RFC 8410 / RFC 7250 identity) |
 //! | [`sshfp`] | `ed25519` | SSHFP values (RFC 4255/6594/7479) from a blob; no DNS |
-//! | [`known_hosts`] | `known-hosts` | Read-only, bounded OpenSSH `known_hosts` parser and `KnownHostsPolicy` |
+//! | [`known_hosts`] | `known-hosts` (hashed names: `openssh-hashed-hosts`) | Read-only, bounded OpenSSH `known_hosts` parser and `KnownHostsPolicy` |
 //! | [`openssh_key`] | `openssh-key` | Unencrypted Ed25519 `openssh-key-v1` host private keys, PKCS#8 in memory |
 //!
 //! # What is not implemented
@@ -41,6 +41,10 @@
 //! and the rules that govern them. Without the feature the crate still
 //! builds: the blob codecs, error types, fingerprint type and trust policy
 //! contract are available so higher layers can be written against them.
+//!
+//! No SHA-1 is linked unless `openssh-hashed-hosts` is enabled; it then
+//! comes only through the legacy hashed-hostname matcher crate, called only
+//! by [`known_hosts`] (enforced by `scripts/check-sha1-boundary.py`).
 //!
 //! # Portability
 //!

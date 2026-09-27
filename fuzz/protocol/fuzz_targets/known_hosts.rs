@@ -1,6 +1,9 @@
 #![no_main]
 //! `tatami_ssh_keys::known_hosts`: parsing, matching and the trust decision of
-//! `KnownHostsPolicy`. Pattern: trust policy.
+//! `KnownHostsPolicy`. Pattern: trust policy. Built with
+//! `openssh-hashed-hosts`, so hashed names reach the matcher in
+//! `tatami_ssh_openssh_compat`; the build without it (explicit unsupported
+//! error) is covered by unit and integration tests.
 //!
 //! 1. API/input: a small description is decoded into `known_hosts` text,
 //!    a lookup (host, port) and an offered key; the text goes through

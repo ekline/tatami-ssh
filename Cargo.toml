@@ -23,3 +23,4 @@ tatami_ssh_auth = { path = "crates/tatami_ssh_auth", default-features = false }
 tatami_ssh_connection = { path = "crates/tatami_ssh_connection", default-features = false }
 tatami_ssh_tcp = { path = "crates/tatami_ssh_tcp", default-features = false }
 tatami_ssh_quic = { path = "crates/tatami_ssh_quic", default-features = false }
+tatami_ssh_openssh_compat = { path = "crates/tatami_ssh_openssh_compat", default-features = false }

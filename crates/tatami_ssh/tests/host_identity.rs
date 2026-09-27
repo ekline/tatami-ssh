@@ -8,8 +8,11 @@
 //! that one entry and report the fingerprint `ssh-keygen -lf` prints, and
 //! must refuse it for a changed key, unknown host, wrong port, negation,
 //! revocation (before and after the positive line), a replaced server key
-//! and a malformed file. Hashed entries from `ssh-keygen -H` and rotation
-//! files work. The SSHFP value seen over TCP equals the one derived from
+//! and a malformed file. Rotation files work. Hashed entries from
+//! `ssh-keygen -H` are trusted on both transports with the
+//! `openssh-hashed-hosts` feature; without it the same file is an explicit
+//! `unsupported_configuration` error on both, before any connection. The
+//! SSHFP value seen over TCP equals the one derived from
 //! the QUIC raw public key and `ssh-keygen -r`. No run modifies the file.
 //!
 //! Skips with a notice when `/usr/sbin/sshd` or `/usr/bin/ssh-keygen` is
@@ -537,7 +540,42 @@ fn one_known_hosts_entry_covers_tcp_and_quic() {
         hashed_text.lines().all(|l| l.starts_with("|1|")),
         "{hashed_text}"
     );
-    assert_eq!(both(&pair, &hashed), ("trusted".into(), "trusted".into()));
+    // A hashed revocation of the served key, after the hashed positive line.
+    let hashed_revoked = write_kh(
+        &dir,
+        "hashed_revoked",
+        &format!(
+            "{hashed_text}@revoked {} ssh-ed25519 {}\n",
+            hashed_text.split_whitespace().next().unwrap(),
+            key.pub_b64
+        ),
+    );
+    #[cfg(feature = "openssh-hashed-hosts")]
+    {
+        assert_eq!(both(&pair, &hashed), ("trusted".into(), "trusted".into()));
+        assert_eq!(
+            both(&pair, &hashed_revoked),
+            ("revoked".into(), "revoked".into())
+        );
+    }
+    #[cfg(not(feature = "openssh-hashed-hosts"))]
+    for (file, line) in [(&hashed, 1), (&hashed_revoked, 1)] {
+        let before = std::fs::read(file).unwrap();
+        let f = file.to_str().unwrap();
+        let (tc, tv) = tcp(port, &["--known-hosts", f]);
+        let (qc, qv) = quic(port, &["--known-hosts", f]);
+        assert_eq!(std::fs::read(file).unwrap(), before);
+        assert_eq!((tc, qc), (1, 1), "{tv}\n{qv}");
+        assert_eq!(tv["outcome_code"], "trust_configuration_error");
+        assert_eq!(tv["trust_error"], "unsupported_configuration");
+        assert_eq!(tv["untrusted_reason"], "unsupported_configuration");
+        assert!(tv["peer"].is_null(), "no connection may be made: {tv}");
+        let outcome = tv["outcome"].as_str().unwrap();
+        assert!(outcome.contains(&format!("line {line}")), "{outcome}");
+        assert!(outcome.contains("openssh-hashed-hosts"), "{outcome}");
+        assert_eq!(qv["trust_error"], "unsupported_configuration");
+        assert_eq!(qv["handshake_outcome"], "not_attempted");
+    }
 
     drop(pair);
     let _ = std::fs::remove_dir_all(&dir);
@@ -694,8 +732,12 @@ fn matching_agrees_with_ssh_keygen_f() {
     .map(|h| entry(h, &key))
     .collect();
     let plain = write_kh(&dir, "plain", &text);
+    // The hashed half needs the compatibility feature; without it such a
+    // file does not parse (covered in one_known_hosts_entry_covers_tcp_and_quic).
+    #[cfg(feature = "openssh-hashed-hosts")]
     let hashed = write_kh(&dir, "hashed", &text);
     // Hashes the non-wildcard lines in place (line numbers unchanged).
+    #[cfg(feature = "openssh-hashed-hosts")]
     assert!(
         Command::new(SSH_KEYGEN)
             .args(["-q", "-H", "-f"])
@@ -722,7 +764,11 @@ fn matching_agrees_with_ssh_keygen_f() {
         ("b.example", 22),
         ("c.example", 22),
     ];
-    for file in [&plain, &hashed] {
+    #[cfg(feature = "openssh-hashed-hosts")]
+    let files = [&plain, &hashed];
+    #[cfg(not(feature = "openssh-hashed-hosts"))]
+    let files = [&plain];
+    for file in files {
         let parsed = KnownHosts::parse(&std::fs::read(file).unwrap(), &Limits::default()).unwrap();
         for &(host, port) in queries {
             let name = lookup_name(host, port).unwrap();

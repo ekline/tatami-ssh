@@ -15,7 +15,7 @@ documentation-only.
 
 | Layer | Packages | Policy |
 |---|---|---|
-| No allocation required | `tatami_ssh_wire` | Borrowed/caller-buffer codecs by default; owned helpers may use the optional `alloc` feature. |
+| No allocation required | `tatami_ssh_wire`, `tatami_ssh_openssh_compat` | Borrowed/caller-buffer codecs by default; owned helpers may use the optional `alloc` feature. `tatami_ssh_openssh_compat` (round 6) is the legacy hashed-hostname matcher, the only SHA-1 user (W-42). |
 | Allocation permitted, no OS | `tatami_ssh_keys`, `tatami_ssh_auth`, `tatami_ssh_connection` | Always `no_std` with `alloc`; no `std` feature. `tatami_ssh_keys/ed25519` adds pure-Rust verification, fingerprints, strict SPKI conversion and SSHFP values; `known-hosts` (parser/policy over bytes) and `openssh-key` (private-key decoding from bytes) stay `no_std` and do no I/O. |
 | Portable binding state with optional host integration | `tatami_ssh_tcp`, `tatami_ssh_quic` | Always `no_std` with `alloc`; `std` exposes `io` modules. `tatami_ssh_tcp/kex` is **portable `no_std` crypto** (pure Rust, entropy injected via `rand_core`; `getrandom` only under `std`). |
 | Host-only backend | `tatami_ssh_quic/quinn-backend` | Enables `std`; pulls `quinn-proto`, `rustls`, `ring` (C/assembly), `rcgen`. Never present in default, `tcp`-only or portable builds (`check-workspace.sh` verifies both directions). |
@@ -44,7 +44,9 @@ protocol code. No async runtime is used anywhere (W-14). The TLS exporter's
 *construction* remains unselected (P-04). Round 5 added `hmac` 0.12.1 and
 `sha1` 0.10.7 (hashed `known_hosts` names only) and RustCrypto `ssh-key`
 0.6.7 (OpenSSH private-key container, `alloc` only), audited in the same
-document (W-37, W-39).
+document (W-37, W-39). Round 6 confined `hmac`/`sha1` to
+`tatami_ssh_openssh_compat`, reachable only through the opt-in
+`openssh-hashed-hosts` feature (W-42, audit "SHA-1 boundary").
 
 ## Dependencies
 
@@ -54,7 +56,8 @@ Each dependency below is a Cargo path dependency declared once in
 | Package | Depends on |
 |---|---|
 | `tatami_ssh_wire` | No project packages |
-| `tatami_ssh_keys` | `wire` |
+| `tatami_ssh_openssh_compat` | No project packages (`hmac`, `sha1`, `base64ct`) |
+| `tatami_ssh_keys` | `wire`; optional `openssh_compat` (only here, only from `known_hosts.rs`) |
 | `tatami_ssh_auth` | `wire`, `keys` |
 | `tatami_ssh_connection` | `wire` |
 | `tatami_ssh_tcp` | `wire`, `keys`, `auth`, `connection` |
@@ -71,8 +74,9 @@ extra empty role-specific packages.
 
 All package defaults are empty. In the four shared protocol packages the only
 opt-in features are `tatami_ssh_wire/alloc` and `tatami_ssh_keys/{ed25519,
-known-hosts, openssh-key}` (providers and portable parsers, not portability
-changes; the latter two imply `ed25519`). The three shared packages other than
+known-hosts, openssh-key, openssh-hashed-hosts}` (providers and portable
+parsers, not portability changes; the latter three imply `ed25519`, and
+`openssh-hashed-hosts` implies `known-hosts`). The three shared packages other than
 `tatami_ssh_wire` permit allocation unconditionally (and enable
 `tatami_ssh_wire/alloc` themselves); `--no-default-features` is not a
 no-allocation mode for them.
@@ -92,6 +96,7 @@ no-allocation mode for them.
 | `quic-diag` (implies `std,quic`) | QUIC + `tatami_ssh_quic/quinn-backend` + `tatami_ssh_keys/{known-hosts,openssh-key}` | `tatami_ssh::quic_diag` (no binaries without `tcp`) |
 | `std,tcp,quic-diag` | TCP with `std` + QUIC backend | `tatami-client probe`, `tatami-client handshake --transport quic`, `tatami-server observe [--transport quic]` |
 | `std,tcp,kex,quic-diag` | everything above | every command of both binaries (W-35) |
+| `+openssh-hashed-hosts` (with any of the above) | + `tatami_ssh_keys/openssh-hashed-hosts` → `tatami_ssh_openssh_compat` (`hmac`, `sha1`) | none; `--known-hosts` accepts hashed `\|1\|` names instead of refusing them as `unsupported_configuration`. Not part of `kex` or `quic-diag` (W-42) |
 
 Weak dependency feature forwarding (`tatami_ssh_tcp?/std`, `tatami_ssh_quic?/std`) ensures
 that `std` does not itself select a transport. Cargo features are additive and

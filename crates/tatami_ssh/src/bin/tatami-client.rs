@@ -87,7 +87,10 @@ Options (handshake, TCP):
   --known-hosts FILE         Instead of a pin, an OpenSSH known_hosts file,
                              read-only. Looked up as HOST (port 22) or
                              [HOST]:PORT, lowercased; supports patterns,
-                             negation, hashed names and @revoked. Unknown
+                             negation and @revoked. Hashed |1| names
+                             (ssh-keygen -H) need a build with
+                             --features openssh-hashed-hosts; otherwise
+                             they are refused as unsupported. Unknown
                              hosts fail; nothing is prompted or written.
                              ~/.ssh/known_hosts is never read implicitly.
                              Exactly one of --host-key-sha256/--known-hosts.

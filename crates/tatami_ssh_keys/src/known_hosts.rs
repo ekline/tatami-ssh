@@ -18,9 +18,18 @@
 //!   configuration error.
 //! - Host patterns: comma-separated, `*` and `?` wildcards, `!` negation,
 //!   `[host]:port` for non-default ports, all matched ASCII
-//!   case-insensitively; or a single hashed entry `|1|salt|hash`
-//!   (HMAC-SHA1, 20-byte salt and digest). HMAC-SHA1 is used only for this
-//!   legacy hostname hashing; it enables no SHA-1 signature or MAC.
+//!   case-insensitively.
+//! - Hashed host names (`ssh-keygen -H`, `HashKnownHosts`): a host field
+//!   that begins with `|` is a hashed entry. **Only with the
+//!   `openssh-hashed-hosts` feature** is it accepted: it must then be
+//!   exactly one `|1|salt|hash` (canonical padded base64, 20-byte salt and
+//!   HMAC-SHA1 digest), validated at parse time and matched by the
+//!   `tatami_ssh_openssh_compat` crate — the only SHA-1 use in Tatami, which
+//!   enables no SHA-1 signature, key exchange, MAC, fingerprint or SSHFP
+//!   digest. Without the feature, any hashed entry — including in an
+//!   `@revoked` or `@cert-authority` line — fails the whole file with
+//!   [`KnownHostsError::Unsupported`] (never skipped). A `|` pattern inside
+//!   a comma-separated list is malformed in both builds.
 //! - Keys: the key type must equal the algorithm named inside the decoded
 //!   blob. `ssh-ed25519` keys are fully validated (length, point). Other
 //!   well-formed key types are accepted as entries but confer no trust on
@@ -53,27 +62,26 @@
 //!    `CertificateAuthorityOnly`; nothing → `UnknownHost`.
 //!
 //! A line applies when some positive pattern matches the lookup name and no
-//! negated pattern does.
+//! negated pattern does, or when its hashed field is the HMAC of the lookup
+//! name.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
 use base64ct::{Base64, Encoding as _};
-use hmac::{Hmac, Mac as _};
-use sha1::Sha1;
 
 use crate::blob::{PublicKeyBlob, SSH_ED25519};
 use crate::ed25519::HostKey;
 use crate::trust::{HostIdentity, HostTrustPolicy, TrustDecision, TrustSource, UntrustedReason};
 
-type HmacSha1 = Hmac<Sha1>;
-
-/// Length of the salt and digest in a hashed hostname (SHA-1).
-pub const HASH_LEN: usize = 20;
-
 /// The default SSH port, written without brackets in lookup names.
 pub const DEFAULT_PORT: u16 = 22;
+
+/// Longest lookup name [`lookup_name`] forms, in bytes (the same bound the
+/// hashed-name matcher applies). A policy bound to a longer name through
+/// [`KnownHosts::policy_for_name`] has no applicable entries.
+pub const MAX_LOOKUP_NAME_BYTES: usize = 1024;
 
 /// Resource bounds applied while parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,8 +130,10 @@ pub enum Malformed {
     MissingField(&'static str),
     /// A comma-separated pattern is empty (or only `!`).
     EmptyPattern,
-    /// A `|1|salt|hash` entry does not decode to two 20-byte values, or a
-    /// hashed entry is combined with other patterns.
+    /// A hashed host field is not exactly one `|1|salt|hash` with
+    /// canonical base64 20-byte values (checked with
+    /// `openssh-hashed-hosts`), or a `|` pattern is combined with other
+    /// patterns (in every build).
     HashedHost,
     /// The key is not valid padded standard base64.
     Base64,
@@ -150,6 +160,25 @@ impl fmt::Display for Malformed {
             Malformed::KeyTypeMismatch => "key type does not match the key blob",
             Malformed::InvalidEd25519Key => "invalid ssh-ed25519 key",
             Malformed::NulByte => "NUL byte in line",
+        })
+    }
+}
+
+/// A well-formed construct this build does not support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsupported {
+    /// A hashed host field (`|1|salt|hash`) in a build without the
+    /// `openssh-hashed-hosts` feature.
+    HashedHostnames,
+}
+
+impl fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Unsupported::HashedHostnames => {
+                "hashed host names (|1|...) are not supported by this build; rebuild with the \
+                 `openssh-hashed-hosts` feature or list plaintext host names"
+            }
         })
     }
 }
@@ -188,6 +217,14 @@ pub enum KnownHostsError {
         /// What is wrong.
         what: Malformed,
     },
+    /// A line uses a format this build does not support. Distinct from
+    /// [`KnownHostsError::Malformed`]: the file may be valid for OpenSSH.
+    Unsupported {
+        /// 1-based line number.
+        line: usize,
+        /// What is unsupported.
+        what: Unsupported,
+    },
 }
 
 impl KnownHostsError {
@@ -197,7 +234,8 @@ impl KnownHostsError {
         match self {
             KnownHostsError::LineTooLong { line, .. }
             | KnownHostsError::TooManyPatterns { line, .. }
-            | KnownHostsError::Malformed { line, .. } => Some(*line),
+            | KnownHostsError::Malformed { line, .. }
+            | KnownHostsError::Unsupported { line, .. } => Some(*line),
             KnownHostsError::FileTooLarge { .. } | KnownHostsError::TooManyEntries { .. } => None,
         }
     }
@@ -224,6 +262,9 @@ impl fmt::Display for KnownHostsError {
             KnownHostsError::Malformed { line, what } => {
                 write!(f, "known_hosts line {line}: {what}")
             }
+            KnownHostsError::Unsupported { line, what } => {
+                write!(f, "known_hosts line {line}: {what}")
+            }
         }
     }
 }
@@ -239,6 +280,8 @@ pub enum LookupNameError {
     /// pattern metacharacter (`*`, `?`, `!`), which would change how it
     /// matches.
     InvalidCharacter,
+    /// The lookup name would exceed [`MAX_LOOKUP_NAME_BYTES`].
+    TooLong,
 }
 
 impl fmt::Display for LookupNameError {
@@ -248,6 +291,7 @@ impl fmt::Display for LookupNameError {
             LookupNameError::InvalidCharacter => {
                 "host name for known_hosts lookup contains a character that cannot appear in a host"
             }
+            LookupNameError::TooLong => "host name for known_hosts lookup is too long",
         })
     }
 }
@@ -255,7 +299,8 @@ impl fmt::Display for LookupNameError {
 impl core::error::Error for LookupNameError {}
 
 /// The logical `known_hosts` lookup name for `host` and `port`: ASCII
-/// lowercase, bare for port 22, `[host]:port` otherwise.
+/// lowercase, bare for port 22, `[host]:port` otherwise; at most
+/// [`MAX_LOOKUP_NAME_BYTES`].
 pub fn lookup_name(host: &str, port: u16) -> Result<String, LookupNameError> {
     if host.is_empty() {
         return Err(LookupNameError::Empty);
@@ -267,26 +312,15 @@ pub fn lookup_name(host: &str, port: u16) -> Result<String, LookupNameError> {
         return Err(LookupNameError::InvalidCharacter);
     }
     let lower = host.to_ascii_lowercase();
-    Ok(if port == DEFAULT_PORT {
+    let name = if port == DEFAULT_PORT {
         lower
     } else {
         alloc::format!("[{lower}]:{port}")
-    })
-}
-
-/// Formats a hashed-hostname field `|1|base64(salt)|base64(HMAC-SHA1)` for
-/// `name` (already a lookup name). For tests and fixtures; this module
-/// never writes files.
-#[must_use]
-pub fn hash_hostname(salt: &[u8; HASH_LEN], name: &str) -> String {
-    let mut mac = HmacSha1::new_from_slice(salt).expect("HMAC accepts any key length");
-    mac.update(name.as_bytes());
-    let digest = mac.finalize().into_bytes();
-    alloc::format!(
-        "|1|{}|{}",
-        Base64::encode_string(salt),
-        Base64::encode_string(&digest)
-    )
+    };
+    if name.len() > MAX_LOOKUP_NAME_BYTES {
+        return Err(LookupNameError::TooLong);
+    }
+    Ok(name)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,10 +333,9 @@ struct Pattern {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Hosts {
     Patterns(Vec<Pattern>),
-    Hashed {
-        salt: [u8; HASH_LEN],
-        hash: [u8; HASH_LEN],
-    },
+    /// The raw `|1|salt|hash` field, validated at parse time.
+    #[cfg(feature = "openssh-hashed-hosts")]
+    Hashed(Vec<u8>),
 }
 
 /// One validated entry.
@@ -340,20 +373,31 @@ impl Entry {
         &self.blob
     }
 
-    /// `true` for a `|1|salt|hash` host field.
+    /// `true` for a `|1|salt|hash` host field (only possible with the
+    /// `openssh-hashed-hosts` feature; otherwise such a file does not
+    /// parse).
     #[must_use]
     pub const fn is_hashed(&self) -> bool {
-        matches!(self.hosts, Hosts::Hashed { .. })
+        match self.hosts {
+            #[cfg(feature = "openssh-hashed-hosts")]
+            Hosts::Hashed(_) => true,
+            Hosts::Patterns(_) => false,
+        }
     }
 
-    /// Whether this line applies to `name` (a [`lookup_name`]).
+    /// Whether this line applies to `name` (a [`lookup_name`]). A hashed
+    /// entry never applies to a name longer than [`MAX_LOOKUP_NAME_BYTES`]
+    /// ([`lookup_name`] cannot form one; [`KnownHosts::policy_for_name`]
+    /// treats such a name as matching nothing at all).
     #[must_use]
     pub fn applies_to(&self, name: &str) -> bool {
         match &self.hosts {
-            Hosts::Hashed { salt, hash } => {
-                let mut mac = HmacSha1::new_from_slice(salt).expect("HMAC accepts any key length");
-                mac.update(name.as_bytes());
-                mac.verify_slice(hash).is_ok()
+            #[cfg(feature = "openssh-hashed-hosts")]
+            Hosts::Hashed(field) => {
+                // The field was validated by `parse`; an error here can only
+                // be an oversized name.
+                tatami_ssh_openssh_compat::matches_hashed_hostname(field, name.as_bytes())
+                    .unwrap_or(false)
             }
             Hosts::Patterns(patterns) => {
                 let name = name.as_bytes();
@@ -422,13 +466,16 @@ impl KnownHosts {
         Ok(self.policy_for_name(name))
     }
 
-    /// Binds the file to an already-formed lookup name.
+    /// Binds the file to an already-formed lookup name. A name longer than
+    /// [`MAX_LOOKUP_NAME_BYTES`] matches no entry (so it is never trusted,
+    /// and no hashed revocation can be missed on the way to a match).
     #[must_use]
     pub fn policy_for_name(&self, name: String) -> KnownHostsPolicy {
+        let too_long = name.len() > MAX_LOOKUP_NAME_BYTES;
         let applicable = self
             .entries
             .iter()
-            .filter(|e| e.applies_to(&name))
+            .filter(|e| !too_long && e.applies_to(&name))
             .map(|e| Applicable {
                 line: e.line,
                 marker: e.marker,
@@ -571,25 +618,33 @@ fn parse_line(content: &[u8], line: usize, limits: &Limits) -> Result<Entry, Kno
     })
 }
 
+/// A host field starting with `|` is a hashed entry. With the feature it is
+/// validated completely now (an empty lookup name matches nothing, so the
+/// call only checks grammar, base64 and lengths); without it the file is
+/// refused as unsupported, never skipped.
+#[cfg(feature = "openssh-hashed-hosts")]
+fn parse_hashed(field: &[u8], line: usize) -> Result<Hosts, KnownHostsError> {
+    match tatami_ssh_openssh_compat::matches_hashed_hostname(field, b"") {
+        Ok(_) => Ok(Hosts::Hashed(field.to_vec())),
+        Err(_) => Err(KnownHostsError::Malformed {
+            line,
+            what: Malformed::HashedHost,
+        }),
+    }
+}
+
+#[cfg(not(feature = "openssh-hashed-hosts"))]
+fn parse_hashed(_field: &[u8], line: usize) -> Result<Hosts, KnownHostsError> {
+    Err(KnownHostsError::Unsupported {
+        line,
+        what: Unsupported::HashedHostnames,
+    })
+}
+
 fn parse_hosts(field: &[u8], line: usize, limits: &Limits) -> Result<Hosts, KnownHostsError> {
     let bad = |what| KnownHostsError::Malformed { line, what };
-    if let Some(rest) = field.strip_prefix(b"|") {
-        let mut parts = rest.split(|&b| b == b'|');
-        let (Some(b"1"), Some(salt), Some(hash), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(bad(Malformed::HashedHost));
-        };
-        let decode = |b: &[u8]| -> Option<[u8; HASH_LEN]> {
-            let text = core::str::from_utf8(b).ok()?;
-            let mut out = [0u8; HASH_LEN];
-            let n = Base64::decode(text, &mut out).ok()?.len();
-            (n == HASH_LEN).then_some(out)
-        };
-        let (Some(salt), Some(hash)) = (decode(salt), decode(hash)) else {
-            return Err(bad(Malformed::HashedHost));
-        };
-        return Ok(Hosts::Hashed { salt, hash });
+    if field.first() == Some(&b'|') {
+        return parse_hashed(field, line);
     }
     let mut patterns = Vec::new();
     for raw in field.split(|&b| b == b',') {
@@ -797,40 +852,187 @@ mod tests {
         assert!(!glob_match(&[pattern.as_slice(), b"c"].concat(), &miss));
     }
 
+    // Hashed host fields produced by OpenSSH_10.2p1 `ssh-keygen -H` from a
+    // plaintext file listing these names; hard-coded (no writer exists).
+    /// `host.example`
+    const HASHED_HOST: &str = "|1|IU1cA2qjw9KDYpT5wGRttwN2vVU=|MjpmhQnQTZr/FMAlIczcdX61uVU=";
+    /// `[host.example]:2222`
+    const HASHED_HOST_2222: &str = "|1|fSQdr5FTkUKRtYdUfMerMOhv9tg=|o7YYvARat2xvQ/xK/bsO6jq+ULY=";
+    /// `other.example`
+    const HASHED_OTHER: &str = "|1|RlS2qd0peVedQkw9lPQIZpqCXYg=|7f076qNh6IMy9djepot4ddmjj1I=";
+
     #[test]
-    fn hashed_entries() {
-        let salt = [7u8; HASH_LEN];
-        let hashed = hash_hostname(&salt, &lookup_name("host.example", 2222).unwrap());
-        let kh = parse(&line(&hashed, &TEST1_PUBLIC_KEY));
-        assert!(kh.entries()[0].is_hashed());
+    fn mixed_hashed_pattern_is_malformed_in_every_build() {
         assert_eq!(
-            decide(&kh, "host.example", 2222, &TEST1_PUBLIC_KEY),
-            trusted(1)
+            parse_err(&line(&format!("a,{HASHED_HOST}"), &TEST1_PUBLIC_KEY)),
+            KnownHostsError::Malformed {
+                line: 1,
+                what: Malformed::HashedHost
+            }
         );
-        assert_eq!(
-            decide(&kh, "HOST.example", 2222, &TEST1_PUBLIC_KEY),
-            trusted(1)
-        );
-        assert_eq!(
-            decide(&kh, "host.example", 22, &TEST1_PUBLIC_KEY),
-            untrusted(UntrustedReason::UnknownHost)
-        );
-        // Malformed hashes are configuration errors.
-        for bad in [
-            "|1|AAAA|AAAA",
-            "|2|BwcHBwcHBwcHBwcHBwcHBwcHBwc=|BwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-            "|1|BwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-            "|1|BwcHBwcHBwcHBwcHBwcHBwcHBwc=|BwcHBwcHBwcHBwcHBwcHBwcHBwc=|x",
-            "a,|1|BwcHBwcHBwcHBwcHBwcHBwcHBwc=|BwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-        ] {
+    }
+
+    #[test]
+    fn overlong_lookup_names_match_nothing() {
+        let host = "a".repeat(MAX_LOOKUP_NAME_BYTES);
+        assert!(lookup_name(&host, 22).is_ok());
+        assert_eq!(lookup_name(&host, 2222), Err(LookupNameError::TooLong));
+        let kh = parse(&line("*", &TEST1_PUBLIC_KEY));
+        let long = "a".repeat(MAX_LOOKUP_NAME_BYTES + 1);
+        assert_eq!(kh.policy_for_name(long).applicable_entries(), 0);
+        assert_eq!(kh.policy_for_name(host).applicable_entries(), 1);
+    }
+
+    #[cfg(feature = "openssh-hashed-hosts")]
+    mod hashed_supported {
+        use super::*;
+
+        #[test]
+        fn openssh_hashed_entries_match() {
+            let kh = parse(&format!(
+                "{}{}",
+                line(HASHED_HOST_2222, &TEST1_PUBLIC_KEY),
+                line(HASHED_OTHER, &TEST2_PUBLIC_KEY)
+            ));
+            assert!(kh.entries()[0].is_hashed());
             assert_eq!(
-                parse_err(&line(bad, &TEST1_PUBLIC_KEY)),
-                KnownHostsError::Malformed {
-                    line: 1,
-                    what: Malformed::HashedHost
-                },
-                "{bad}"
+                decide(&kh, "host.example", 2222, &TEST1_PUBLIC_KEY),
+                trusted(1)
             );
+            // The lookup name is lowercased before hashing.
+            assert_eq!(
+                decide(&kh, "HOST.example", 2222, &TEST1_PUBLIC_KEY),
+                trusted(1)
+            );
+            assert_eq!(
+                decide(&kh, "host.example", 22, &TEST1_PUBLIC_KEY),
+                untrusted(UntrustedReason::UnknownHost)
+            );
+            assert_eq!(
+                decide(&kh, "other.example", 22, &TEST2_PUBLIC_KEY),
+                trusted(2)
+            );
+            assert_eq!(
+                decide(&kh, "other.example", 22, &TEST1_PUBLIC_KEY),
+                untrusted(UntrustedReason::KeyChanged { line: 2 })
+            );
+        }
+
+        #[test]
+        fn hashed_revocation_wins_before_and_after() {
+            for (text, rline) in [
+                (
+                    format!(
+                        "@revoked {HASHED_HOST} ssh-ed25519 {}\n{}",
+                        b64(&TEST1_PUBLIC_KEY),
+                        line("host.example", &TEST1_PUBLIC_KEY)
+                    ),
+                    1,
+                ),
+                (
+                    format!(
+                        "{}@revoked {HASHED_HOST} ssh-ed25519 {}\n",
+                        line(HASHED_HOST, &TEST1_PUBLIC_KEY),
+                        b64(&TEST1_PUBLIC_KEY)
+                    ),
+                    2,
+                ),
+            ] {
+                let kh = parse(&text);
+                assert_eq!(
+                    decide(&kh, "host.example", 22, &TEST1_PUBLIC_KEY),
+                    untrusted(UntrustedReason::Revoked { line: rline }),
+                    "{text}"
+                );
+            }
+            // A hashed revocation for another name does not apply.
+            let kh = parse(&format!(
+                "@revoked {HASHED_OTHER} ssh-ed25519 {}\n{}",
+                b64(&TEST1_PUBLIC_KEY),
+                line(HASHED_HOST, &TEST1_PUBLIC_KEY)
+            ));
+            assert_eq!(
+                decide(&kh, "host.example", 22, &TEST1_PUBLIC_KEY),
+                trusted(2)
+            );
+        }
+
+        #[test]
+        fn malformed_hashes_are_configuration_errors() {
+            for bad in [
+                "|1|AAAA|AAAA",
+                "|2|IU1cA2qjw9KDYpT5wGRttwN2vVU=|MjpmhQnQTZr/FMAlIczcdX61uVU=",
+                "|1|IU1cA2qjw9KDYpT5wGRttwN2vVU=",
+                "|1|IU1cA2qjw9KDYpT5wGRttwN2vVU=|MjpmhQnQTZr/FMAlIczcdX61uVU=|x",
+                // Unpadded and non-canonical base64.
+                "|1|IU1cA2qjw9KDYpT5wGRttwN2vVU|MjpmhQnQTZr/FMAlIczcdX61uVU=",
+                "|1|IU1cA2qjw9KDYpT5wGRttwN2vVV=|MjpmhQnQTZr/FMAlIczcdX61uVU=",
+                "|1|IU1cA2qjw9KDYpT5wGRttwN2vVU=|MjpmhQnQTZr/FMAlIczcdX61uVU=,host",
+                "|",
+            ] {
+                for marker in ["", "@revoked ", "@cert-authority "] {
+                    let text = format!(
+                        "{}{marker}{}",
+                        line("host", &TEST1_PUBLIC_KEY),
+                        line(bad, &TEST1_PUBLIC_KEY)
+                    );
+                    assert_eq!(
+                        parse_err(&text),
+                        KnownHostsError::Malformed {
+                            line: 2,
+                            what: Malformed::HashedHost
+                        },
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "openssh-hashed-hosts"))]
+    mod hashed_unsupported {
+        use super::*;
+
+        #[test]
+        fn any_hashed_entry_is_an_explicit_unsupported_error() {
+            // Well-formed OpenSSH entries, a malformed one, and every marker:
+            // none is skipped, the file is refused at that line.
+            for field in [HASHED_HOST, HASHED_HOST_2222, HASHED_OTHER, "|2|junk", "|"] {
+                for marker in ["", "@revoked ", "@cert-authority "] {
+                    let text = format!(
+                        "# c\n{}{marker}{}",
+                        line("host.example", &TEST1_PUBLIC_KEY),
+                        line(field, &TEST1_PUBLIC_KEY)
+                    );
+                    let e = parse_err(&text);
+                    assert_eq!(
+                        e,
+                        KnownHostsError::Unsupported {
+                            line: 3,
+                            what: Unsupported::HashedHostnames
+                        },
+                        "{text}"
+                    );
+                    assert_eq!(e.line(), Some(3));
+                }
+            }
+        }
+
+        #[test]
+        fn hashed_revocation_is_not_dropped() {
+            // Without support a hashed revocation cannot be evaluated, so the
+            // positive plaintext line must not be used either.
+            let text = format!(
+                "{}@revoked {HASHED_HOST} ssh-ed25519 {}\n",
+                line("host.example", &TEST1_PUBLIC_KEY),
+                b64(&TEST1_PUBLIC_KEY)
+            );
+            let e = parse_err(&text);
+            assert!(matches!(e, KnownHostsError::Unsupported { line: 2, .. }));
+            let msg = e.to_string();
+            assert!(msg.starts_with("known_hosts line 2: "), "{msg}");
+            assert!(msg.contains("openssh-hashed-hosts"), "{msg}");
+            assert!(msg.contains("plaintext"), "{msg}");
         }
     }
 

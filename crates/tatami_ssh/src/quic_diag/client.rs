@@ -132,7 +132,8 @@ pub struct Report {
     /// The `known_hosts` lookup name bound before resolution.
     pub lookup_name: Option<String>,
     /// Stable code when the trust configuration was unusable
-    /// (`io_error`, `malformed_configuration`, `invalid_lookup_name`).
+    /// (`io_error`, `malformed_configuration`, `unsupported_configuration`,
+    /// `invalid_lookup_name`).
     pub trust_error: Option<&'static str>,
     /// The outcome, or why no handshake could be attempted.
     pub result: Result<ClientOutcome, String>,

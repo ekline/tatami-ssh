@@ -17,7 +17,9 @@ arbitrary = { version = "1", features = ["derive"] }
 # Independent JSON parser used only as an oracle.
 serde_json = "1"
 tatami_ssh_wire = { path = "../../crates/tatami_ssh_wire", default-features = false, features = ["alloc"] }
-tatami_ssh_keys = { path = "../../crates/tatami_ssh_keys", default-features = false, features = ["ed25519", "known-hosts", "openssh-key"] }
+# `openssh-hashed-hosts` keeps hashed-name matching covered by the
+# `known_hosts` target (through `tatami_ssh_openssh_compat`).
+tatami_ssh_keys = { path = "../../crates/tatami_ssh_keys", default-features = false, features = ["ed25519", "known-hosts", "openssh-key", "openssh-hashed-hosts"] }
 tatami_ssh_tcp = { path = "../../crates/tatami_ssh_tcp", default-features = false, features = ["std", "kex"] }
 tatami_ssh_connection = { path = "../../crates/tatami_ssh_connection", default-features = false }
 tatami_ssh = { path = "../../crates/tatami_ssh", default-features = false, features = ["std", "tcp", "kex"] }
@@ -32,9 +34,9 @@ x25519-dalek = { version = "2.0.1", default-features = false, features = ["stati
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes"] }
 sha2 = { version = "0.10.9", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
-# SHA-1 under the harness's own RFC 2104 HMAC, the reference for hashed
-# known_hosts names (`known_hosts` target); same version as the production
-# lockfile.
+# SHA-1 under the harness's own RFC 2104 HMAC, the independent reference
+# for hashed known_hosts names (`known_hosts` target); harness-only, same
+# version as the production lockfile.
 sha1 = { version = "0.10.7", default-features = false }
 
 [profile.release]

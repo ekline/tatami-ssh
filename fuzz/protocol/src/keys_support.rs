@@ -8,8 +8,10 @@
 //! - [`ed25519_blob`]: the hand layout of an `ssh-ed25519` public-key blob.
 //! - [`b64_encode`]: RFC 4648 §4 padded base64 (to write `known_hosts` key
 //!   fields and PEM armor without the decoder under test).
-//! - [`hmac_sha1`]: RFC 2104 HMAC over `sha1::Sha1`, not the `hmac` crate the
-//!   library uses (hashed `known_hosts` names); RFC 2202 vectors below.
+//! - [`hmac_sha1`]: RFC 2104 HMAC over `sha1::Sha1`, not the `hmac` crate
+//!   that `tatami_ssh_openssh_compat` uses (hashed `known_hosts` names, the
+//!   harness writes them because the library has no writer); RFC 2202
+//!   vectors below. A harness-only oracle.
 //! - [`glob_ref`]: the textbook dynamic-programming `*`/`?` matcher.
 //! - [`openssh_armor`]: `-----BEGIN OPENSSH PRIVATE KEY-----` armor.
 

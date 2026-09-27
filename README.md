@@ -188,8 +188,8 @@ reported separately (`host_key_signature_valid`, `host_trusted`, with
 `untrusted_reason` lists every structured trust failure in one field: a
 policy reason (`fingerprint_mismatch`, `unknown_host`, `key_changed`,
 `revoked`, ...) once a key was judged, or the configuration code (`io_error`,
-`malformed_configuration`, `invalid_lookup_name`, also in `trust_error`) when
-no decision was made; the message is in `outcome`.
+`malformed_configuration`, `unsupported_configuration`, `invalid_lookup_name`,
+also in `trust_error`) when no decision was made; the message is in `outcome`.
 `~/.ssh/known_hosts` is never read implicitly; there is no prompt and no
 enrollment (`docs/decisions.md` W-32, W-37).
 
@@ -315,8 +315,14 @@ cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-client -- 
   intended convention is TCP 22 plus UDP 22; UDP 4433 is only the
   experiment's default (W-38).
 - **`known_hosts` subset.** Read-only, explicit file only. Comments,
-  comma-separated patterns with `*`/`?`, `!` negation, `[host]:port`, hashed
-  `|1|` names and `@revoked`. An applicable revocation wins regardless of
+  comma-separated patterns with `*`/`?`, `!` negation, `[host]:port` and
+  `@revoked`. Hashed `|1|` names (`ssh-keygen -H`) need the opt-in
+  `openssh-hashed-hosts` feature (for example
+  `--features std,tcp,kex,quic-diag,openssh-hashed-hosts`); without it a
+  file containing any hashed entry, including a hashed `@revoked` line, is
+  refused before connecting (`unsupported_configuration`). That feature is
+  the only thing in Tatami that links SHA-1 (HMAC-SHA1, in
+  `tatami_ssh_openssh_compat`; W-42). An applicable revocation wins regardless of
   line order; several keys per host (rotation) are allowed; unknown hosts
   fail. Any malformed line or unknown marker (including in `@revoked`)
   rejects the whole file before connecting (`trust_configuration_error`,
@@ -343,11 +349,13 @@ with `TATAMI_REQUIRE_OPENSSH=1`) against
 prints and the SSHFP value `ssh-keygen -r` prints; changed key, unknown host,
 wrong port, a port-22 entry for another port, negation, revocation before and
 after the positive line, a malformed file (no connection made) and replaced
-server keys fail; `ssh-keygen -H` hashed entries and rotation work; a
+server keys fail; rotation works; `ssh-keygen -H` hashed entries (and a
+hashed revocation) work with `openssh-hashed-hosts` and are an explicit
+`unsupported_configuration` on both transports without it; a
 certificate server is refused; bad host-key files (permissions, encrypted,
 a public key) and conflicting identity options are refused at startup; the
-file is never modified; matching agrees with `ssh-keygen -F` on 16 plain and
-hashed queries.
+file is never modified; matching agrees with `ssh-keygen -F` on 16 plain
+(and, with the feature, hashed) queries.
 
 ## Checks
 
@@ -358,8 +366,11 @@ scripts/check-workspace.sh
 Runs formatting, Clippy, the feature matrix (including `kex`, `std,tcp,kex`,
 `quic-diag`, `tatami_ssh_keys` `known-hosts`/`openssh-key`), dependency-graph
 checks (no `std`, TLS, resolver or `getrandom` crates in the portable key
-graphs; no private-key or TLS crates in the portable `kex` facade), tests,
-docs and (when the `thumbv7em-none-eabi` target is installed) core/alloc-only
+graphs; no private-key or TLS crates in the portable `kex` facade), the
+self-tested SHA-1 boundary check (`scripts/check-sha1-boundary.py`: SHA-1
+reachable only through `tatami_ssh_openssh_compat` with
+`openssh-hashed-hosts`, unreachable without it), tests with and without
+`openssh-hashed-hosts`, docs and (when the `thumbv7em-none-eabi` target is installed) core/alloc-only
 builds, including `tatami_ssh_tcp --features kex` and `tatami_ssh_keys --features
 known-hosts,openssh-key` with no standard library. CI runs it on Rust 1.85.0
 and stable, with OpenSSH installed and `TATAMI_REQUIRE_OPENSSH=1` so the

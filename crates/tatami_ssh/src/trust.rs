@@ -130,7 +130,9 @@ pub struct PreparedTrust {
 pub enum TrustConfigError {
     /// The `known_hosts` file could not be read.
     File(FileError),
-    /// The `known_hosts` file is malformed.
+    /// The `known_hosts` file is malformed, or uses a format this build
+    /// does not support (hashed host names without the
+    /// `openssh-hashed-hosts` feature: [`KnownHostsError::Unsupported`]).
     Malformed {
         /// The file.
         path: PathBuf,
@@ -142,12 +144,16 @@ pub enum TrustConfigError {
 }
 
 impl TrustConfigError {
-    /// Stable code: `io_error`, `malformed_configuration` or
-    /// `invalid_lookup_name`.
+    /// Stable code: `io_error`, `malformed_configuration`,
+    /// `unsupported_configuration` or `invalid_lookup_name`.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
             TrustConfigError::File(_) => "io_error",
+            TrustConfigError::Malformed {
+                error: KnownHostsError::Unsupported { .. },
+                ..
+            } => "unsupported_configuration",
             TrustConfigError::Malformed { .. } => "malformed_configuration",
             TrustConfigError::LookupName(_) => "invalid_lookup_name",
         }
@@ -250,6 +256,37 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code(), "invalid_lookup_name");
         let _ = std::fs::remove_file(ok);
+    }
+
+    /// `ssh-keygen -H` output (OpenSSH_10.2p1) for `host`: accepted with
+    /// `openssh-hashed-hosts`, an explicit unsupported-configuration error
+    /// (not "malformed", not "unknown host") without it.
+    #[test]
+    fn hashed_known_hosts_depend_on_the_compatibility_feature() {
+        let p = temp_file(
+            "hashed",
+            &alloc::format!(
+                "|1|GxqmlqIssNcv8hLxLEdYFzdXm1M=|NySrkNSholebEQAwLuvQRB5BT2g= ssh-ed25519 {BLOB_B64}\n"
+            ),
+        );
+        let t = TrustConfig::KnownHostsFile(p.clone());
+        let result = t.prepare("host", 22);
+        let _ = std::fs::remove_file(p);
+        #[cfg(feature = "openssh-hashed-hosts")]
+        assert_eq!(
+            decide(&result.unwrap()),
+            TrustDecision::Trusted {
+                source: TrustSource::KnownHosts { line: 1 }
+            }
+        );
+        #[cfg(not(feature = "openssh-hashed-hosts"))]
+        {
+            let e = result.unwrap_err();
+            assert_eq!(e.code(), "unsupported_configuration");
+            let text = e.to_string();
+            assert!(text.contains("line 1"), "{text}");
+            assert!(text.contains("openssh-hashed-hosts"), "{text}");
+        }
     }
 
     #[test]
