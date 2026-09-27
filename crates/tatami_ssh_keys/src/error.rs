@@ -62,6 +62,38 @@ pub enum KeyError {
     /// The key bytes have the right length but do not encode a valid public
     /// key (for Ed25519: not a canonical point on the curve).
     InvalidKey,
+    /// An `mpint` is negative, zero where a positive value is required, or
+    /// not in the minimal encoding RFC 4251 §5 requires.
+    NonCanonicalInteger {
+        /// Which field (`e`, `n`, `r`, `s`, ...).
+        field: &'static str,
+    },
+    /// An RSA modulus outside the accepted size range, or even.
+    RsaModulus {
+        /// Bit length of the modulus found.
+        bits: usize,
+    },
+    /// An RSA public exponent that is even, below 3, or longer than four
+    /// bytes.
+    RsaExponent,
+    /// The curve identifier inside an ECDSA blob does not match its
+    /// algorithm name (`ecdsa-sha2-nistp256` requires `nistp256`).
+    CurveMismatch,
+    /// An ECDSA point that is not a 65-byte SEC1 uncompressed encoding.
+    PointEncoding,
+    /// An ECDSA signature component (`r` or `s`) wider than the curve's
+    /// scalar size.
+    ScalarTooLong {
+        /// Which component.
+        field: &'static str,
+    },
+    /// The presented key is of a different type than the one negotiated.
+    UnexpectedKeyType {
+        /// Key type the negotiated scheme requires.
+        expected: &'static [u8],
+        /// Key type found in the blob.
+        found: Vec<u8>,
+    },
 }
 
 impl fmt::Display for KeyError {
@@ -77,6 +109,31 @@ impl fmt::Display for KeyError {
                 found,
             } => write!(f, "{field} is {found} bytes, expected {expected}"),
             KeyError::InvalidKey => f.write_str("key bytes do not encode a valid public key"),
+            KeyError::NonCanonicalInteger { field } => {
+                write!(f, "{field} is not a minimal positive mpint")
+            }
+            KeyError::RsaModulus { bits } => write!(
+                f,
+                "RSA modulus of {bits} bits is not accepted (odd, 2048 to 8192 bits)"
+            ),
+            KeyError::RsaExponent => f.write_str(
+                "RSA public exponent is not accepted (odd, at least 3, at most 4 bytes)",
+            ),
+            KeyError::CurveMismatch => {
+                f.write_str("ECDSA curve identifier does not match the key algorithm")
+            }
+            KeyError::PointEncoding => {
+                f.write_str("ECDSA point is not a 65-byte uncompressed SEC1 encoding")
+            }
+            KeyError::ScalarTooLong { field } => {
+                write!(f, "ECDSA signature {field} is wider than the curve order")
+            }
+            KeyError::UnexpectedKeyType { expected, found } => write!(
+                f,
+                "host key is {}, but the negotiated algorithm needs {}",
+                Escaped(found),
+                Escaped(expected)
+            ),
         }
     }
 }
@@ -104,8 +161,22 @@ pub enum VerifyError {
         /// Algorithm named in the signature blob.
         signature_algorithm: Vec<u8>,
     },
+    /// The signature blob is labelled with another scheme than the one
+    /// negotiated. Detected before any cryptographic work.
+    UnexpectedSignatureAlgorithm {
+        /// The negotiated scheme.
+        expected: &'static [u8],
+        /// The label in the signature blob.
+        found: Vec<u8>,
+    },
     /// The signature blob is malformed or has the wrong length.
     MalformedSignature(KeyError),
+    /// The scheme needs a host signature provider and none that supports it
+    /// was supplied.
+    ProviderUnavailable {
+        /// The scheme.
+        scheme: &'static [u8],
+    },
     /// The signature is well-formed but does not verify for this key and
     /// message.
     Invalid,
@@ -123,7 +194,18 @@ impl fmt::Display for VerifyError {
                 Escaped(signature_algorithm),
                 Escaped(key_algorithm)
             ),
+            VerifyError::UnexpectedSignatureAlgorithm { expected, found } => write!(
+                f,
+                "signature is labelled {}, but {} was negotiated",
+                Escaped(found),
+                Escaped(expected)
+            ),
             VerifyError::MalformedSignature(e) => write!(f, "malformed signature: {e}"),
+            VerifyError::ProviderUnavailable { scheme } => write!(
+                f,
+                "no signature provider for {} in this build",
+                Escaped(scheme)
+            ),
             VerifyError::Invalid => f.write_str("signature does not verify"),
         }
     }

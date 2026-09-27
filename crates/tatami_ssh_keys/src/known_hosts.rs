@@ -31,11 +31,18 @@
 //!   [`KnownHostsError::Unsupported`] (never skipped). A `|` pattern inside
 //!   a comma-separated list is malformed in both builds.
 //! - Keys: the key type must equal the algorithm named inside the decoded
-//!   blob. `ssh-ed25519` keys are fully validated (length, point). Other
-//!   well-formed key types are accepted as entries but confer no trust on
-//!   an Ed25519 identity. Malformed structure, base64 or blobs — including
-//!   in `@revoked` lines — make the whole file a configuration error with a
-//!   line number: a broken revocation is never skipped.
+//!   blob. Keys of every enabled type are validated structurally with the
+//!   same parser the handshake uses: `ssh-ed25519` (length, point),
+//!   `ssh-rsa` (feature `rsa`: strict positive `mpint`s, no trailing
+//!   bytes) and `ecdsa-sha2-nistp256` (feature `ecdsa-p256`: curve name,
+//!   uncompressed point, no trailing bytes). A structurally valid RSA key
+//!   outside the size/exponent policy (for example a legacy 1024-bit key of
+//!   another host) is kept as an entry but can never match: a presented key
+//!   outside the policy is refused before any trust decision. Other key
+//!   types are accepted as opaque entries and confer no trust on another
+//!   type. Malformed structure, base64 or blobs — including in `@revoked`
+//!   lines — make the whole file a configuration error with a line number:
+//!   a broken revocation is never skipped.
 //! - Not supported: SSH-1 (`bits e n`) lines, `@cert-authority` host
 //!   certificates (a CA line is recorded but never trusted as a host key),
 //!   and `known_hosts` options beyond the above.
@@ -71,8 +78,10 @@ use core::fmt;
 
 use base64ct::{Base64, Encoding as _};
 
-use crate::blob::{PublicKeyBlob, SSH_ED25519};
-use crate::ed25519::HostKey;
+use crate::algorithm::KeyType;
+use crate::blob::PublicKeyBlob;
+use crate::error::KeyError;
+use crate::host_key::HostKey;
 use crate::trust::{HostIdentity, HostTrustPolicy, TrustDecision, TrustSource, UntrustedReason};
 
 /// The default SSH port, written without brackets in lookup names.
@@ -141,9 +150,12 @@ pub enum Malformed {
     Blob,
     /// The key type field differs from the algorithm inside the blob.
     KeyTypeMismatch,
-    /// An `ssh-ed25519` key with the wrong length, trailing bytes or an
-    /// invalid point.
-    InvalidEd25519Key,
+    /// A key of an enabled type that does not parse: for `ssh-ed25519` the
+    /// wrong length, trailing bytes or an invalid point; for `ssh-rsa`
+    /// non-canonical or missing integers or trailing bytes; for
+    /// `ecdsa-sha2-nistp256` a wrong curve name, point encoding or trailing
+    /// bytes.
+    InvalidKey(KeyType),
     /// The line contains a NUL byte.
     NulByte,
 }
@@ -158,7 +170,7 @@ impl fmt::Display for Malformed {
             Malformed::Base64 => "key is not valid base64",
             Malformed::Blob => "key blob does not start with an algorithm name",
             Malformed::KeyTypeMismatch => "key type does not match the key blob",
-            Malformed::InvalidEd25519Key => "invalid ssh-ed25519 key",
+            Malformed::InvalidKey(key_type) => return write!(f, "invalid {key_type} key"),
             Malformed::NulByte => "NUL byte in line",
         })
     }
@@ -606,8 +618,13 @@ fn parse_line(content: &[u8], line: usize, limits: &Limits) -> Result<Entry, Kno
     if parsed.algorithm != key_type {
         return Err(bad(Malformed::KeyTypeMismatch));
     }
-    if key_type == SSH_ED25519 {
-        HostKey::parse(&blob).map_err(|_| bad(Malformed::InvalidEd25519Key))?;
+    if let Some(kt) = KeyType::from_name(key_type).filter(|k| k.is_enabled()) {
+        match HostKey::parse(&blob) {
+            // Well formed but outside the RSA size/exponent policy: an inert
+            // entry (see the module notes), not a broken file.
+            Ok(_) | Err(KeyError::RsaModulus { .. } | KeyError::RsaExponent) => {}
+            Err(_) => return Err(bad(Malformed::InvalidKey(kt))),
+        }
     }
     Ok(Entry {
         line,
@@ -702,8 +719,8 @@ pub fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::encode_ed25519_blob;
     use crate::blob::fixtures::{TEST1_PUBLIC_KEY, TEST2_PUBLIC_KEY, TEST3_PUBLIC_KEY};
+    use crate::blob::{SSH_ED25519, encode_ed25519_blob};
     use crate::fingerprint::Sha256Fingerprint;
     use alloc::format;
     use alloc::string::ToString;
@@ -1119,7 +1136,7 @@ mod tests {
 
     #[test]
     fn other_algorithms_and_cas_confer_no_trust() {
-        let kh = parse(&other_alg_line("", "host", "ssh-rsa"));
+        let kh = parse(&other_alg_line("", "host", "ssh-dss"));
         assert_eq!(
             decide(&kh, "host", 22, &TEST1_PUBLIC_KEY),
             untrusted(UntrustedReason::NoKeyForAlgorithm)
@@ -1136,7 +1153,7 @@ mod tests {
         );
         let kh = parse(&format!(
             "{}{}",
-            other_alg_line("@cert-authority ", "*", "ssh-rsa"),
+            other_alg_line("@cert-authority ", "*", "ssh-dss"),
             line("host", &TEST1_PUBLIC_KEY)
         ));
         assert_eq!(decide(&kh, "host", 22, &TEST1_PUBLIC_KEY), trusted(2));
@@ -1186,20 +1203,20 @@ mod tests {
             parse_err(&text),
             KnownHostsError::Malformed {
                 line: 1,
-                what: Malformed::InvalidEd25519Key
+                what: Malformed::InvalidKey(KeyType::Ed25519)
             }
         );
         // Unpadded base64 (OpenSSH writes padding) is rejected. The
         // 51-byte Ed25519 blob needs no padding, so use a 17-byte blob.
         let mut short = Vec::new();
-        put_string(&mut short, b"ssh-rsa");
+        put_string(&mut short, b"ssh-dss");
         put_string(&mut short, &[1, 2]);
         let padded = Base64::encode_string(&short);
         assert!(padded.ends_with('='));
-        assert!(parse(&format!("host ssh-rsa {padded}\n")).entries().len() == 1);
+        assert!(parse(&format!("host ssh-dss {padded}\n")).entries().len() == 1);
         let unpadded = padded.trim_end_matches('=');
         assert_eq!(
-            parse_err(&format!("host ssh-rsa {unpadded}\n")),
+            parse_err(&format!("host ssh-dss {unpadded}\n")),
             KnownHostsError::Malformed {
                 line: 1,
                 what: Malformed::Base64
@@ -1272,5 +1289,154 @@ mod tests {
         let e = parse_err("host ssh-ed25519\n");
         assert_eq!(e.line(), Some(1));
         assert_eq!(e.to_string(), "known_hosts line 1: missing key");
+    }
+}
+
+#[cfg(all(test, feature = "rsa", feature = "ecdsa-p256"))]
+mod other_type_tests {
+    //! RSA and ECDSA P-256 entries through the same policy: exact-blob
+    //! matching, rotation, revocation precedence and the distinct reasons.
+    use super::*;
+    use crate::blob::fixtures::TEST1_PUBLIC_KEY;
+    use crate::fingerprint::Sha256Fingerprint;
+    use crate::test_vectors::*;
+    use alloc::format;
+
+    fn parse(text: &str) -> Result<KnownHosts, KnownHostsError> {
+        KnownHosts::parse(text.as_bytes(), &Limits::default())
+    }
+
+    fn decide(kh: &KnownHosts, host: &str, port: u16, blob: &[u8]) -> TrustDecision {
+        let parsed = PublicKeyBlob::decode(blob).unwrap();
+        let id = HostIdentity {
+            algorithm: parsed.algorithm,
+            blob,
+            sha256: Sha256Fingerprint::of_blob(blob),
+        };
+        kh.policy_for(host, port).unwrap().decide(&id)
+    }
+
+    fn ed25519_line(hosts: &str) -> String {
+        let mut b = alloc::vec![0u8; 51];
+        crate::blob::encode_ed25519_blob(&TEST1_PUBLIC_KEY, &mut b).unwrap();
+        format!("{hosts} ssh-ed25519 {}\n", Base64::encode_string(&b))
+    }
+
+    /// Another valid RSA key: the fixture modulus with a different (still
+    /// odd, still 2048-bit) low byte. Structurally valid; never a real key.
+    fn other_rsa() -> Vec<u8> {
+        let mut b = b64(RSA_2048_PUB);
+        let last = b.len() - 1;
+        b[last] ^= 0x02;
+        b
+    }
+
+    const TRUSTED: fn(usize) -> TrustDecision = |line| TrustDecision::Trusted {
+        source: TrustSource::KnownHosts { line },
+    };
+
+    fn untrusted(reason: UntrustedReason) -> TrustDecision {
+        TrustDecision::Untrusted { reason }
+    }
+
+    #[test]
+    fn rsa_and_p256_entries_are_judged_like_ed25519() {
+        let rsa = b64(RSA_2048_PUB);
+        let p256 = b64(P256_PUB);
+        let text = format!(
+            "host,[host]:2222 ssh-rsa {RSA_2048_PUB}\nhost ecdsa-sha2-nistp256 {P256_PUB}\n{}",
+            ed25519_line("host")
+        );
+        let kh = parse(&text).unwrap();
+        assert_eq!(decide(&kh, "host", 22, &rsa), TRUSTED(1));
+        assert_eq!(decide(&kh, "host", 2222, &rsa), TRUSTED(1));
+        assert_eq!(decide(&kh, "HOST", 22, &p256), TRUSTED(2));
+        // Changed RSA key for a host with an RSA entry.
+        assert_eq!(
+            decide(&kh, "host", 22, &other_rsa()),
+            untrusted(UntrustedReason::KeyChanged { line: 1 })
+        );
+        // Only other key types listed for [host]:2222.
+        assert_eq!(
+            decide(&kh, "host", 2222, &p256),
+            untrusted(UntrustedReason::NoKeyForAlgorithm)
+        );
+        assert_eq!(
+            decide(&kh, "other", 22, &rsa),
+            untrusted(UntrustedReason::UnknownHost)
+        );
+    }
+
+    #[test]
+    fn revocation_wins_before_and_after_for_every_type() {
+        for (kind, pubkey) in [("ssh-rsa", RSA_2048_PUB), ("ecdsa-sha2-nistp256", P256_PUB)] {
+            let blob = b64(pubkey);
+            let plain = format!("host {kind} {pubkey}\n");
+            let revoked = format!("@revoked * {kind} {pubkey}\n");
+            for (text, line) in [
+                (format!("{plain}{revoked}"), 2),
+                (format!("{revoked}{plain}"), 1),
+            ] {
+                let kh = parse(&text).unwrap();
+                assert_eq!(
+                    decide(&kh, "host", 22, &blob),
+                    untrusted(UntrustedReason::Revoked { line }),
+                    "{kind}"
+                );
+            }
+        }
+        // Revoking one RSA key leaves a rotated one trusted.
+        let other = Base64::encode_string(&other_rsa());
+        let kh = parse(&format!(
+            "@revoked host ssh-rsa {RSA_2048_PUB}\nhost ssh-rsa {other}\n"
+        ))
+        .unwrap();
+        assert_eq!(decide(&kh, "host", 22, &other_rsa()), TRUSTED(2));
+    }
+
+    #[test]
+    fn malformed_rsa_and_p256_entries_break_the_file() {
+        // Redundant leading zero on e.
+        let mut bad_rsa = Vec::new();
+        for part in [&b"ssh-rsa"[..], &[0, 1, 0, 1], &b64(RSA_2048_PUB)[22..]] {
+            bad_rsa.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            bad_rsa.extend_from_slice(part);
+        }
+        let mut wrong_curve = b64(P256_PUB);
+        wrong_curve[34] = b'4'; // "nistp256" -> "nistp254"
+        let mut trailing = b64(P256_PUB);
+        trailing.push(0);
+        for (kind, blob, kt) in [
+            ("ssh-rsa", bad_rsa, KeyType::Rsa),
+            ("ecdsa-sha2-nistp256", wrong_curve, KeyType::EcdsaP256),
+            ("ecdsa-sha2-nistp256", trailing, KeyType::EcdsaP256),
+        ] {
+            let text = format!("@revoked host {kind} {}\n", Base64::encode_string(&blob));
+            assert_eq!(
+                parse(&text).unwrap_err(),
+                KnownHostsError::Malformed {
+                    line: 1,
+                    what: Malformed::InvalidKey(kt)
+                },
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_violations_are_inert_entries_and_other_curves_opaque() {
+        let text = format!("host ssh-rsa {RSA_1024_PUB}\nhost ecdsa-sha2-nistp384 {P384_PUB}\n");
+        let kh = parse(&text).unwrap();
+        assert_eq!(kh.entries().len(), 2);
+        // The 1024-bit key could never be presented (it fails to parse in
+        // the handshake); a valid RSA key sees "key changed".
+        assert_eq!(
+            decide(&kh, "host", 22, &b64(RSA_2048_PUB)),
+            untrusted(UntrustedReason::KeyChanged { line: 1 })
+        );
+        assert_eq!(
+            decide(&kh, "host", 22, &b64(P256_PUB)),
+            untrusted(UntrustedReason::NoKeyForAlgorithm)
+        );
     }
 }

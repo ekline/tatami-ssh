@@ -43,6 +43,12 @@ step cargo clippy --workspace --all-targets --all-features -- -D warnings
 # ordinary build (hashed entries unsupported) too.
 step cargo clippy -p tatami_ssh_keys --all-targets --no-default-features --features known-hosts,openssh-key -- -D warnings
 step cargo clippy -p tatami_ssh --all-targets --no-default-features --features std,tcp,kex,quic-diag -- -D warnings
+# Round 6 key types, one at a time (Ed25519-only is the line above).
+step cargo clippy -p tatami_ssh_keys --all-targets --no-default-features --features rsa -- -D warnings
+step cargo clippy -p tatami_ssh_keys --all-targets --no-default-features --features ecdsa-p256 -- -D warnings
+step cargo clippy -p tatami_ssh_keys --all-targets --no-default-features --features known-hosts,openssh-key,ecdsa-p256 -- -D warnings
+step cargo clippy -p tatami_ssh --all-targets --no-default-features --features std,tcp,kex,quic-diag,rsa -- -D warnings
+step cargo clippy -p tatami_ssh --all-targets --no-default-features --features std,tcp,kex,quic-diag,ecdsa-p256 -- -D warnings
 
 # tatami_ssh_wire is the only shared package with a feature; check both states.
 # The allocation-free path is checked in isolation: when other workspace
@@ -70,7 +76,7 @@ step cargo check -p tatami_ssh_keys --no-default-features --features ed25519
 step cargo check -p tatami_ssh_tcp --no-default-features --features kex
 step cargo check -p tatami_ssh_tcp --no-default-features --features std,kex
 printf '\n==> verify the kex feature graph enables no std feature\n'
-if cargo tree -p tatami_ssh_tcp --no-default-features --features kex -e features -f '{p} {f}' \
+if cargo tree -p tatami_ssh_tcp --no-default-features --features kex -e normal,build -e features -f '{p} {f}' \
     | grep -E 'feature "std"' | grep -v semver; then
     echo "error: a std feature is enabled in the portable kex graph" >&2
     exit 1
@@ -87,6 +93,28 @@ step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts
 step cargo check -p tatami_ssh_openssh_compat
 step cargo check -p tatami_ssh_keys --no-default-features --features openssh-hashed-hosts
 step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts
+# RSA / ECDSA P-256 host keys (round 6): portable parsing and policy; the
+# final signature check is a host-supplied provider, so no C/asm here.
+step cargo check -p tatami_ssh_keys --no-default-features --features fingerprint
+step cargo check -p tatami_ssh_keys --no-default-features --features rsa
+step cargo check -p tatami_ssh_keys --no-default-features --features ecdsa-p256
+step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,rsa,ecdsa-p256
+printf '\n==> verify portable RSA/P-256 key support pulls no C/asm provider or std\n'
+if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,rsa,ecdsa-p256 -e normal \
+    | grep -qE 'ring|rustls|aws-lc|openssl|getrandom|[^-]rsa v'; then
+    echo "error: a host-only provider (or the rsa crate) in the portable key graph" >&2
+    exit 1
+fi
+if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,rsa,ecdsa-p256 \
+    -e normal,build -e features -f '{p} {f}' | grep -E 'feature "std"' | grep -v semver; then
+    echo "error: a std feature is enabled in the portable RSA/P-256 graph" >&2
+    exit 1
+fi
+if cargo tree -p tatami_ssh --no-default-features --features std,tcp,kex,quic-diag,rsa,ecdsa-p256 -e normal \
+    | grep -qE '(^|[^_-])rsa v[0-9]'; then
+    echo "error: the rsa crate (RUSTSEC-2023-0071) is in the facade graph" >&2
+    exit 1
+fi
 printf '\n==> verify the host-identity feature graph enables no std feature\n'
 if cargo tree -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts \
     -e normal,build -e features -f '{p} {f}' | grep -E 'feature "std"' | grep -v semver; then
@@ -130,7 +158,8 @@ fi
 
 # Facade feature matrix from docs/architecture.md.
 for features in "" std tcp quic tcp,quic std,tcp std,quic std,tcp,quic kex std,tcp,kex quic-diag quic-diag,tcp std,tcp,kex,quic-diag \
-    openssh-hashed-hosts kex,openssh-hashed-hosts std,tcp,kex,quic-diag,openssh-hashed-hosts; do
+    openssh-hashed-hosts kex,openssh-hashed-hosts std,tcp,kex,quic-diag,openssh-hashed-hosts \
+    rsa ecdsa-p256 rsa,ecdsa-p256 std,tcp,kex,rsa std,tcp,kex,quic-diag,rsa,ecdsa-p256 quic-diag,rsa; do
     if [ -z "$features" ]; then
         step cargo check -p tatami_ssh --no-default-features
     else
@@ -144,6 +173,7 @@ step cargo build -p tatami_ssh --no-default-features --features std,tcp --bins
 step cargo build -p tatami_ssh --no-default-features --features std,tcp,kex --bins
 step cargo build -p tatami_ssh --no-default-features --features std,tcp,quic-diag --bins
 step cargo build -p tatami_ssh --no-default-features --features std,tcp,kex,quic-diag --bins
+step cargo build -p tatami_ssh --no-default-features --features std,tcp,kex,quic-diag,rsa,ecdsa-p256 --bins
 
 step cargo test --workspace --all-features
 # `--all-features` enables openssh-hashed-hosts; also test the ordinary
@@ -151,6 +181,9 @@ step cargo test --workspace --all-features
 # error (unit tests, facade trust and the OpenSSH identity tests).
 step cargo test -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key
 step cargo test -p tatami_ssh --no-default-features --features std,tcp,kex,quic-diag
+# Each key type on its own, and the portable key crate without a provider.
+step cargo test -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,rsa
+step cargo test -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,ecdsa-p256
 step env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
 # Core/alloc-only check: catches accidental transitive std use that a host
@@ -174,6 +207,8 @@ if [ "$run_embedded" -eq 1 ]; then
         step cargo check -p tatami_ssh_openssh_compat --target "$EMBEDDED_TARGET"
         step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,openssh-hashed-hosts --target "$EMBEDDED_TARGET"
         step cargo check -p tatami_ssh --no-default-features --features kex,openssh-hashed-hosts --target "$EMBEDDED_TARGET"
+        # RSA / ECDSA P-256 parsing, policy and import (round 6), no std.
+        step cargo check -p tatami_ssh_keys --no-default-features --features known-hosts,openssh-key,rsa,ecdsa-p256 --target "$EMBEDDED_TARGET"
     elif [ "${CHECK_EMBEDDED_REQUIRED:-0}" = 1 ]; then
         echo "error: target $EMBEDDED_TARGET is not installed" >&2
         exit 1

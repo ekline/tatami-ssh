@@ -14,7 +14,7 @@ use tatami_ssh_keys::blob::encode_ed25519_blob;
 use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
 use tatami_ssh_keys::sshfp::{Sshfp, TYPE_SHA256};
 use tatami_ssh_keys::trust::{HostIdentity, HostTrustPolicy, PinnedSha256};
-use tatami_ssh_tcp::negotiate::ClientProposal;
+use tatami_ssh_tcp::negotiate::{ClientProposal, HostKeyAlgorithms};
 use tatami_ssh_wire::kexinit::KexInit;
 
 /// SHA-1 host-key / signature algorithms (RFC 4253 `ssh-rsa` signatures,
@@ -52,13 +52,21 @@ const KEYGEN_R_SHA256: &str =
 
 fn proposals() -> Vec<ClientProposal> {
     let mut out = Vec::new();
+    // Ed25519 only (no provider) and every scheme Tatami can offer.
+    let lists = [
+        HostKeyAlgorithms::ED25519_ONLY,
+        HostKeyAlgorithms::preferred(|_| true).unwrap(),
+    ];
     for advertise_ext_info in [false, true] {
         for offer_strict_kex in [false, true] {
-            out.push(ClientProposal {
-                cookie: [0x5a; 16],
-                advertise_ext_info,
-                offer_strict_kex,
-            });
+            for host_key_algorithms in lists {
+                out.push(ClientProposal {
+                    cookie: [0x5a; 16],
+                    advertise_ext_info,
+                    offer_strict_kex,
+                    host_key_algorithms,
+                });
+            }
         }
     }
     out

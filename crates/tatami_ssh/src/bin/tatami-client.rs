@@ -32,6 +32,7 @@ Usage:
   tatami-client handshake HOST (--host-key-sha256 'SHA256:...' |
                            --known-hosts FILE) [--port PORT]
                            [--connect-timeout DURATION] [--timeout DURATION]
+                           [--host-key-algorithms LIST]
                            [--no-ext-info] [--no-strict-kex] [--json]
   tatami-client handshake HOST --transport quic --alpn PROTO
                            (--host-key-sha256 'SHA256:...' | --known-hosts FILE
@@ -48,9 +49,11 @@ Commands:
               sent; a server that waits for the client's proposal will time
               out with a partial result. TCP only.
   handshake   With --transport tcp (the default): connect to HOST:PORT and
-              perform the first interoperability profile's key exchange
-              (curve25519-sha256, ssh-ed25519, aes128-gcm@openssh.com, strict
-              KEX): verify the host signature, decide trust with the pin
+              perform the key exchange (curve25519-sha256,
+              aes128-gcm@openssh.com, strict KEX; host keys ssh-ed25519,
+              and with --features rsa / ecdsa-p256 also rsa-sha2-512,
+              rsa-sha2-256 and ecdsa-sha2-nistp256; never ssh-rsa/SHA-1):
+              verify the host signature, decide trust with the pin
               (--host-key-sha256) or the known_hosts file (--known-hosts),
               exchange NEWKEYS, request the ssh-userauth service and
               disconnect.
@@ -98,6 +101,12 @@ Options (handshake, TCP):
   --connect-timeout DURATION Deadline for the whole connect phase (default 10s)
   --timeout DURATION         Overall deadline from connect to the outcome,
                              covering every read and write (default 10s)
+  --host-key-algorithms LIST Offer exactly these host-key algorithms, in
+                             this order (comma-separated), e.g.
+                             rsa-sha2-256 to force one. Default: every one
+                             this build verifies, in the order ssh-ed25519,
+                             ecdsa-sha2-nistp256, rsa-sha2-512,
+                             rsa-sha2-256. ssh-rsa (RSA/SHA-1) is refused.
   --no-ext-info              Do not offer ext-info-c
   --no-strict-kex            Do not offer the strict-KEX markers
   --json                     Print one JSON object instead of the text report
@@ -343,6 +352,10 @@ fn parse_tcp_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, 
                 io.connect_timeout = parse_duration(value(&mut it, "--connect-timeout")?)?;
             }
             "--timeout" => io.overall_timeout = parse_duration(value(&mut it, "--timeout")?)?,
+            "--host-key-algorithms" => {
+                let v = value(&mut it, "--host-key-algorithms")?;
+                config.host_key_algorithms = Some(parse_host_key_algorithms(v)?);
+            }
             "--no-ext-info" => config.advertise_ext_info = false,
             "--no-strict-kex" => config.offer_strict_kex = false,
             "--json" => json = true,
@@ -370,6 +383,43 @@ fn parse_tcp_handshake(mut it: std::slice::Iter<'_, String>) -> Result<Command, 
     options.io = io;
     options.config = config;
     Ok(Command::Handshake { options, json })
+}
+
+/// Parses `--host-key-algorithms`: known, enabled, distinct names.
+#[cfg(feature = "kex")]
+fn parse_host_key_algorithms(
+    v: &str,
+) -> Result<tatami_ssh::tcp::negotiate::HostKeyAlgorithms, UsageError> {
+    use tatami_ssh::keys::SignatureScheme;
+    let mut schemes = Vec::new();
+    for name in v.split(',') {
+        let scheme = match SignatureScheme::from_name(name.as_bytes()) {
+            Some(s) => s,
+            None if name == "ssh-rsa" => {
+                return Err(UsageError(String::from(
+                    "--host-key-algorithms: ssh-rsa (RSA/SHA-1 signatures) is not supported; use rsa-sha2-512 or rsa-sha2-256 (same RSA key)",
+                )));
+            }
+            None => {
+                return Err(UsageError(format!(
+                    "--host-key-algorithms: unknown algorithm {name:?} (supported: ssh-ed25519, ecdsa-sha2-nistp256, rsa-sha2-512, rsa-sha2-256)"
+                )));
+            }
+        };
+        if !scheme.is_enabled() {
+            return Err(UsageError(format!(
+                "--host-key-algorithms: {scheme} requires a build with --features {}",
+                if scheme.key_type() == tatami_ssh::keys::KeyType::Rsa {
+                    "rsa"
+                } else {
+                    "ecdsa-p256"
+                }
+            )));
+        }
+        schemes.push(scheme);
+    }
+    tatami_ssh::tcp::negotiate::HostKeyAlgorithms::new(&schemes)
+        .map_err(|e| UsageError(format!("--host-key-algorithms: {e}")))
 }
 
 #[cfg(feature = "kex")]

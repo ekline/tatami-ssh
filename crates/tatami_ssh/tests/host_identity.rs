@@ -15,6 +15,11 @@
 //! SSHFP value seen over TCP equals the one derived from
 //! the QUIC raw public key and `ssh-keygen -r`. No run modifies the file.
 //!
+//! With the `rsa` and `ecdsa-p256` features (round 6) the same continuity
+//! is shown for RSA and ECDSA P-256 host keys, and OpenSSH TCP handshakes
+//! are forced to each host signature scheme (`ssh-ed25519`, `rsa-sha2-256`,
+//! `rsa-sha2-512`, `ecdsa-sha2-nistp256`) from either side.
+//!
 //! Skips with a notice when `/usr/sbin/sshd` or `/usr/bin/ssh-keygen` is
 //! missing; a present-but-failing OpenSSH is a test failure.
 
@@ -79,28 +84,29 @@ fn scratch() -> PathBuf {
 /// An ephemeral host key: private file, `.pub` line, fingerprint.
 struct Key {
     path: PathBuf,
+    /// Blob type from the `.pub` line (`ssh-ed25519`, `ssh-rsa`, ...).
+    kind: String,
     pub_b64: String,
     fingerprint: String,
 }
 
 fn keygen(dir: &Path, name: &str) -> Key {
+    keygen_typed(dir, name, &["-t", "ed25519"])
+}
+
+/// `ssh-keygen -q -N '' ... type_args`, e.g. `["-t", "rsa", "-b", "3072"]`.
+fn keygen_typed(dir: &Path, name: &str, type_args: &[&str]) -> Key {
     let path = dir.join(name);
     let st = Command::new(SSH_KEYGEN)
-        .args([
-            "-q",
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-C",
-            "tatami-fixture",
-            "-f",
-        ])
+        .args(["-q", "-N", "", "-C", "tatami-fixture"])
+        .args(type_args)
+        .arg("-f")
         .arg(&path)
         .status()
         .unwrap();
     assert!(st.success());
     let pub_line = std::fs::read_to_string(path.with_extension("pub")).unwrap();
+    let kind = pub_line.split_whitespace().next().unwrap().to_string();
     let pub_b64 = pub_line.split_whitespace().nth(1).unwrap().to_string();
     let lf = Command::new(SSH_KEYGEN)
         .arg("-lf")
@@ -114,13 +120,20 @@ fn keygen(dir: &Path, name: &str) -> Key {
         .to_string();
     Key {
         path,
+        kind,
         pub_b64,
         fingerprint,
     }
 }
 
-/// `ssh-keygen -r` SSHFP SHA-256 RDATA (`4 2 <hex>`) for a key.
+/// `ssh-keygen -r` SSHFP SHA-256 RDATA (`A 2 <hex>`) for a key.
 fn keygen_sshfp(key: &Key) -> String {
+    let alg = match key.kind.as_str() {
+        "ssh-rsa" => 1,
+        "ecdsa-sha2-nistp256" => 3,
+        _ => 4,
+    };
+    let marker = format!("SSHFP {alg} 2 ");
     let o = Command::new(SSH_KEYGEN)
         .args(["-r", "fixture.example", "-f"])
         .arg(key.path.with_extension("pub"))
@@ -129,8 +142,8 @@ fn keygen_sshfp(key: &Key) -> String {
     let text = String::from_utf8_lossy(&o.stdout);
     let line = text
         .lines()
-        .find(|l| l.contains("SSHFP 4 2 "))
-        .expect("ssh-keygen -r printed a 4 2 record");
+        .find(|l| l.contains(&marker))
+        .expect("ssh-keygen -r printed a SHA-256 record");
     line.split_once("SSHFP ").unwrap().1.trim().to_string()
 }
 
@@ -168,6 +181,12 @@ fn free_port_pair() -> u16 {
 }
 
 fn sshd_supports_penalties(key: &Path) -> bool {
+    // Probed once per process; the answer depends only on the sshd binary.
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| sshd_supports_penalties_uncached(key))
+}
+
+fn sshd_supports_penalties_uncached(key: &Path) -> bool {
     let o = Command::new(SSHD)
         .args(["-T", "-f", "/dev/null", "-h"])
         .arg(key)
@@ -184,6 +203,12 @@ fn sshd_supports_penalties(key: &Path) -> bool {
 }
 
 fn start_sshd(key: &Path, port: u16) -> Result<(Child, Log), String> {
+    start_sshd_with(&[key], port, &[])
+}
+
+/// `sshd` with one `-h` per key and extra `-o` style arguments.
+fn start_sshd_with(keys: &[&Path], port: u16, extra: &[&str]) -> Result<(Child, Log), String> {
+    let key = keys[0];
     let mut args: Vec<String> = [
         "-D",
         "-e",
@@ -205,8 +230,12 @@ fn start_sshd(key: &Path, port: u16) -> Result<(Child, Log), String> {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    args.extend(["-p".into(), port.to_string(), "-h".into()]);
-    args.push(key.display().to_string());
+    args.extend(["-p".into(), port.to_string()]);
+    for k in keys {
+        args.push("-h".into());
+        args.push(k.display().to_string());
+    }
+    args.extend(extra.iter().map(|s| s.to_string()));
     if sshd_supports_penalties(key) {
         args.extend(["-o".into(), "PerSourcePenalties=no".into()]);
     }
@@ -346,7 +375,7 @@ fn write_kh(dir: &Path, name: &str, text: &str) -> PathBuf {
 }
 
 fn entry(hosts: &str, key: &Key) -> String {
-    format!("{hosts} ssh-ed25519 {}\n", key.pub_b64)
+    format!("{hosts} {} {}\n", key.kind, key.pub_b64)
 }
 
 /// Runs both transports with `--known-hosts file` and returns the two
@@ -817,5 +846,305 @@ fn conflicting_trust_options_are_usage_errors() {
         let o = client(args);
         assert_eq!(o.status.code(), Some(2), "{args:?}");
         assert!(o.stdout.is_empty());
+    }
+}
+
+/// Round 6: RSA and ECDSA P-256 host keys against OpenSSH, and the same key
+/// on TCP and QUIC.
+#[cfg(all(feature = "rsa", feature = "ecdsa-p256"))]
+mod host_key_types {
+    use super::*;
+
+    const RSA: &[&str] = &["-t", "rsa", "-b", "3072"];
+    const P256: &[&str] = &["-t", "ecdsa", "-b", "256"];
+
+    /// An `sshd` serving all of `keys` (plus `extra` options) on a fresh
+    /// TCP port.
+    struct Sshd {
+        port: u16,
+        child: Child,
+        _log: Log,
+    }
+
+    impl Drop for Sshd {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn sshd(keys: &[&Key], extra: &[&str]) -> Sshd {
+        let paths: Vec<&Path> = keys.iter().map(|k| k.path.as_path()).collect();
+        let mut last = String::new();
+        for _ in 0..5 {
+            let port = free_port_pair();
+            match start_sshd_with(&paths, port, extra) {
+                Ok((child, log)) => {
+                    return Sshd {
+                        port,
+                        child,
+                        _log: log,
+                    };
+                }
+                Err(e) if e.contains("Address already in use") => last = e,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("could not start sshd: {last}");
+    }
+
+    fn assert_completed(v: &Value, scheme: &str, key: &Key) {
+        assert_eq!(v["outcome_code"], "completed", "{v}");
+        assert_eq!(v["selected"]["host_key"], scheme, "{v}");
+        assert_eq!(v["host_key"]["algorithm"], key.kind.as_str(), "{v}");
+        assert_eq!(v["fingerprint_sha256"], key.fingerprint.as_str(), "{v}");
+        assert_eq!(v["host_key_signature_valid"], true);
+        assert_eq!(v["host_trusted"], true);
+        assert_eq!(v["service_accepted"], "ssh-userauth");
+        assert_eq!(v["user_authenticated"], false);
+    }
+
+    #[test]
+    fn openssh_tcp_handshakes_forced_to_each_scheme() {
+        if !openssh_available("openssh_tcp_handshakes_forced_to_each_scheme") {
+            return;
+        }
+        let dir = scratch();
+        let ed = keygen(&dir, "ed25519");
+        let rsa = keygen_typed(&dir, "rsa", RSA);
+        let p256 = keygen_typed(&dir, "p256", P256);
+        let server = sshd(&[&ed, &rsa, &p256], &[]);
+
+        // Forced from the client; the server offers all three key types.
+        for (scheme, key) in [
+            ("ssh-ed25519", &ed),
+            ("rsa-sha2-256", &rsa),
+            ("rsa-sha2-512", &rsa),
+            ("ecdsa-sha2-nistp256", &p256),
+        ] {
+            let (code, v) = tcp(
+                server.port,
+                &[
+                    "--host-key-sha256",
+                    &key.fingerprint,
+                    "--host-key-algorithms",
+                    scheme,
+                ],
+            );
+            assert_eq!(code, 0, "{scheme}: {v}");
+            assert_completed(&v, scheme, key);
+            assert_eq!(
+                v["advertised"]["client"]["server_host_key_algorithms"],
+                serde_json::json!([scheme])
+            );
+        }
+        // Unforced: Tatami's preference order puts ssh-ed25519 first.
+        let (code, v) = tcp(server.port, &["--host-key-sha256", &ed.fingerprint]);
+        assert_eq!(code, 0, "{v}");
+        assert_completed(&v, "ssh-ed25519", &ed);
+        assert_eq!(
+            v["advertised"]["client"]["server_host_key_algorithms"],
+            serde_json::json!([
+                "ssh-ed25519",
+                "ecdsa-sha2-nistp256",
+                "rsa-sha2-512",
+                "rsa-sha2-256"
+            ])
+        );
+        // One RSA key, one fingerprint, both SHA-2 schemes: a known_hosts
+        // file listing only the Ed25519 key refuses the RSA identity.
+        let kh = write_kh(
+            &dir,
+            "only_ed25519",
+            &entry(&format!("[127.0.0.1]:{}", server.port), &ed),
+        );
+        let (code, v) = tcp(
+            server.port,
+            &[
+                "--known-hosts",
+                kh.to_str().unwrap(),
+                "--host-key-algorithms",
+                "rsa-sha2-512",
+            ],
+        );
+        assert_eq!(code, 1, "{v}");
+        assert_eq!(v["untrusted_reason"], "no_key_for_algorithm");
+        drop(server);
+
+        // Forced from the server: OpenSSH offers only rsa-sha2-256, the
+        // client its default list.
+        let server = sshd(
+            &[&ed, &rsa, &p256],
+            &["-o", "HostKeyAlgorithms=rsa-sha2-256"],
+        );
+        let (code, v) = tcp(server.port, &["--host-key-sha256", &rsa.fingerprint]);
+        assert_eq!(code, 0, "{v}");
+        assert_completed(&v, "rsa-sha2-256", &rsa);
+        drop(server);
+
+        // A server that offers only RSA/SHA-1 has nothing in common.
+        let server = sshd(&[&rsa], &["-o", "HostKeyAlgorithms=ssh-rsa"]);
+        let (code, v) = tcp(server.port, &["--host-key-sha256", &rsa.fingerprint]);
+        assert_eq!(code, 1, "{v}");
+        assert_eq!(v["outcome_code"], "negotiation_failed", "{v}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rsa_and_p256_keys_cover_tcp_and_quic() {
+        if !openssh_available("rsa_and_p256_keys_cover_tcp_and_quic") {
+            return;
+        }
+        let dir = scratch();
+        let ed = keygen(&dir, "ed25519");
+        for (name, args) in [("rsa", RSA), ("p256", P256)] {
+            let key = keygen_typed(&dir, name, args);
+            let other = keygen_typed(&dir, &format!("{name}_other"), args);
+            let pair = start_pair(&key);
+            let port = pair.port;
+            let bracket = format!("[127.0.0.1]:{port}");
+            assert_eq!(
+                pair.quic_started["ssh_host_key_algorithm"],
+                key.kind.as_str()
+            );
+            assert_eq!(
+                pair.quic_started["ssh_host_key_sha256"],
+                key.fingerprint.as_str()
+            );
+
+            // One ordinary known_hosts record, both transports.
+            let kh = write_kh(&dir, &format!("{name}_kh"), &entry(&bracket, &key));
+            let f = kh.to_str().unwrap();
+            let (tc, tv) = tcp(port, &["--known-hosts", f]);
+            assert_eq!(tc, 0, "{tv}");
+            assert_eq!(tv["host_key"]["algorithm"], key.kind.as_str());
+            assert_eq!(tv["fingerprint_sha256"], key.fingerprint.as_str());
+            assert_eq!(tv["known_hosts_lookup"], bracket.as_str());
+            assert_eq!(tv["service_accepted"], "ssh-userauth");
+            let (qc, qv) = quic(port, &["--known-hosts", f]);
+            assert_eq!(qc, 0, "{qv}");
+            assert_eq!(qv["ssh_host_key"]["algorithm"], key.kind.as_str());
+            assert_eq!(
+                qv["ssh_host_key"]["fingerprint_sha256"],
+                key.fingerprint.as_str()
+            );
+            assert_eq!(qv["known_hosts_lookup"], bracket.as_str());
+            assert_eq!(qv["handshake_outcome"], "completed");
+            // SSHFP with the key type's algorithm number, as ssh-keygen -r.
+            assert_eq!(qv["ssh_host_key"]["sshfp"], keygen_sshfp(&key).as_str());
+
+            // One SSH-blob SHA-256 pin, both transports.
+            let (tc, _) = tcp(port, &["--host-key-sha256", &key.fingerprint]);
+            let (qc, qv) = quic(port, &["--host-key-sha256", &key.fingerprint]);
+            assert_eq!((tc, qc), (0, 0), "{qv}");
+            let (tc, tv) = tcp(port, &["--host-key-sha256", &other.fingerprint]);
+            let (qc, qv) = quic(port, &["--host-key-sha256", &other.fingerprint]);
+            assert_eq!((tc, qc), (1, 1));
+            assert_eq!(tv["untrusted_reason"], "fingerprint_mismatch");
+            assert_eq!(qv["untrusted_reason"], "fingerprint_mismatch");
+
+            // Failures, identical on both transports.
+            let cases = [
+                ("changed", entry(&bracket, &other), "key_changed"),
+                ("other_type", entry(&bracket, &ed), "no_key_for_algorithm"),
+                ("port22", entry("127.0.0.1", &key), "unknown_host"),
+                (
+                    "revoked_before",
+                    format!(
+                        "@revoked * {} {}\n{}",
+                        key.kind,
+                        key.pub_b64,
+                        entry(&bracket, &key)
+                    ),
+                    "revoked",
+                ),
+                (
+                    "revoked_after",
+                    format!(
+                        "{}@revoked {bracket} {} {}\n",
+                        entry(&bracket, &key),
+                        key.kind,
+                        key.pub_b64
+                    ),
+                    "revoked",
+                ),
+                (
+                    "rotation",
+                    format!("{}{}", entry(&bracket, &other), entry(&bracket, &key)),
+                    "trusted",
+                ),
+            ];
+            for (case, text, expected) in cases {
+                let file = write_kh(&dir, &format!("{name}_{case}"), &text);
+                let (t, q) = both(&pair, &file);
+                assert_eq!(
+                    (t.as_str(), q.as_str()),
+                    (expected, expected),
+                    "{name} {case}"
+                );
+            }
+            drop(pair);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_outside_the_policy_are_refused() {
+        if !openssh_available("keys_outside_the_policy_are_refused") {
+            return;
+        }
+        let dir = scratch();
+        let run_quic = |key: &Key| {
+            Command::new(SERVER)
+                .args(["observe", "--transport", "quic", "--alpn", ALPN])
+                .args(["--listen", "127.0.0.1:0", "--run-for", "1s"])
+                .args(["--host-key", key.path.to_str().unwrap()])
+                .output()
+                .unwrap()
+        };
+        // 1024-bit RSA: below the policy on both transports.
+        let small = keygen_typed(&dir, "rsa1024", &["-t", "rsa", "-b", "1024"]);
+        let o = run_quic(&small);
+        assert_eq!(o.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("1024 bits"), "{err}");
+        assert!(o.stdout.is_empty());
+        let server = sshd(&[&small], &["-o", "HostKeyAlgorithms=rsa-sha2-512"]);
+        let (code, v) = tcp(server.port, &["--host-key-sha256", &small.fingerprint]);
+        assert_eq!(code, 1, "{v}");
+        assert_eq!(v["outcome_code"], "protocol_error", "{v}");
+        assert!(v["outcome"].as_str().unwrap().contains("1024 bits"), "{v}");
+        assert_ne!(v["host_trusted"], true);
+        drop(server);
+        // ECDSA P-384: not supported.
+        let p384 = keygen_typed(&dir, "p384", &["-t", "ecdsa", "-b", "384"]);
+        let o = run_quic(&p384);
+        assert_eq!(o.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("ecdsa-sha2-nistp384"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_algorithm_option_is_validated() {
+        for (list, needle) in [
+            ("ssh-rsa", "RSA/SHA-1"),
+            ("ssh-dss", "unknown algorithm"),
+            ("rsa-sha2-256,rsa-sha2-256", "listed twice"),
+            ("", "unknown algorithm"),
+        ] {
+            let o = client(&[
+                "handshake",
+                "h",
+                "--host-key-sha256",
+                "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8",
+                "--host-key-algorithms",
+                list,
+            ]);
+            assert_eq!(o.status.code(), Some(2), "{list}");
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(err.contains(needle), "{list}: {err}");
+        }
     }
 }

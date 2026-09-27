@@ -96,13 +96,17 @@ Options for observe (QUIC only):
                          in preference order). The value is experimental and
                          UNREGISTERED; no interoperability with any other
                          implementation is claimed. There is no default.
-  --host-key FILE        An OpenSSH Ed25519 host private key (unencrypted
+  --host-key FILE        One OpenSSH host private key (unencrypted
                          openssh-key-v1, e.g. /etc/ssh/ssh_host_ed25519_key;
-                         must not be group/other-accessible). Presented as
-                         an RFC 7250 raw public key: clients verify it with
+                         must not be group/other-accessible): Ed25519, and
+                         with --features rsa / ecdsa-p256 also RSA (2048,
+                         3072 or 4096 bits) or ECDSA P-256. Presented as an
+                         RFC 7250 raw public key: clients verify it with
                          the same known_hosts entry or SSH fingerprint as
-                         the TCP server using that key. No certificate is
-                         made; encrypted keys are refused.
+                         the TCP server using that key (TLS signs with
+                         RSA-PSS / ECDSA, not the SSH signature format).
+                         No certificate is made; encrypted keys are
+                         refused.
   --identity-dir DIR     Instead: directory holding a TEST cert.pem and
                          key.pem (X.509 diagnostic identity).
   --generate-identity    Generate a self-signed Ed25519 test identity into
@@ -514,9 +518,12 @@ fn observe_quic(options: quic_server::Options) -> ExitCode {
             "{NAME}: certificate SHA-256 (pin this with --cert-sha256; certificate DER hash, not an SSH host-key fingerprint): {cert}"
         );
     }
-    if let Some(fp) = presented.ssh_host_key_sha256() {
+    if let (Some(key_type), Some(fp)) = (
+        presented.ssh_host_key_type(),
+        presented.ssh_host_key_sha256(),
+    ) {
         eprintln!(
-            "{NAME}: SSH host key ssh-ed25519 {fp} presented as an RFC 7250 raw public key (verify with --known-hosts or --host-key-sha256, as for the TCP server using this key)"
+            "{NAME}: SSH host key {key_type} {fp} presented as an RFC 7250 raw public key (verify with --known-hosts or --host-key-sha256, as for the TCP server using this key)"
         );
     }
     eprintln!(

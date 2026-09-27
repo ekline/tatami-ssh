@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tatami_ssh_keys::openssh_key::{Ed25519HostPrivateKey, MAX_PRIVATE_KEY_BYTES, PrivateKeyError};
+use tatami_ssh_keys::openssh_key::{HostPrivateKey, MAX_PRIVATE_KEY_BYTES, PrivateKeyError};
 use tatami_ssh_quic::diag::identity::{
     HostKeyIdentity, IdentityError, PresentedIdentity, ServerIdentity, TestIdentity,
 };
@@ -225,17 +225,28 @@ pub fn prepare(options: Options) -> Result<Prepared, RunError> {
     })
 }
 
-/// Reads an OpenSSH Ed25519 host key (bounded, owner-only permissions on
-/// Unix) and prepares it for the TLS stack without writing any copy.
+/// Reads an OpenSSH host key (bounded, owner-only permissions on Unix) of
+/// any type this build supports (Ed25519; RSA and ECDSA P-256 with the
+/// `rsa` / `ecdsa-p256` features) and prepares it for the TLS stack without
+/// writing any copy. The provider re-validates the converted key and proves
+/// possession before any socket exists (see `HostKeyIdentity`).
 pub fn load_host_key(path: &std::path::Path) -> Result<HostKeyIdentity, RunError> {
+    use tatami_ssh_keys::openssh_key::PrivateKeyFormat;
+    use tatami_ssh_quic::diag::identity::PrivateKeyEncoding;
     let text = crate::host::files::read_private_key(path, MAX_PRIVATE_KEY_BYTES)
         .map_err(RunError::HostKeyFile)?;
-    let key = Ed25519HostPrivateKey::from_openssh(&text).map_err(|error| RunError::HostKey {
+    let key = HostPrivateKey::from_openssh(&text).map_err(|error| RunError::HostKey {
         path: path.to_path_buf(),
         error,
     })?;
-    let pkcs8 = key.to_pkcs8_der();
-    HostKeyIdentity::from_pkcs8(&pkcs8, &key.ssh_blob()).map_err(RunError::Identity)
+    let der = key.to_private_key_der();
+    let encoding = match der.format {
+        PrivateKeyFormat::Pkcs8 => PrivateKeyEncoding::Pkcs8,
+        PrivateKeyFormat::Pkcs1 => PrivateKeyEncoding::Pkcs1,
+        PrivateKeyFormat::Sec1 => PrivateKeyEncoding::Sec1,
+    };
+    HostKeyIdentity::from_private_key_der(encoding, &der.der, &key.ssh_blob())
+        .map_err(RunError::Identity)
 }
 
 /// Encodes server events as JSON records.
@@ -275,7 +286,7 @@ impl Encoder {
                 )
                 .opt(
                     "ssh_host_key_algorithm",
-                    identity.ssh_host_key_sha256().map(|_| "ssh-ed25519"),
+                    identity.ssh_host_key_type().map(|k| k.to_string()),
                 )
                 .field("alpn", bytes_list(alpn, self.max_field_bytes))
                 .field("alpn_registered", false)

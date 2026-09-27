@@ -4,9 +4,12 @@
 //!   `PKCS_ED25519`) with its PKCS#8 key. It exists only so an X.509 TLS 1.3
 //!   handshake can complete; no trust beyond an explicit pin or test root is
 //!   derived from it.
-//! - [`HostKeyIdentity`]: an SSH Ed25519 host key presented as an RFC 7250
-//!   raw public key. The same key an OpenSSH server uses on TCP; no
-//!   certificate is manufactured for it.
+//! - [`HostKeyIdentity`]: an SSH host key (Ed25519, and RSA / ECDSA P-256
+//!   with the `rsa` / `ecdsa-p256` features) presented as an RFC 7250 raw
+//!   public key. The same key an OpenSSH server uses on TCP; no
+//!   certificate is manufactured for it. TLS 1.3 signs `CertificateVerify`
+//!   with RSA-PSS (RSA keys), ECDSA P-256/SHA-256 in DER, or Ed25519 — not
+//!   the SSH signature encodings; only the key is shared.
 //!
 //! SPKI conversion is delegated to `tatami_ssh_keys::spki`, the one
 //! authoritative implementation.
@@ -62,8 +65,12 @@ pub enum IdentityError {
         /// Description.
         detail: String,
     },
-    /// The key is not an Ed25519 PKCS#8 key this experiment supports.
+    /// The key is not of a supported type or encoding.
     UnsupportedKey,
+    /// The TLS provider refused the private key (for RSA: `ring` signs
+    /// only with 2048-, 3072- or 4096-bit moduli and `e >= 65537`), or the
+    /// key failed the load-time proof-of-possession check.
+    KeyRejected(String),
     /// The private key's public half is not the expected SSH host key.
     HostKeyMismatch,
     /// The identity directory already contains an identity.
@@ -83,7 +90,10 @@ impl core::fmt::Display for IdentityError {
                 write!(f, "identity file {}: {detail}", path.display())
             }
             IdentityError::UnsupportedKey => {
-                f.write_str("identity key is not an Ed25519 PKCS#8 key")
+                f.write_str("identity key is not a supported key type or encoding")
+            }
+            IdentityError::KeyRejected(why) => {
+                write!(f, "the TLS provider refused the host key: {why}")
             }
             IdentityError::HostKeyMismatch => {
                 f.write_str("the signing key's public key is not the expected SSH host key")
@@ -246,21 +256,43 @@ pub fn raw_ed25519_to_spki(key: &[u8; 32]) -> Vec<u8> {
     out
 }
 
-/// An SSH Ed25519 host key presented over TLS as an RFC 7250 raw public
-/// key.
+/// DER container of a private key handed to [`HostKeyIdentity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateKeyEncoding {
+    /// PKCS#8 `OneAsymmetricKey` (any type).
+    Pkcs8,
+    /// PKCS#1 `RSAPrivateKey`.
+    Pkcs1,
+    /// SEC1 `ECPrivateKey`.
+    Sec1,
+}
+
+/// Fixed message signed and verified once at load time.
+const POSSESSION_PROBE: &[u8] = b"tatami host key load-time proof of possession";
+
+/// An SSH host key presented over TLS as an RFC 7250 raw public key.
 ///
-/// Built from the PKCS#8 form of the key (produced in memory by
-/// `tatami_ssh_keys::openssh_key`) and the expected SSH public-key blob. The
-/// provider loads the key from a **borrowed** buffer and the resulting
-/// public key must equal the expected one, so a mismatched pair is refused
-/// before any socket exists. This type holds no secret bytes itself; the
-/// signing key lives inside the provider (`ring`), whose internal copies are
-/// outside this crate's control.
+/// Built from the private key converted in memory by
+/// `tatami_ssh_keys::openssh_key` and the expected SSH public-key blob:
+///
+/// 1. The provider (`ring`) loads the key from a **borrowed** buffer; this
+///    validates RSA components and re-derives EC/Ed25519 public keys.
+/// 2. The provider's public key is converted strictly to an SSH blob, which
+///    must equal the expected one (the file's public key), and its SPKI
+///    must be the canonical encoding.
+/// 3. A probe message is signed with the scheme TLS will use for this key
+///    and verified against the public key, so a key that cannot actually
+///    sign (for example an RSA key with an inconsistent `d`) is refused
+///    here, before any socket exists.
+///
+/// This type holds no secret bytes itself; the signing key lives inside
+/// the provider, whose internal copies are outside this crate's control.
 #[derive(Clone)]
 pub struct HostKeyIdentity {
     signing: std::sync::Arc<dyn rustls::sign::SigningKey>,
-    spki: [u8; ED25519_SPKI_LEN],
-    ssh_blob: [u8; tatami_ssh_keys::blob::ED25519_BLOB_LEN],
+    key_type: tatami_ssh_keys::KeyType,
+    spki: Vec<u8>,
+    ssh_blob: Vec<u8>,
 }
 
 impl core::fmt::Debug for HostKeyIdentity {
@@ -272,24 +304,50 @@ impl core::fmt::Debug for HostKeyIdentity {
 }
 
 impl HostKeyIdentity {
-    /// Loads `pkcs8` with the backend provider and checks that its public
-    /// key is `expected_ssh_blob`.
+    /// Loads an Ed25519 `pkcs8` key; see [`HostKeyIdentity::from_private_key_der`].
     pub fn from_pkcs8(pkcs8: &[u8], expected_ssh_blob: &[u8]) -> Result<Self, IdentityError> {
-        let der = PrivatePkcs8KeyDer::from(pkcs8);
-        let signing = rustls::crypto::ring::sign::any_eddsa_type(&der)
-            .map_err(|_| IdentityError::UnsupportedKey)?;
+        Self::from_private_key_der(PrivateKeyEncoding::Pkcs8, pkcs8, expected_ssh_blob)
+    }
+
+    /// Loads `der` with the backend provider and checks it against
+    /// `expected_ssh_blob` as described on the type.
+    pub fn from_private_key_der(
+        encoding: PrivateKeyEncoding,
+        der: &[u8],
+        expected_ssh_blob: &[u8],
+    ) -> Result<Self, IdentityError> {
+        use rustls::pki_types::{PrivatePkcs1KeyDer, PrivateSec1KeyDer};
+        let der = match encoding {
+            PrivateKeyEncoding::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)),
+            PrivateKeyEncoding::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)),
+            PrivateKeyEncoding::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)),
+        };
+        let signing = rustls::crypto::ring::sign::any_supported_type(&der)
+            .map_err(|e| IdentityError::KeyRejected(format!("{e}")))?;
         let spki_der = signing.public_key().ok_or(IdentityError::UnsupportedKey)?;
-        let key = tatami_ssh_keys::spki::ed25519_public_key_from_spki(spki_der.as_ref())
+        let key = tatami_ssh_keys::spki::host_key_from_spki(spki_der.as_ref())
             .map_err(|_| IdentityError::UnsupportedKey)?;
-        let ssh_blob = tatami_ssh_keys::spki::ssh_blob_of(&key);
+        let ssh_blob = key.to_blob();
         if ssh_blob.as_slice() != expected_ssh_blob {
             return Err(IdentityError::HostKeyMismatch);
         }
+        let spki = tatami_ssh_keys::spki::host_key_spki(&key);
+        if spki.as_slice() != spki_der.as_ref() {
+            return Err(IdentityError::UnsupportedKey);
+        }
+        prove_possession(signing.as_ref(), &key)?;
         Ok(HostKeyIdentity {
             signing,
-            spki: tatami_ssh_keys::spki::ed25519_spki(&key),
+            key_type: key.key_type(),
+            spki,
             ssh_blob,
         })
+    }
+
+    /// The SSH key type.
+    #[must_use]
+    pub fn key_type(&self) -> tatami_ssh_keys::KeyType {
+        self.key_type
     }
 
     /// The provider signing key.
@@ -304,7 +362,7 @@ impl HostKeyIdentity {
         &self.spki
     }
 
-    /// The canonical `ssh-ed25519` public-key blob.
+    /// The canonical SSH public-key blob.
     #[must_use]
     pub fn ssh_blob(&self) -> &[u8] {
         &self.ssh_blob
@@ -347,7 +405,10 @@ impl ServerIdentity {
             ServerIdentity::Test(t) => {
                 PresentedIdentity::Certificate(t.certificate_sha256_fingerprint())
             }
-            ServerIdentity::HostKey(h) => PresentedIdentity::SshHostKey(h.ssh_fingerprint()),
+            ServerIdentity::HostKey(h) => PresentedIdentity::SshHostKey {
+                key_type: h.key_type(),
+                fingerprint: h.ssh_fingerprint(),
+            },
         }
     }
 }
@@ -357,9 +418,13 @@ impl ServerIdentity {
 pub enum PresentedIdentity {
     /// SHA-256 of the X.509 certificate DER (not an SSH fingerprint).
     Certificate(CertificateSha256),
-    /// OpenSSH `SHA256:` fingerprint of the SSH host key sent as a raw
-    /// public key.
-    SshHostKey(tatami_ssh_keys::Sha256Fingerprint),
+    /// An SSH host key sent as a raw public key.
+    SshHostKey {
+        /// The SSH key type.
+        key_type: tatami_ssh_keys::KeyType,
+        /// OpenSSH `SHA256:` fingerprint of the SSH blob.
+        fingerprint: tatami_ssh_keys::Sha256Fingerprint,
+    },
 }
 
 impl PresentedIdentity {
@@ -368,7 +433,7 @@ impl PresentedIdentity {
     pub const fn mode(&self) -> &'static str {
         match self {
             PresentedIdentity::Certificate(_) => "x509_test_certificate",
-            PresentedIdentity::SshHostKey(_) => "ssh_host_key_raw_public_key",
+            PresentedIdentity::SshHostKey { .. } => "ssh_host_key_raw_public_key",
         }
     }
 
@@ -377,7 +442,7 @@ impl PresentedIdentity {
     pub const fn certificate_sha256(&self) -> Option<CertificateSha256> {
         match self {
             PresentedIdentity::Certificate(c) => Some(*c),
-            PresentedIdentity::SshHostKey(_) => None,
+            PresentedIdentity::SshHostKey { .. } => None,
         }
     }
 
@@ -386,8 +451,69 @@ impl PresentedIdentity {
     pub const fn ssh_host_key_sha256(&self) -> Option<tatami_ssh_keys::Sha256Fingerprint> {
         match self {
             PresentedIdentity::Certificate(_) => None,
-            PresentedIdentity::SshHostKey(f) => Some(*f),
+            PresentedIdentity::SshHostKey { fingerprint, .. } => Some(*fingerprint),
         }
+    }
+
+    /// The SSH key type, in host-key mode.
+    #[must_use]
+    pub const fn ssh_host_key_type(&self) -> Option<tatami_ssh_keys::KeyType> {
+        match self {
+            PresentedIdentity::Certificate(_) => None,
+            PresentedIdentity::SshHostKey { key_type, .. } => Some(*key_type),
+        }
+    }
+}
+
+/// Signs [`POSSESSION_PROBE`] with the TLS 1.3 scheme for `key`'s type and
+/// verifies it with `ring` against the public key.
+fn prove_possession(
+    signing: &dyn rustls::sign::SigningKey,
+    key: &tatami_ssh_keys::HostKey,
+) -> Result<(), IdentityError> {
+    use ring::signature as rs;
+    use rustls::SignatureScheme as S;
+    use tatami_ssh_keys::HostKey;
+    let reject = |why: &str| IdentityError::KeyRejected(String::from(why));
+    let scheme = match key.key_type() {
+        tatami_ssh_keys::KeyType::Ed25519 => S::ED25519,
+        tatami_ssh_keys::KeyType::Rsa => S::RSA_PSS_SHA256,
+        tatami_ssh_keys::KeyType::EcdsaP256 => S::ECDSA_NISTP256_SHA256,
+    };
+    let signer = signing
+        .choose_scheme(&[scheme])
+        .ok_or_else(|| reject("no TLS 1.3 signature scheme for this key"))?;
+    let sig = signer
+        .sign(POSSESSION_PROBE)
+        .map_err(|e| IdentityError::KeyRejected(format!("{e}")))?;
+    let ok = match key {
+        HostKey::Ed25519(k) => rs::UnparsedPublicKey::new(&rs::ED25519, k.as_bytes())
+            .verify(POSSESSION_PROBE, &sig)
+            .is_ok(),
+        #[cfg(feature = "rsa")]
+        HostKey::Rsa(k) => rs::RsaPublicKeyComponents {
+            n: k.modulus(),
+            e: k.exponent(),
+        }
+        .verify(&rs::RSA_PSS_2048_8192_SHA256, POSSESSION_PROBE, &sig)
+        .is_ok(),
+        #[cfg(feature = "ecdsa-p256")]
+        HostKey::EcdsaP256(k) => {
+            rs::UnparsedPublicKey::new(&rs::ECDSA_P256_SHA256_ASN1, &k.point()[..])
+                .verify(POSSESSION_PROBE, &sig)
+                .is_ok()
+        }
+        // A key type enabled in `tatami_ssh_keys` by another crate but not
+        // in this one.
+        #[allow(unreachable_patterns)]
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(reject(
+            "the private key does not produce valid signatures for its public key",
+        ))
     }
 }
 
@@ -852,7 +978,7 @@ mod tests {
         ));
         assert!(matches!(
             HostKeyIdentity::from_pkcs8(&pkcs8[..pkcs8.len() - 1], &blob),
-            Err(IdentityError::UnsupportedKey)
+            Err(IdentityError::KeyRejected(_))
         ));
         let dbg = std::format!("{host:?}");
         assert!(dbg.contains("ssh_host_key_sha256"));

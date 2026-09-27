@@ -8,20 +8,28 @@
 //! 1. API/input: a small description is decoded into `known_hosts` text,
 //!    a lookup (host, port) and an offered key; the text goes through
 //!    `KnownHosts::parse`, the lookup through `policy_for`, the key through
+//!    `HostKey::parse` (as the handshake does) and then
 //!    `HostTrustPolicy::decide`. Structure is generated because raw
-//!    mutation almost never produces a valid base64 Ed25519 blob, so it
-//!    would not reach matching or the decision at all.
+//!    mutation almost never produces a valid base64 key blob, so it would
+//!    not reach matching or the decision at all.
+//!
+//!    Keys: K0-K2 Ed25519 (derived), RSA = the `ssh-keygen` RSA 2048
+//!    fixture, P256 = the P-256 fixture, RSA1024 = the 1024-bit fixture
+//!    (structurally valid, outside the RSA policy: an inert entry), P384 =
+//!    the P-384 fixture (a type this crate does not implement: opaque).
 //!
 //!    ```text
 //!    byte 0   bits 0-1 lookup (host.example:22, HOST.Example:22,
 //!             host.example:2222, other.example:22); bits 2-3 offered key
-//!             K0/K1/K2 (3 = K0); bit 4 inject one malformed line; bits 5-7
-//!             malformed kind (unknown marker, bad base64, key-type mismatch,
-//!             missing key, empty pattern; 5-7 wrap)
+//!             K0/K1/K2, 3 = RSA/P256/RSA1024 by (bits 5-7) % 3; bit 4
+//!             inject one malformed line; bits 5-7 malformed kind (unknown
+//!             marker, bad base64, key-type mismatch, missing key, empty
+//!             pattern, Ed25519 key of 31 bytes, @revoked RSA with a
+//!             non-minimal e, P-256 with curve nistp254)
 //!    byte 1   lines: 1 + b % 8
 //!    byte 2   position of the malformed line (b % (lines + 1))
-//!    per line marker (b % 3: none, @revoked, @cert-authority), key (b % 4:
-//!             K0, K1, K2, a well-formed ssh-rsa blob), hosts h, p1, p2, p3:
+//!    per line marker (b % 3: none, @revoked, @cert-authority), key (b % 7:
+//!             K0, K1, K2, RSA, P256, RSA1024, P384), hosts h, p1, p2, p3:
 //!             h bit 7 = one hashed name (lookup (h >> 3) % 4, HMAC-SHA1 by
 //!             the harness), else 1 + h % 3 patterns from a 10-entry
 //!             vocabulary (bit 7 of p = negated)
@@ -33,15 +41,24 @@
 //!    lines of at most 3 patterns.
 //! 3. Properties:
 //!    - An injected malformed line fails the whole file with exactly that
-//!      line number and kind; a malformed `@revoked` line is never skipped.
+//!      line number and kind; a malformed `@revoked` line is never skipped;
+//!      `InvalidKey(kt)` names the (enabled) type of the broken key. Lines of
+//!      every key above parse: RSA1024 (policy only) and P384 (not
+//!      implemented) are kept as entries and are never `InvalidKey`.
+//!    - The inert RSA1024 entry never leads to trust: presented, that key
+//!      fails `HostKey::parse` with `RsaModulus{1024}` before any decision
+//!      (the handshake and the QUIC verifier both parse first), so the
+//!      decision is only evaluated for keys that parse.
 //!    - `Entry::applies_to` equals the harness's view of each generated line
 //!      (`glob_ref` DP matcher on lowercased patterns, negation excludes,
 //!      harness HMAC-SHA1 for hashed names).
 //!    - `decide` equals the contract computed over the generated entries:
 //!      an applicable revocation of the offered key wins (first such line),
 //!      else the first applicable plain line listing it trusts, else
-//!      `KeyChanged` (first applicable `ssh-ed25519` line),
-//!      `NoKeyForAlgorithm`, `CertificateAuthorityOnly`, `UnknownHost`.
+//!      `KeyChanged` (first applicable plain line of the offered key's
+//!      algorithm: an RSA1024 line is `ssh-rsa` and so "changed" for the
+//!      RSA 2048 key), `NoKeyForAlgorithm`, `CertificateAuthorityOnly`,
+//!      `UnknownHost`.
 //!    - Appending an entry that cannot apply leaves the decision unchanged;
 //!      reversing the lines keeps the outcome code; appending an applicable
 //!      `@revoked` line for the offered key turns any decision into
@@ -58,9 +75,14 @@ use std::sync::OnceLock;
 
 use ed25519_dalek::SigningKey;
 use libfuzzer_sys::fuzz_target;
-use tatami_ssh_fuzz_protocol::keys_support::{b64_encode, ed25519_blob, glob_ref, hmac_sha1};
+use tatami_ssh_fuzz_protocol::keys_support::{
+    b64_encode, ed25519_blob, fixtures, glob_ref, hmac_sha1, ssh_string,
+};
 use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_keys::algorithm::KeyType;
+use tatami_ssh_keys::error::KeyError;
 use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
+use tatami_ssh_keys::host_key::HostKey;
 use tatami_ssh_keys::known_hosts::{KnownHosts, KnownHostsError, Limits, Malformed, glob_match};
 use tatami_ssh_keys::trust::{
     HostIdentity, HostTrustPolicy, TrustDecision, TrustSource, UntrustedReason,
@@ -86,16 +108,39 @@ const LOOKUPS: [(&str, u16, &str); 4] = [
     ("other.example", 22, "other.example"),
 ];
 
-fn keys() -> &'static [Vec<u8>; 4] {
-    static KEYS: OnceLock<[Vec<u8>; 4]> = OnceLock::new();
+const RSA: usize = 3;
+const P256: usize = 4;
+const RSA1024: usize = 5;
+const P384: usize = 6;
+
+/// Key-type field of each key.
+const ALG: [&str; 7] = [
+    "ssh-ed25519",
+    "ssh-ed25519",
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp384",
+];
+
+fn keys() -> &'static [Vec<u8>; 7] {
+    static KEYS: OnceLock<[Vec<u8>; 7]> = OnceLock::new();
     KEYS.get_or_init(|| {
         let ed = |s: u8| ed25519_blob(SigningKey::from_bytes(&[s; 32]).verifying_key().as_bytes());
-        let mut rsa = Vec::new();
-        for part in [&b"ssh-rsa"[..], &[1, 2, 3]] {
-            rsa.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            rsa.extend_from_slice(part);
+        let keys = [
+            ed(1),
+            ed(2),
+            ed(3),
+            fixtures::bytes("RSA_2048_PUB"),
+            fixtures::bytes("P256_PUB"),
+            fixtures::bytes("RSA_1024_PUB"),
+            fixtures::bytes("P384_PUB"),
+        ];
+        for (k, alg) in keys.iter().zip(ALG) {
+            assert_eq!(&k[4..4 + alg.len()], alg.as_bytes(), "blob names its type");
         }
-        [ed(1), ed(2), ed(3), rsa]
+        keys
     })
 }
 
@@ -138,13 +183,9 @@ impl Line {
                 b64_encode(&hmac_sha1(salt, LOOKUPS[*lookup].2.as_bytes()))
             ),
         };
-        let alg = if self.key == 3 {
-            "ssh-rsa"
-        } else {
-            "ssh-ed25519"
-        };
         format!(
-            "{marker}{hosts} {alg} {} c\n",
+            "{marker}{hosts} {} {} c\n",
+            ALG[self.key],
             b64_encode(&keys()[self.key])
         )
     }
@@ -178,7 +219,7 @@ fn expected(lines: &[Line], name: &str, offered: usize) -> TrustDecision {
             source: TrustSource::KnownHosts { line },
         };
     }
-    if let Some(line) = first(&|l| l.mark == Mark::None && l.key != 3) {
+    if let Some(line) = first(&|l| l.mark == Mark::None && ALG[l.key] == ALG[offered]) {
         return untrusted(UntrustedReason::KeyChanged { line });
     }
     if first(&|l| l.mark == Mark::None).is_some() {
@@ -206,8 +247,11 @@ fn decide(text: &str, lookup: usize, offered: usize) -> TrustDecision {
         .expect("vocabulary hosts are valid");
     assert_eq!(policy.lookup_name(), name);
     let blob = &keys()[offered];
+    // Presented keys are parsed before any decision (handshake, QUIC).
+    let presented = HostKey::parse(blob).expect("only parseable keys reach decide");
+    assert_eq!(presented.algorithm(), ALG[offered].as_bytes());
     policy.decide(&HostIdentity {
-        algorithm: b"ssh-ed25519",
+        algorithm: ALG[offered].as_bytes(),
         blob,
         sha256: Sha256Fingerprint::of_blob(blob),
     })
@@ -219,7 +263,34 @@ fn render(lines: &[Line]) -> String {
 
 fn malformed(kind: u8) -> (String, Malformed) {
     let key = b64_encode(&keys()[0]);
-    match kind % 5 {
+    match kind % 8 {
+        5 => {
+            let mut short = ssh_string(b"ssh-ed25519");
+            short.extend(ssh_string(&[7; 31]));
+            (
+                format!("host.example ssh-ed25519 {}\n", b64_encode(&short)),
+                Malformed::InvalidKey(KeyType::Ed25519),
+            )
+        }
+        6 => {
+            // RSA 2048 with a redundant leading zero on e, revoked.
+            let good = &keys()[RSA];
+            let mut bad = ssh_string(b"ssh-rsa");
+            bad.extend(ssh_string(&[0, 1, 0, 1]));
+            bad.extend_from_slice(&good[4 + 7 + 4 + 3..]);
+            (
+                format!("@revoked * ssh-rsa {}\n", b64_encode(&bad)),
+                Malformed::InvalidKey(KeyType::Rsa),
+            )
+        }
+        7 => {
+            let mut bad = keys()[P256].clone();
+            bad[34] = b'4'; // nistp256 -> nistp254
+            (
+                format!("host.example ecdsa-sha2-nistp256 {}\n", b64_encode(&bad)),
+                Malformed::InvalidKey(KeyType::EcdsaP256),
+            )
+        }
         0 => (
             format!("@bogus host.example ssh-ed25519 {key}\n"),
             Malformed::UnknownMarker,
@@ -244,13 +315,16 @@ fuzz_target!(|data: &[u8]| {
     let mut cur = Cursor::new(data);
     let flags = cur.u8();
     let lookup = usize::from(flags & 3);
-    let offered = usize::from((flags >> 2) & 3) % 3;
+    let offered = match (flags >> 2) & 3 {
+        3 => [RSA, P256, RSA1024][usize::from(flags >> 5) % 3],
+        k => usize::from(k),
+    };
     let n = 1 + usize::from(cur.u8()) % 8;
     let bad_at = usize::from(cur.u8()) % (n + 1);
     let mut lines = Vec::with_capacity(n);
     for i in 0..n {
         let mark = [Mark::None, Mark::Revoked, Mark::Ca][usize::from(cur.u8()) % 3];
-        let key = usize::from(cur.u8()) % 4;
+        let key = usize::from(cur.u8()) % 7;
         let h = cur.u8();
         let p = [cur.u8(), cur.u8(), cur.u8()];
         let hosts = if h & 0x80 != 0 {
@@ -298,6 +372,22 @@ fuzz_target!(|data: &[u8]| {
         );
         assert_eq!(e.blob(), &keys()[l.key][..]);
         assert_eq!(e.is_hashed(), matches!(l.hosts, Hosts::Hashed { .. }));
+    }
+
+    // The inert entry: kept, but its key can never be presented.
+    if offered == RSA1024 {
+        assert_eq!(
+            HostKey::parse(&keys()[RSA1024]),
+            Err(KeyError::RsaModulus { bits: 1024 }),
+            "a policy-violating key is refused before any trust decision"
+        );
+        assert_eq!(
+            HostKey::parse(&keys()[P384]),
+            Err(KeyError::UnsupportedAlgorithm(
+                b"ecdsa-sha2-nistp384".to_vec()
+            ))
+        );
+        return;
     }
 
     let got = decide(&text, lookup, offered);

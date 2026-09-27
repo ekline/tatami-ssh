@@ -959,7 +959,7 @@ impl Model {
             }
             Reply::KsAlgRsa => {
                 self.exact(HandshakeOutcome::ProtocolError(ProtocolViolation::HostKey(
-                    KeyError::UnsupportedAlgorithm(b"ssh-rsa".to_vec()),
+                    KeyError::UnsupportedAlgorithm(b"ssh-dss".to_vec()),
                 )));
                 return false;
             }
@@ -1582,7 +1582,7 @@ fn run(sc: &Scenario) -> Run {
         };
         let k_s_wire: Vec<u8> = match sc.reply {
             Reply::KsAlgRsa => {
-                let mut b = string(b"ssh-rsa");
+                let mut b = string(b"ssh-dss");
                 b.extend(string(&host_pk));
                 b
             }
@@ -1810,7 +1810,7 @@ fn check_report(r: &HandshakeReport, m: &Model, sc: &Scenario, run: &Run) {
     );
     if let Some(err) = &r.signature_error {
         let want = match sc.reply {
-            Reply::SigAlgRsa => "does not match key algorithm",
+            Reply::SigAlgRsa => "but `ssh-ed25519` was negotiated",
             Reply::SigTrailing => "trailing byte",
             Reply::SigShort => "expected 64",
             _ => "does not verify",

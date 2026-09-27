@@ -5,7 +5,8 @@
 //! with `verify_strict`, which rejects non-canonical encodings and small-
 //! order components that the plain `verify` would accept.
 //!
-//! Nothing here handles private keys, signing, or any other algorithm.
+//! Nothing here handles private keys, signing, or any other algorithm; the
+//! type-generic [`crate::host_key::HostKey`] dispatches to this module.
 //! A successful verification proves that the holder of the private key for
 //! `K_S` signed the exchange hash; it says nothing about whether `K_S` is the
 //! key the user expects. That is a separate decision made through
@@ -116,79 +117,18 @@ impl Ed25519Signature {
     }
 }
 
-/// A server host key of a supported algorithm.
-///
-/// Only `ssh-ed25519` exists in this profile; other blobs are reported as
-/// [`KeyError::UnsupportedAlgorithm`] with the name preserved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostKey {
-    /// An `ssh-ed25519` key (RFC 8709).
-    Ed25519(Ed25519PublicKey),
-}
-
-impl HostKey {
-    /// Interprets a parsed public-key blob.
-    pub fn from_blob(blob: &PublicKeyBlob<'_>) -> Result<Self, KeyError> {
-        if blob.algorithm == SSH_ED25519 {
-            Ed25519PublicKey::from_blob(blob).map(HostKey::Ed25519)
-        } else {
-            Err(KeyError::UnsupportedAlgorithm(blob.algorithm.to_vec()))
-        }
-    }
-
-    /// Decodes and interprets raw blob bytes (`K_S`).
-    pub fn parse(blob: &[u8]) -> Result<Self, KeyError> {
-        Self::from_blob(&PublicKeyBlob::decode(blob)?)
-    }
-
-    /// The public-key algorithm name of this key.
-    #[must_use]
-    pub const fn algorithm(&self) -> &'static [u8] {
-        match self {
-            HostKey::Ed25519(_) => SSH_ED25519,
-        }
-    }
-
-    /// Verifies a signature blob over `message`.
-    ///
-    /// The signature blob's algorithm must equal the key's; a mismatch is
-    /// reported as [`VerifyError::AlgorithmMismatch`] before the signature
-    /// bytes are looked at, so a peer cannot make the verifier interpret
-    /// bytes under an algorithm the key was not published for.
-    pub fn verify_signature_blob(
-        &self,
-        message: &[u8],
-        sig: &SignatureBlob<'_>,
-    ) -> Result<(), VerifyError> {
-        if sig.algorithm != self.algorithm() {
-            return Err(VerifyError::AlgorithmMismatch {
-                key_algorithm: self.algorithm().to_vec(),
-                signature_algorithm: sig.algorithm.to_vec(),
-            });
-        }
-        match self {
-            HostKey::Ed25519(key) => {
-                let sig =
-                    Ed25519Signature::from_blob(sig).map_err(VerifyError::MalformedSignature)?;
-                key.verify(message, &sig)
-            }
-        }
-    }
-
-    /// Encodes the public-key blob for this key into `out`.
-    pub fn encode_blob(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
-        match self {
-            HostKey::Ed25519(key) => key.encode_blob(out),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithm::SignatureScheme;
     use crate::blob::fixtures::*;
     use crate::error::BlobError;
+    use crate::host_key::HostKey;
     use tatami_ssh_wire::DecodeError;
+
+    fn verify(host: &HostKey, message: &[u8], sig: &SignatureBlob<'_>) -> Result<(), VerifyError> {
+        host.verify(SignatureScheme::Ed25519, message, sig, None)
+    }
 
     fn key(bytes: &[u8; 32]) -> Ed25519PublicKey {
         Ed25519PublicKey::from_bytes(bytes).unwrap()
@@ -283,35 +223,41 @@ mod tests {
     fn signature_blob_wrappers_verify_rfc_vectors() {
         let host = HostKey::parse(&test1_key_blob()).unwrap();
         let sig = sig_blob(&TEST1_SIGNATURE);
-        host.verify_signature_blob(&[], &SignatureBlob::decode(&sig).unwrap())
-            .unwrap();
+        verify(&host, &[], &SignatureBlob::decode(&sig).unwrap()).unwrap();
 
         let host3 = HostKey::parse(&key_blob(&TEST3_PUBLIC_KEY)).unwrap();
         let sig3 = sig_blob(&TEST3_SIGNATURE);
-        host3
-            .verify_signature_blob(&TEST3_MESSAGE, &SignatureBlob::decode(&sig3).unwrap())
-            .unwrap();
+        verify(
+            &host3,
+            &TEST3_MESSAGE,
+            &SignatureBlob::decode(&sig3).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            host3.verify_signature_blob(&TEST2_MESSAGE, &SignatureBlob::decode(&sig3).unwrap()),
+            verify(
+                &host3,
+                &TEST2_MESSAGE,
+                &SignatureBlob::decode(&sig3).unwrap()
+            ),
             Err(VerifyError::Invalid)
         );
     }
 
     #[test]
     fn unsupported_key_algorithm_keeps_the_name() {
-        // string "ssh-rsa" with an ed25519-shaped body.
+        // string "ssh-dss" with an ed25519-shaped body.
         let mut blob = [0u8; 47];
-        blob[..11].copy_from_slice(&[0, 0, 0, 7, b's', b's', b'h', b'-', b'r', b's', b'a']);
+        blob[..11].copy_from_slice(&[0, 0, 0, 7, b's', b's', b'h', b'-', b'd', b's', b's']);
         blob[11..15].copy_from_slice(&[0, 0, 0, 32]);
         blob[15..].copy_from_slice(&TEST1_PUBLIC_KEY);
         let parsed = PublicKeyBlob::decode(&blob).unwrap();
         assert_eq!(
             HostKey::from_blob(&parsed),
-            Err(KeyError::UnsupportedAlgorithm(b"ssh-rsa".to_vec()))
+            Err(KeyError::UnsupportedAlgorithm(b"ssh-dss".to_vec()))
         );
         assert_eq!(
             Ed25519PublicKey::from_blob(&parsed),
-            Err(KeyError::UnsupportedAlgorithm(b"ssh-rsa".to_vec()))
+            Err(KeyError::UnsupportedAlgorithm(b"ssh-dss".to_vec()))
         );
     }
 
@@ -325,14 +271,24 @@ mod tests {
             signature: b"abc",
         };
         assert_eq!(
-            host.verify_signature_blob(&[], &rsa_sig),
-            Err(VerifyError::AlgorithmMismatch {
-                key_algorithm: b"ssh-ed25519".to_vec(),
-                signature_algorithm: b"ssh-rsa".to_vec(),
+            verify(&host, &[], &rsa_sig),
+            Err(VerifyError::UnexpectedSignatureAlgorithm {
+                expected: b"ssh-ed25519",
+                found: b"ssh-rsa".to_vec(),
             })
         );
-        // An ed25519 signature blob under an ssh-rsa key never gets this far:
-        // the key itself is unsupported.
+        // A correctly labelled signature under a scheme for another key type.
+        let ed_label = SignatureBlob {
+            algorithm: b"rsa-sha2-256",
+            signature: b"abc",
+        };
+        assert_eq!(
+            host.verify(SignatureScheme::RsaSha2_256, &[], &ed_label, None),
+            Err(VerifyError::AlgorithmMismatch {
+                key_algorithm: b"ssh-ed25519".to_vec(),
+                signature_algorithm: b"rsa-sha2-256".to_vec(),
+            })
+        );
         assert!(matches!(
             Ed25519Signature::from_blob(&rsa_sig),
             Err(KeyError::UnsupportedAlgorithm(_))
@@ -396,7 +352,7 @@ mod tests {
                 signature: &sig_bytes[..found],
             };
             assert_eq!(
-                host.verify_signature_blob(&[], &sig),
+                verify(&host, &[], &sig),
                 Err(VerifyError::MalformedSignature(KeyError::WrongLength {
                     field: "signature",
                     expected: 64,

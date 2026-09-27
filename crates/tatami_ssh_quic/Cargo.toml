@@ -32,6 +32,12 @@ quinn-backend = [
     "dep:base64ct",
     "tatami_ssh_keys/ed25519",
 ]
+# SSH host keys of these types as RFC 7250 raw public keys (client
+# verification and server identities). The TLS signatures themselves are
+# made and checked by the `ring` provider (RSA-PSS / ECDSA P-256 SHA-256 in
+# TLS 1.3, not the SSH PKCS#1 v1.5 / mpint encodings).
+rsa = ["tatami_ssh_keys/rsa"]
+ecdsa-p256 = ["tatami_ssh_keys/ecdsa-p256"]
 
 [dependencies]
 tatami_ssh_wire = { workspace = true, features = ["alloc"] }

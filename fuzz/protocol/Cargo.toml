@@ -18,8 +18,12 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_json = "1"
 tatami_ssh_wire = { path = "../../crates/tatami_ssh_wire", default-features = false, features = ["alloc"] }
 # `openssh-hashed-hosts` keeps hashed-name matching covered by the
-# `known_hosts` target (through `tatami_ssh_openssh_compat`).
-tatami_ssh_keys = { path = "../../crates/tatami_ssh_keys", default-features = false, features = ["ed25519", "known-hosts", "openssh-key", "openssh-hashed-hosts"] }
+# `known_hosts` target (through `tatami_ssh_openssh_compat`). `rsa` and
+# `ecdsa-p256` add the round-6 host-key types (parsing, policy, scheme
+# binding; the final check goes to a harness mock `SignatureProvider`). They
+# are enabled here only, not on the facade, whose `rsa`/`ecdsa-p256`
+# features pull `ring`.
+tatami_ssh_keys = { path = "../../crates/tatami_ssh_keys", default-features = false, features = ["ed25519", "rsa", "ecdsa-p256", "known-hosts", "openssh-key", "openssh-hashed-hosts"] }
 tatami_ssh_tcp = { path = "../../crates/tatami_ssh_tcp", default-features = false, features = ["std", "kex"] }
 tatami_ssh_connection = { path = "../../crates/tatami_ssh_connection", default-features = false }
 tatami_ssh = { path = "../../crates/tatami_ssh", default-features = false, features = ["std", "tcp", "kex"] }

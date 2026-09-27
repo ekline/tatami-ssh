@@ -38,3 +38,10 @@ rand_core = { version = "0.6.4", default-features = false, optional = true }
 zeroize = { version = "1.9.0", default-features = false, features = ["zeroize_derive"], optional = true }
 subtle = { version = "2.6.1", default-features = false, optional = true }
 getrandom = { version = "0.2.17", default-features = false, optional = true }
+
+[dev-dependencies]
+# Test-only: RSA / ECDSA P-256 host keys in the scripted handshake. The
+# library never depends on `ring`; a host passes a `SignatureProvider`.
+tatami_ssh_keys = { workspace = true, features = ["ed25519", "rsa", "ecdsa-p256"] }
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+base64ct = { version = "1.6", default-features = false, features = ["alloc"] }

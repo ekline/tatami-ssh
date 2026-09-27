@@ -9,7 +9,11 @@
 //! [`Sha256Fingerprint`] itself is feature-free so that trust policy can be
 //! expressed without a hash provider; computing one from a blob and
 //! rendering/parsing the text form need `sha2` and `base64ct` and are gated
-//! behind the `ed25519` feature.
+//! behind the `fingerprint` feature, which every key-type feature
+//! (`ed25519`, `rsa`, `ecdsa-p256`) enables. The fingerprint is the same
+//! for every key type: SHA-256 of the blob, independent of the signature
+//! scheme (an RSA key has one fingerprint whether it signs with SHA-256 or
+//! SHA-512).
 
 use core::fmt;
 
@@ -109,7 +113,7 @@ impl fmt::Display for FingerprintParseError {
 
 impl core::error::Error for FingerprintParseError {}
 
-#[cfg(feature = "ed25519")]
+#[cfg(feature = "fingerprint")]
 mod text {
     use core::fmt;
     use core::str::FromStr;
@@ -189,6 +193,8 @@ mod tests {
 
     #[cfg(feature = "ed25519")]
     mod with_provider {
+        //! Uses the Ed25519 fixtures; the computation itself needs only the
+        //! `fingerprint` feature.
         use super::super::*;
         use crate::blob::fixtures::{TEST1_PUBLIC_KEY, test1_key_blob};
         use alloc::string::ToString;

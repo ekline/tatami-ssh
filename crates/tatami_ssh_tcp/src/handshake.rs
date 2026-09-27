@@ -1,6 +1,19 @@
-//! Portable client key-exchange and service-negotiation state machine for
-//! the first interoperability profile (`curve25519-sha256`, `ssh-ed25519`,
-//! `aes128-gcm@openssh.com`).
+//! Portable client key-exchange and service-negotiation state machine
+//! (`curve25519-sha256`, `aes128-gcm@openssh.com`, and the host signature
+//! schemes `ssh-ed25519`, `ecdsa-sha2-nistp256`, `rsa-sha2-512`,
+//! `rsa-sha2-256`).
+//!
+//! # Host keys
+//!
+//! Ed25519 is verified in `tatami_ssh_keys`. RSA/SHA-2 and ECDSA P-256 are
+//! offered only when a host-supplied
+//! [`SignatureProvider`]
+//! that supports them is passed to
+//! [`ClientHandshake::with_signature_provider`]; without one (for example
+//! on bare metal) only `ssh-ed25519` is offered. The presented `K_S` must be
+//! of the negotiated scheme's key type, and the signature must carry the
+//! negotiated scheme's label (so an `rsa-sha2-512` exchange never accepts
+//! an `rsa-sha2-256` or `ssh-rsa` signature).
 //!
 //! # What it does
 //!
@@ -86,10 +99,12 @@ use core::fmt;
 
 use rand_core::{CryptoRngCore, RngCore};
 use sha2::{Digest, Sha256};
+use tatami_ssh_keys::algorithm::SignatureScheme;
 use tatami_ssh_keys::blob::{PublicKeyBlob, SignatureBlob};
-use tatami_ssh_keys::ed25519::HostKey;
 use tatami_ssh_keys::error::KeyError;
 use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
+use tatami_ssh_keys::host_key::HostKey;
+use tatami_ssh_keys::provider::SignatureProvider;
 use tatami_ssh_keys::trust::{HostIdentity, TrustDecision, UntrustedReason};
 use tatami_ssh_wire::ext_info::{ExtInfo, ExtInfoError};
 use tatami_ssh_wire::kex::{KexEcdhInit, KexEcdhReply, NewKeys};
@@ -109,7 +124,9 @@ use crate::ident::{
 };
 pub use crate::initial::SkippedMessage;
 use crate::initial::{InitialLimits, InputBuffer, InputOverflow, MsgName};
-use crate::negotiate::{ClientProposal, Negotiated, NegotiationError, StrictKex, negotiate};
+use crate::negotiate::{
+    ClientProposal, HostKeyAlgorithms, Negotiated, NegotiationError, StrictKex, negotiate,
+};
 use crate::packet::{
     HEADER_LEN, PacketError, PacketLimits, PacketStep, decode_initial_packet,
     encode_initial_packet_with,
@@ -151,6 +168,12 @@ pub struct HandshakeConfig {
     pub max_ext_info_extensions: usize,
     /// Service requested after `NEWKEYS`; `ssh-userauth` by default.
     pub service: Vec<u8>,
+    /// Host signature schemes to offer. `None` (the default): every scheme
+    /// this build and the supplied provider can verify, in
+    /// [`SignatureScheme::PREFERENCE`] order. `Some`: exactly this list, in
+    /// this order (to force one scheme); construction fails if one of them
+    /// cannot be verified.
+    pub host_key_algorithms: Option<HostKeyAlgorithms>,
 }
 
 impl Default for HandshakeConfig {
@@ -167,6 +190,7 @@ impl Default for HandshakeConfig {
             max_protected_packets: 64,
             max_ext_info_extensions: 64,
             service: tatami_ssh_wire::algorithms::SSH_USERAUTH.to_vec(),
+            host_key_algorithms: None,
         }
     }
 }
@@ -506,6 +530,10 @@ pub enum HandshakeInitError {
     /// The proposal could not be encoded (cannot happen with the fixed
     /// lists; surfaced rather than panicked on).
     Encode(EncodeError),
+    /// A configured host-key algorithm cannot be verified: its key-type
+    /// feature is off, or it needs a signature provider that was not
+    /// supplied or does not support it.
+    HostKeyAlgorithm(SignatureScheme),
 }
 
 impl fmt::Display for HandshakeInitError {
@@ -514,6 +542,10 @@ impl fmt::Display for HandshakeInitError {
             HandshakeInitError::Identification(e) => write!(f, "{e}"),
             HandshakeInitError::Entropy(e) => write!(f, "entropy source failed: {e}"),
             HandshakeInitError::Encode(e) => write!(f, "cannot encode KEXINIT: {e}"),
+            HandshakeInitError::HostKeyAlgorithm(s) => write!(
+                f,
+                "host-key algorithm {s} cannot be verified by this build (feature or signature provider missing)"
+            ),
         }
     }
 }
@@ -718,6 +750,7 @@ pub struct ClientHandshake {
     identity: Option<HostIdentityOwned>,
     signature_valid: Option<bool>,
     signature_error: Option<String>,
+    provider: Option<Box<dyn SignatureProvider + Send>>,
     trust: Option<TrustDecision>,
     session_id: Option<SessionId>,
     keys: Option<KeySet>,
@@ -748,11 +781,46 @@ impl fmt::Debug for ClientHandshake {
 impl ClientHandshake {
     /// Builds the state machine, draws the cookie, the ephemeral scalar and
     /// the padding seed from `rng`, and queues the client identification and
-    /// `KEXINIT` as the first output.
+    /// `KEXINIT` as the first output. Without a signature provider only
+    /// `ssh-ed25519` host keys can be verified; see
+    /// [`ClientHandshake::with_signature_provider`].
     pub fn new(
         config: HandshakeConfig,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Self, HandshakeInitError> {
+        Self::build(config, rng, None)
+    }
+
+    /// [`ClientHandshake::new`], with a host signature provider for the RSA
+    /// and ECDSA P-256 schemes it supports.
+    pub fn with_signature_provider(
+        config: HandshakeConfig,
+        rng: &mut dyn CryptoRngCore,
+        provider: Box<dyn SignatureProvider + Send>,
+    ) -> Result<Self, HandshakeInitError> {
+        Self::build(config, rng, Some(provider))
+    }
+
+    fn build(
+        config: HandshakeConfig,
+        rng: &mut dyn CryptoRngCore,
+        provider: Option<Box<dyn SignatureProvider + Send>>,
+    ) -> Result<Self, HandshakeInitError> {
+        let can_verify = |s: SignatureScheme| {
+            s.is_enabled()
+                && (!s.needs_provider() || provider.as_ref().is_some_and(|p| p.supports(s)))
+        };
+        let host_key_algorithms = match config.host_key_algorithms {
+            Some(list) => {
+                if let Some(&s) = list.as_slice().iter().find(|&&s| !can_verify(s)) {
+                    return Err(HandshakeInitError::HostKeyAlgorithm(s));
+                }
+                list
+            }
+            None => HostKeyAlgorithms::preferred(can_verify).ok_or(
+                HandshakeInitError::HostKeyAlgorithm(SignatureScheme::Ed25519),
+            )?,
+        };
         let client_line = build_identification(&config.software_version)
             .map_err(HandshakeInitError::Identification)?;
         let mut cookie = [0u8; 16];
@@ -769,6 +837,7 @@ impl ClientHandshake {
             cookie,
             advertise_ext_info: config.advertise_ext_info,
             offer_strict_kex: config.offer_strict_kex,
+            host_key_algorithms,
         };
         let i_c = proposal.encode().map_err(HandshakeInitError::Encode)?;
         let client_kexinit = KexInit::decode(&i_c)
@@ -806,6 +875,7 @@ impl ClientHandshake {
             identity: None,
             signature_valid: None,
             signature_error: None,
+            provider,
             trust: None,
             session_id: None,
             keys: None,
@@ -1327,6 +1397,23 @@ impl ClientHandshake {
             blob: identity.blob.to_vec(),
             sha256: identity.sha256,
         };
+        // `check_profile` accepted the selection, so it names a scheme.
+        let Some(scheme) = self
+            .negotiated
+            .as_ref()
+            .and_then(Negotiated::host_key_scheme)
+        else {
+            return self.unexpected(msg::KEX_ECDH_REPLY);
+        };
+        if host_key.key_type() != scheme.key_type() {
+            return self.fail(
+                ProtocolViolation::HostKey(KeyError::UnexpectedKeyType {
+                    expected: scheme.key_type().name(),
+                    found: blob.algorithm.to_vec(),
+                })
+                .into(),
+            );
+        }
 
         let Some(ephemeral) = self.ephemeral.take() else {
             return self.unexpected(msg::KEX_ECDH_REPLY);
@@ -1360,8 +1447,12 @@ impl ClientHandshake {
         let verified = SignatureBlob::decode(reply.signature_blob)
             .map_err(|e| alloc::format!("signature blob: {e}"))
             .and_then(|sig| {
+                let provider = self
+                    .provider
+                    .as_deref()
+                    .map(|p| p as &dyn SignatureProvider);
                 host_key
-                    .verify_signature_blob(h.as_bytes(), &sig)
+                    .verify(scheme, h.as_bytes(), &sig, provider)
                     .map_err(|e| alloc::format!("{e}"))
             });
         if let Err(detail) = verified {
@@ -1924,8 +2015,13 @@ mod tests {
         let key = HostKey::from_blob(&blob).unwrap();
         let mut sig_blob = string(b"ssh-ed25519");
         sig_blob.extend(string(&SIGNATURE));
-        key.verify_signature_blob(&H, &SignatureBlob::decode(&sig_blob).unwrap())
-            .unwrap();
+        key.verify(
+            SignatureScheme::Ed25519,
+            &H,
+            &SignatureBlob::decode(&sig_blob).unwrap(),
+            None,
+        )
+        .unwrap();
         // The strict script's I_S equals the transcript fixture's I_S.
         assert_eq!(strict().i_s, i_s());
     }
@@ -2236,7 +2332,7 @@ mod tests {
         let mut short = string(b"ssh-ed25519");
         short.extend(string(&script.signature[..63]));
         for (blob, expect) in [
-            (wrong_alg, "does not match key algorithm"),
+            (wrong_alg, "but `ssh-ed25519` was negotiated"),
             (trailing, "trailing byte"),
             (short, "expected 64"),
         ] {
@@ -2265,8 +2361,8 @@ mod tests {
             p.extend(string(&sig_blob));
             p
         };
-        let mut rsa = string(b"ssh-rsa");
-        rsa.extend(string(&[1, 0, 1]));
+        let mut dss = string(b"ssh-dss");
+        dss.extend(string(&[1, 0, 1]));
         let run = |reply: Vec<u8>| {
             let mut hs = handshake(config());
             let mut wire = V_S.to_vec();
@@ -2277,10 +2373,32 @@ mod tests {
             drive(&mut hs, trusted()).1.unwrap()
         };
         assert_eq!(
-            run(reply_with_ks(&rsa, &BOB_PUBLIC)),
+            run(reply_with_ks(&dss, &BOB_PUBLIC)),
             HandshakeOutcome::ProtocolError(ProtocolViolation::HostKey(
-                KeyError::UnsupportedAlgorithm(b"ssh-rsa".to_vec())
+                KeyError::UnsupportedAlgorithm(b"ssh-dss".to_vec())
             ))
+        );
+        // A well-formed RSA key where ssh-ed25519 was negotiated: refused
+        // before any signature work (as unsupported when the `rsa` feature
+        // is off in this build).
+        let mut rsa = string(b"ssh-rsa");
+        rsa.extend(string(&[1, 0, 1]));
+        let mut n = alloc::vec![0u8, 0x80];
+        n.extend([0x5a; 255]);
+        let last = n.len() - 1;
+        n[last] |= 1;
+        rsa.extend(string(&n));
+        let expected = if tatami_ssh_keys::KeyType::Rsa.is_enabled() {
+            KeyError::UnexpectedKeyType {
+                expected: b"ssh-ed25519",
+                found: b"ssh-rsa".to_vec(),
+            }
+        } else {
+            KeyError::UnsupportedAlgorithm(b"ssh-rsa".to_vec())
+        };
+        assert_eq!(
+            run(reply_with_ks(&rsa, &BOB_PUBLIC)),
+            HandshakeOutcome::ProtocolError(ProtocolViolation::HostKey(expected))
         );
         assert!(matches!(
             run(reply_with_ks(&[0, 0, 0, 9, b'x'], &BOB_PUBLIC)),
@@ -2910,5 +3028,481 @@ mod tests {
         ] {
             assert!(!report.contains(&secret));
         }
+    }
+}
+
+/// RSA/SHA-2 and ECDSA P-256 host keys through a `ring`-backed test
+/// provider (a dev-dependency only). The server side signs the exchange
+/// hash of the real transcript with `ring`, from OpenSSH-generated fixture
+/// keys (OpenSSL's PKCS#1 / SEC1 conversions of them), so these runs check
+/// scheme negotiation, the key-type and label binding, and the provider
+/// hand-off end to end up to the trust decision.
+#[cfg(test)]
+mod provider_tests {
+    use super::scripted::*;
+    use super::*;
+    use crate::transcript::fixtures::*;
+    use base64ct::{Base64, Encoding as _};
+    use ring::signature as rs;
+    use tatami_ssh_keys::provider::{ProviderRejected, ProviderRequest, RsaHash};
+
+    /// `ssh-keygen -t rsa -b 2048 -C tatami-rsa` `.pub` blob (see
+    /// `tatami_ssh_keys` test vectors for provenance).
+    const RSA_PUB: &str = "AAAAB3NzaC1yc2EAAAADAQABAAABAQC/pUSpK/bpDncU75uYgJ+xQtxuqITHzTd9IUzFgNNlp1atsMgG+plKggA93jMaPuSc/PKrn0ShISco1UWZajKeNXyO2jdcsWtwiRXLQRLWFgT308pyunpMmewS03xJg7nBhneWSPbLjvr3PxALsDZSplTTCl15Iyuwvcoq14Jp+oPJ27Jz73sRRYqcwXoyrMqfgOOb5kTeS+EG206df1zfwVkLNmzTh+N3c5krdc49eQjg3JKGszQjpIotfyJSOwtDTHrexFcrYJgXNPjaytgO3OJ5UnAvXuQCl2YeDu3pwJUuil5rGFfLNloa5pmSD0a34c/8IxUl7LZVCbSWGGtd";
+    /// OpenSSL's PKCS#1 DER of the same key.
+    const RSA_PKCS1: &str = "MIIEogIBAAKCAQEAv6VEqSv26Q53FO+bmICfsULcbqiEx803fSFMxYDTZadWrbDIBvqZSoIAPd4zGj7knPzyq59EoSEnKNVFmWoynjV8jto3XLFrcIkVy0ES1hYE99PKcrp6TJnsEtN8SYO5wYZ3lkj2y4769z8QC7A2UqZU0wpdeSMrsL3KKteCafqDyduyc+97EUWKnMF6MqzKn4Djm+ZE3kvhBttOnX9c38FZCzZs04fjd3OZK3XOPXkI4NyShrM0I6SKLX8iUjsLQ0x63sRXK2CYFzT42srYDtzieVJwL17kApdmHg7t6cCVLopeaxhXyzZaGuaZkg9Gt+HP/CMVJey2VQm0lhhrXQIDAQABAoIBAAhlDial6x0m2c8ENundeoFKhzrerWBOLDfSOVlubPQnOhwGIiDyIbxaiPWs0cq8xgldaCjd42T2fY9jljaj6P82oxPj2ah5ChaGHrsGSPOxR7ruX1AavIg19toVQvy6ZSzlvb/KxurAQtyJOeP1Lk/9Arqy2cjYYk3N5njtc0Q+llahz8HF2kkRmJsEF+y+WI+e8GaO5QETcTnPbEE7J6FWFVhSuwDd5n9MWio5eUQUa9DzhjIHXAs7lNpcWVnN9uypDW1HcKmGANq+Uak8gH6/GlCV7mlF1Mgk3OjqtOEvxifyJqO4bD51rMtDWov3iUK1TKxnaAn6byUYwq3Gk4ECgYEA4HxmN818pH0dSdioNyqFZz/kQT4Q3xfECOeKSW4Ow2XtVeL675K5hDI9KB7yHN0yDwVHlPys1pV6xqFNVf2KGOkb7kO8COUMZEYID1kjacKHD6eYhQwmijp/zRzSqrhnvwAfndkEiypjjE+xWK18Xg0E81ZiqvZBsC2ACoUZf90CgYEA2oymBcz8Hk4TdajFYB4W0an76ogqYEWFYyV6horrYkyqBFMkKcEMfq/bgiQzTVx4ekJe6i7zHpEpYJF1zDpbOpK6lbdsohpOX1AIvN6JsUqQt+TPY0LEPVY/OzZIyZbna3Dvy04v5ImlJVMqNnP7jt5PwKaMDTsyRQrmDDNZoYECgYA9gHd0xFxoqEp05+G2M3UXA38ijMGMjXNMyTquwXNT/0HVrPj41+bxm937dvb4B3XmfZjN7afgplVbw+dvLqY+Cud3EKGcgjwx4KnmopI8MGpWVKFJmjmY10waQtJIqXrq7jq7QTCoe/WIBHFfDTCsh76aeElR82Otw9l3iF2jFQKBgAynxllhpFvQ45mVm1BUjbe4YykSl3mZrP6vxeeSlczMaa/0bIyqbCHN5yUjGYFqUGOsAjkHXPaxKzc3VR3tZyj+JCXVSEoewdkNFmRxcoG8sqKjckrqK9jtbJ3uJ8rcnSwAjzIzpdxTCCggJ7qdfryoLPAX9NYzTlbnKakdNByBAoGAaKSruN1CEJTTaZ86nMrTMvQmon7qj4BgJT/S+lhLdvZv0R7gy8QNyV7mxfryDMLbYLNMk2EGStN3hkCGMKNHDXhutCG7HqP9jEEubMZUad77O6bAndA3b6ycttA5qJ/y5EQg60/Dzd6+wI1sc9RHu+g+Wr+KaQ2PLOFDvUGIa2k=";
+    /// `ssh-keygen -t ecdsa -b 256 -C tatami-ecdsa` `.pub` blob.
+    const P256_PUB: &str = "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPefqcX04ziwNySvMXeLEfDe8F0XSC8g003NOymUwN0vb5UpZ3nIXNJJQafT41xQzPXH9DJRby8NLEtRLgS20No=";
+    /// OpenSSL's SEC1 DER of the same key (scalar at 7..39, point last).
+    const P256_SEC1: &str = "MHcCAQEEILYUyJJ3H2634hSVlQKFu2gLJEWfBiDyCpd43t+LnLJOoAoGCCqGSM49AwEHoUQDQgAE95+pxfTjOLA3JK8xd4sR8N7wXRdILyDTTc07KZTA3S9vlSlnechc0klBp9PjXFDM9cf0MlFvLw0sS1EuBLbQ2g==";
+
+    fn b64(s: &str) -> Vec<u8> {
+        Base64::decode_vec(s).unwrap()
+    }
+
+    /// Verification only, as a host adapter would implement it.
+    struct Ring;
+
+    impl SignatureProvider for Ring {
+        fn supports(&self, scheme: SignatureScheme) -> bool {
+            scheme.needs_provider()
+        }
+        fn verify(&self, m: &[u8], r: &ProviderRequest<'_>) -> Result<(), ProviderRejected> {
+            match r {
+                ProviderRequest::RsaPkcs1v15 {
+                    hash,
+                    modulus,
+                    exponent,
+                    signature,
+                } => {
+                    let alg = match hash {
+                        RsaHash::Sha256 => &rs::RSA_PKCS1_2048_8192_SHA256,
+                        RsaHash::Sha512 => &rs::RSA_PKCS1_2048_8192_SHA512,
+                    };
+                    rs::RsaPublicKeyComponents {
+                        n: modulus,
+                        e: exponent,
+                    }
+                    .verify(alg, m, signature)
+                }
+                ProviderRequest::EcdsaP256Sha256 {
+                    public_point,
+                    signature,
+                } => rs::UnparsedPublicKey::new(&rs::ECDSA_P256_SHA256_FIXED, public_point)
+                    .verify(m, &signature[..]),
+            }
+            .map_err(|_| ProviderRejected)
+        }
+    }
+
+    /// Server KEXINIT offering `host_keys`, otherwise the plain profile.
+    fn server_kexinit(host_keys: &[u8]) -> Vec<u8> {
+        let mut out = alloc::vec![20u8];
+        out.extend_from_slice(&[0x52; 16]);
+        for list in [
+            &b"curve25519-sha256"[..],
+            host_keys,
+            b"aes128-gcm@openssh.com",
+            b"aes128-gcm@openssh.com",
+            b"hmac-sha2-256",
+            b"hmac-sha2-256",
+            b"none",
+            b"none",
+            b"",
+            b"",
+        ] {
+            out.extend(string(list));
+        }
+        out.push(0);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out
+    }
+
+    /// Independent exchange hash (RFC 8731 / RFC 5656 §4) with sha2.
+    fn exchange_hash_of(i_c: &[u8], i_s: &[u8], k_s: &[u8]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        for part in [V_C, V_S, i_c, i_s, k_s, &ALICE_PUBLIC, &BOB_PUBLIC] {
+            hash.update((part.len() as u32).to_be_bytes());
+            hash.update(part);
+        }
+        hash.update(32u32.to_be_bytes());
+        hash.update(SHARED_K);
+        hash.finalize().into()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Key {
+        Rsa,
+        P256,
+    }
+
+    fn k_s_of(key: Key) -> Vec<u8> {
+        match key {
+            Key::Rsa => b64(RSA_PUB),
+            Key::P256 => b64(P256_PUB),
+        }
+    }
+
+    fn mpint(m: &[u8]) -> Vec<u8> {
+        let m = &m[m.iter().position(|&b| b != 0).unwrap_or(m.len())..];
+        let mut body = Vec::new();
+        if m.first().is_some_and(|b| b & 0x80 != 0) {
+            body.push(0);
+        }
+        body.extend_from_slice(m);
+        string(&body)
+    }
+
+    /// The raw signature for `message`: PKCS#1 v1.5 for RSA (the hash per
+    /// `rsa_hash`), SSH `mpint r || mpint s` for P-256.
+    fn sign(key: Key, rsa_hash: RsaHash, message: &[u8]) -> Vec<u8> {
+        let rng = ring::rand::SystemRandom::new();
+        match key {
+            Key::Rsa => {
+                let pair = rs::RsaKeyPair::from_der(&b64(RSA_PKCS1)).unwrap();
+                let mut sig = alloc::vec![0u8; pair.public().modulus_len()];
+                let pad = match rsa_hash {
+                    RsaHash::Sha256 => &rs::RSA_PKCS1_SHA256,
+                    RsaHash::Sha512 => &rs::RSA_PKCS1_SHA512,
+                };
+                pair.sign(pad, &rng, message, &mut sig).unwrap();
+                sig
+            }
+            Key::P256 => {
+                let sec1 = b64(P256_SEC1);
+                let pair = rs::EcdsaKeyPair::from_private_key_and_public_key(
+                    &rs::ECDSA_P256_SHA256_FIXED_SIGNING,
+                    &sec1[7..39],
+                    &sec1[sec1.len() - 65..],
+                    &rng,
+                )
+                .unwrap();
+                let fixed = pair.sign(&rng, message).unwrap();
+                let fixed = fixed.as_ref();
+                [mpint(&fixed[..32]), mpint(&fixed[32..])].concat()
+            }
+        }
+    }
+
+    /// How the scripted server misbehaves, if at all.
+    #[derive(Clone, Copy, Debug)]
+    struct Server {
+        offers: &'static [u8],
+        key: Key,
+        rsa_hash: RsaHash,
+        label: &'static [u8],
+        corrupt: bool,
+    }
+
+    /// What the client ended up with.
+    struct Run {
+        outcome: Option<HandshakeOutcome>,
+        identity: Option<HostIdentityOwned>,
+        report: HandshakeReport,
+    }
+
+    fn drive(
+        hs: &mut ClientHandshake,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<HostIdentityOwned>, HandshakeOutcome> {
+        loop {
+            match hs.step() {
+                Step::NeedMore => return Ok(None),
+                Step::Send => out.extend(hs.take_output()),
+                Step::TrustDecisionRequired(id) => return Ok(Some(id)),
+                Step::Finished(o) => return Err(*o),
+            }
+        }
+    }
+
+    /// First unprotected payload after the identification line (`I_C`).
+    fn first_payload(written: &[u8]) -> Vec<u8> {
+        let ident_end = written.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let rest = &written[ident_end..];
+        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        let pad = rest[4] as usize;
+        rest[5..4 + len - pad].to_vec()
+    }
+
+    fn run(config: HandshakeConfig, server: Server) -> Run {
+        let mut hs =
+            ClientHandshake::with_signature_provider(config, &mut client_rng(), Box::new(Ring))
+                .unwrap();
+        let mut written = Vec::new();
+        assert_eq!(drive(&mut hs, &mut written).ok(), Some(None));
+        let i_c = first_payload(&written);
+        let i_s = server_kexinit(server.offers);
+        let k_s = k_s_of(server.key);
+        let mut wire = V_S.to_vec();
+        wire.extend_from_slice(b"\r\n");
+        wire.extend(packet(&i_s));
+        hs.feed(&wire);
+        if let Err(o) = drive(&mut hs, &mut written) {
+            return Run {
+                outcome: Some(o),
+                identity: None,
+                report: hs.report(),
+            };
+        }
+        let h = exchange_hash_of(&i_c, &i_s, &k_s);
+        let mut raw = sign(server.key, server.rsa_hash, &h);
+        if server.corrupt {
+            let last = raw.len() - 1;
+            raw[last] ^= 0x01;
+        }
+        let mut sig_blob = string(server.label);
+        sig_blob.extend(string(&raw));
+        let mut reply = alloc::vec![31u8];
+        reply.extend(string(&k_s));
+        reply.extend(string(&BOB_PUBLIC));
+        reply.extend(string(&sig_blob));
+        hs.feed(&packet(&reply));
+        let (outcome, identity) = match drive(&mut hs, &mut written) {
+            Ok(id) => (None, id),
+            Err(o) => (Some(o), None),
+        };
+        Run {
+            outcome,
+            identity,
+            report: hs.report(),
+        }
+    }
+
+    fn config(forced: Option<&[SignatureScheme]>) -> HandshakeConfig {
+        HandshakeConfig {
+            software_version: String::from("tatami_0.1.0"),
+            host_key_algorithms: forced.map(|l| HostKeyAlgorithms::new(l).unwrap()),
+            ..HandshakeConfig::default()
+        }
+    }
+
+    fn offered(hs: &ClientHandshake) -> String {
+        hs.report()
+            .advertised
+            .client
+            .server_host_key_algorithms
+            .join(",")
+    }
+
+    #[test]
+    fn offered_lists_follow_provider_and_configuration() {
+        let without = ClientHandshake::new(config(None), &mut client_rng()).unwrap();
+        assert_eq!(offered(&without), "ssh-ed25519");
+        let with = ClientHandshake::with_signature_provider(
+            config(None),
+            &mut client_rng(),
+            Box::new(Ring),
+        )
+        .unwrap();
+        assert_eq!(
+            offered(&with),
+            "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256"
+        );
+        // Forcing RSA without a provider is a configuration error, not a
+        // silent fallback.
+        assert!(matches!(
+            ClientHandshake::new(
+                config(Some(&[SignatureScheme::RsaSha2_256])),
+                &mut client_rng()
+            ),
+            Err(HandshakeInitError::HostKeyAlgorithm(
+                SignatureScheme::RsaSha2_256
+            ))
+        ));
+        let forced = ClientHandshake::with_signature_provider(
+            config(Some(&[SignatureScheme::RsaSha2_256])),
+            &mut client_rng(),
+            Box::new(Ring),
+        )
+        .unwrap();
+        assert_eq!(offered(&forced), "rsa-sha2-256");
+    }
+
+    #[test]
+    fn each_scheme_negotiates_and_verifies() {
+        for (offers, key, rsa_hash, label) in [
+            (
+                &b"rsa-sha2-512,rsa-sha2-256"[..],
+                Key::Rsa,
+                RsaHash::Sha512,
+                &b"rsa-sha2-512"[..],
+            ),
+            (b"rsa-sha2-256", Key::Rsa, RsaHash::Sha256, b"rsa-sha2-256"),
+            (
+                b"ecdsa-sha2-nistp256,rsa-sha2-512",
+                Key::P256,
+                RsaHash::Sha256,
+                b"ecdsa-sha2-nistp256",
+            ),
+        ] {
+            let r = run(
+                config(None),
+                Server {
+                    offers,
+                    key,
+                    rsa_hash,
+                    label,
+                    corrupt: false,
+                },
+            );
+            assert_eq!(r.outcome, None, "{label:?}: {:?}", r.report.signature_error);
+            assert_eq!(r.report.signature_valid, Some(true));
+            let selected = r.report.selected.unwrap();
+            assert_eq!(selected.host_key.as_bytes(), label);
+            let id = r.identity.expect("trust decision requested");
+            assert_eq!(id.blob, k_s_of(key));
+            assert_eq!(id.sha256, Sha256Fingerprint::of_blob(&k_s_of(key)));
+            let expected_type = if key == Key::Rsa {
+                "ssh-rsa"
+            } else {
+                "ecdsa-sha2-nistp256"
+            };
+            assert_eq!(id.algorithm, expected_type);
+        }
+    }
+
+    #[test]
+    fn forcing_each_rsa_hash_from_the_client() {
+        // The server offers both; the client's forced list decides.
+        for (forced, label, hash) in [
+            (
+                SignatureScheme::RsaSha2_256,
+                &b"rsa-sha2-256"[..],
+                RsaHash::Sha256,
+            ),
+            (
+                SignatureScheme::RsaSha2_512,
+                b"rsa-sha2-512",
+                RsaHash::Sha512,
+            ),
+        ] {
+            let r = run(
+                config(Some(&[forced])),
+                Server {
+                    offers: b"rsa-sha2-512,rsa-sha2-256,ssh-ed25519",
+                    key: Key::Rsa,
+                    rsa_hash: hash,
+                    label,
+                    corrupt: false,
+                },
+            );
+            assert_eq!(r.outcome, None, "{:?}", r.report.signature_error);
+            assert_eq!(r.report.selected.unwrap().host_key.as_bytes(), label);
+        }
+    }
+
+    fn assert_signature_invalid(r: &Run, needle: &str) {
+        assert_eq!(r.outcome, Some(HandshakeOutcome::SignatureInvalid));
+        assert_eq!(r.report.signature_valid, Some(false));
+        let err = r.report.signature_error.clone().unwrap();
+        assert!(err.contains(needle), "{err}");
+        assert!(
+            r.identity.is_none(),
+            "no trust decision after a bad signature"
+        );
+    }
+
+    #[test]
+    fn labels_hashes_and_signatures_are_bound() {
+        let rsa512 = Server {
+            offers: b"rsa-sha2-512",
+            key: Key::Rsa,
+            rsa_hash: RsaHash::Sha512,
+            label: b"rsa-sha2-512",
+            corrupt: false,
+        };
+        // A genuine SHA-256 signature labelled as negotiated SHA-512: the
+        // hash is wrong, the provider refuses.
+        assert_signature_invalid(
+            &run(
+                config(None),
+                Server {
+                    rsa_hash: RsaHash::Sha256,
+                    ..rsa512
+                },
+            ),
+            "does not verify",
+        );
+        // A correct SHA-256 signature carrying its own label while SHA-512
+        // was negotiated; and the RSA/SHA-1 `ssh-rsa` label.
+        for label in [&b"rsa-sha2-256"[..], b"ssh-rsa"] {
+            assert_signature_invalid(
+                &run(
+                    config(None),
+                    Server {
+                        rsa_hash: RsaHash::Sha256,
+                        label,
+                        ..rsa512
+                    },
+                ),
+                "was negotiated",
+            );
+        }
+        // Tampered RSA and P-256 signatures.
+        assert_signature_invalid(
+            &run(
+                config(None),
+                Server {
+                    corrupt: true,
+                    ..rsa512
+                },
+            ),
+            "does not verify",
+        );
+        assert_signature_invalid(
+            &run(
+                config(None),
+                Server {
+                    offers: b"ecdsa-sha2-nistp256",
+                    key: Key::P256,
+                    rsa_hash: RsaHash::Sha256,
+                    label: b"ecdsa-sha2-nistp256",
+                    corrupt: true,
+                },
+            ),
+            "does not verify",
+        );
+    }
+
+    #[test]
+    fn presented_key_must_match_the_negotiated_type() {
+        // ECDSA negotiated, RSA key presented (validly signed by it).
+        let r = run(
+            config(None),
+            Server {
+                offers: b"ecdsa-sha2-nistp256",
+                key: Key::Rsa,
+                rsa_hash: RsaHash::Sha256,
+                label: b"ecdsa-sha2-nistp256",
+                corrupt: false,
+            },
+        );
+        assert_eq!(
+            r.outcome,
+            Some(HandshakeOutcome::ProtocolError(ProtocolViolation::HostKey(
+                KeyError::UnexpectedKeyType {
+                    expected: b"ecdsa-sha2-nistp256",
+                    found: b"ssh-rsa".to_vec(),
+                }
+            )))
+        );
+        assert_eq!(r.report.signature_valid, None, "no signature work was done");
+        // The server offers only SHA-1 RSA: nothing in common.
+        let r = run(
+            config(None),
+            Server {
+                offers: b"ssh-rsa,ssh-dss",
+                key: Key::Rsa,
+                rsa_hash: RsaHash::Sha256,
+                label: b"ssh-rsa",
+                corrupt: false,
+            },
+        );
+        assert_eq!(
+            r.outcome,
+            Some(HandshakeOutcome::NegotiationFailed(
+                NegotiationError::NoCommonHostKey
+            ))
+        );
     }
 }

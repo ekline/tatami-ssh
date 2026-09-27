@@ -794,6 +794,12 @@ pub mod handshake {
                 return Report::unconnected(options, lookup_name, Completion::ConnectFailed(e));
             }
         };
+        // RSA / ECDSA P-256 host keys are verified by the host provider
+        // when this build has them; otherwise only ssh-ed25519 is offered.
+        #[cfg(any(feature = "rsa", feature = "ecdsa-p256"))]
+        let provider = crate::host::signature::provider();
+        #[cfg(not(any(feature = "rsa", feature = "ecdsa-p256")))]
+        let provider = None;
         match run_handshake(
             stream,
             options.config.clone(),
@@ -801,6 +807,7 @@ pub mod handshake {
             // shared-policy trait object directly requires trait upcasting,
             // which is unavailable on the workspace's Rust 1.85 MSRV.
             &prepared.policy.as_ref(),
+            provider,
             &options.io,
         ) {
             Ok(run) => from_run(options, lookup_name, run),

@@ -234,6 +234,68 @@ Check integers alone do not establish key consistency; the derivation check
 does. The PKCS#8 form (RFC 8410 §7 prefix plus seed) is built in
 `Zeroizing` memory and never written.
 
+## RSA and ECDSA P-256 host keys (round 6)
+
+Decision W-43. Ed25519 stays the preferred host key; RSA/SHA-2 and ECDSA
+P-256 are added for interoperability, each behind an explicit feature
+(`tatami_ssh_keys/{rsa,ecdsa-p256}`, facade `rsa` / `ecdsa-p256`).
+
+**Division of labour.** The portable crates (`no_std` + `alloc`, no C/asm)
+parse blobs and signatures, apply the key policy and bind verification to
+the negotiated scheme; a host-supplied `tatami_ssh_keys::provider::
+SignatureProvider` performs only the final check. The facade implements it
+in `host::signature` with `ring` 0.17.14 — already in the graph through
+rustls 0.23.45 — so there is one audited provider for TCP and QUIC. Without a
+provider (for example on bare metal) the TCP client offers `ssh-ed25519`
+only; a forced RSA/P-256 list is a construction error, never a silent
+fallback. `scripts/check-workspace.sh` checks that the portable key graph
+with both features contains no `ring`, `rustls`, `getrandom`, `rsa` or
+`std` feature.
+
+| Operation | Where | Implementation |
+|---|---|---|
+| `ssh-rsa` blob, strict positive minimal `mpint`s; modulus odd, 2048–8192 bits; exponent odd, ≥ 3, ≤ 4 bytes | `tatami_ssh_keys::rsa` | own code, before any provider call |
+| `rsa-sha2-256` / `rsa-sha2-512` verification (PKCS#1 v1.5, not PSS) | facade `host::signature` | `ring` `RSA_PKCS1_2048_8192_SHA256/512` over raw `(n, e)` |
+| RFC 8332 shortened RSA signatures | `tatami_ssh_keys::rsa` | accepted by left-padding to the modulus length; empty or longer signatures rejected; never truncated |
+| `ecdsa-sha2-nistp256` blob (curve name, 65-byte uncompressed point) and signature (strict non-zero `r`, `s` ≤ 32 bytes) | `tatami_ssh_keys::ecdsa` | own code |
+| P-256 point validity, `r`/`s` < n | facade `host::signature` | `ring` `ECDSA_P256_SHA256_FIXED`; no low-S rule |
+| SPKI ⇄ SSH blob (rsaEncryption + `NULL`; id-ecPublicKey + prime256v1 + uncompressed point) | `tatami_ssh_keys::spki` | own strict DER; canonical re-encoding only |
+| OpenSSH RSA / P-256 private key import | `tatami_ssh_keys::openssh_key` | `ssh-key` 0.6.7 parsing (feature `ecdsa` → `sec1` 0.7.3, `base16ct` 0.2.0); RSA CRT exponents `d mod (p−1)`, `d mod (q−1)` and the checks `p·q = n`, `d < n` with `crypto-bigint` 0.5.5 (constant time in the secret dividend) |
+| TLS `CertificateVerify` with the same key (QUIC) | `tatami_ssh_quic` | rustls `any_supported_type` on `ring`: RSA-PSS or ECDSA P-256/SHA-256 in TLS 1.3 (never PKCS#1 v1.5); scheme must match the key type |
+
+**Signature scheme binding.** The signature label must equal the negotiated
+scheme and the presented `K_S` must be of that scheme's key type, both
+before any cryptographic work. `ssh-rsa` (RSA/SHA-1) is not a
+`SignatureScheme` value, so it can be neither offered nor accepted; as a
+public-key blob name it stays legal. Client order: `ssh-ed25519`,
+`ecdsa-sha2-nistp256`, `rsa-sha2-512`, `rsa-sha2-256` (OpenSSH's order for
+these), overridable with `HandshakeConfig::host_key_algorithms` /
+`tatami-client handshake --host-key-algorithms`.
+
+**RUSTSEC-2023-0071 (`rsa` crate, Marvin timing attack, no patched
+version).** Not applicable: the `rsa` crate is not a dependency (the facade
+graph check fails the build if it appears). No RSA private-key operation is
+network-facing through any RustCrypto code. RSA *verification* uses public
+data only. RSA *signing* happens only in `ring` inside TLS (QUIC server with
+an RSA host key), the provider rustls already uses. Importing an RSA key
+computes the CRT exponents with `crypto-bigint`, locally and once, from a
+file the operator supplies; no decryption or signing is performed there.
+
+**Load-time checks (QUIC host keys).** `ring` validates the RSA components it
+uses (`p`, `q`, `dP`, `dQ`, `qInv`, sizes; it never uses `d`) and re-derives
+EC and Ed25519 public keys. The provider's public key must equal the file's
+SSH blob and the canonical SPKI, and a probe message is signed with the TLS
+scheme and verified against the public key, so a key that cannot produce
+valid signatures is refused before any socket exists.
+
+**Limitations.** `ring` signs only with 2048-, 3072- and 4096-bit RSA keys
+with `e ≥ 65537`, so larger RSA host keys work on TCP (verification) but not
+as QUIC server identities. `ssh-key` 0.6.7 expects 32-byte P-256 scalars;
+OpenSSH writes a minimal `mpint`, so about one P-256 key in 256 (a 31-byte
+scalar) is refused as malformed. ECDSA P-384/P-521, DSA, `sk-*` keys and
+certificates remain unsupported. Point validity is left to the provider:
+an off-curve P-256 key parses but can never verify.
+
 ## Secret handling rules applied
 
 - Entropy is injected into portable code through `rand_core::CryptoRngCore`

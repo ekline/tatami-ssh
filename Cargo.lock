@@ -38,6 +38,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base16ct"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -123,6 +129,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crypto-bigint"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
+dependencies = [
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -572,6 +588,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "sec1"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
+dependencies = [
+ "base16ct",
+ "generic-array",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -686,6 +712,7 @@ version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b86f5297f0f04d08cabaa0f6bff7cb6aec4d9c3b49d87990d63da9d9156a8c3"
 dependencies = [
+ "sec1",
  "sha2",
  "signature",
  "ssh-cipher",
@@ -727,6 +754,7 @@ name = "tatami_ssh"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "ring",
  "serde_json",
  "tatami_ssh_auth",
  "tatami_ssh_connection",
@@ -755,6 +783,7 @@ name = "tatami_ssh_keys"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "crypto-bigint",
  "ed25519-dalek",
  "sha2",
  "ssh-key",
@@ -794,8 +823,10 @@ name = "tatami_ssh_tcp"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64ct",
  "getrandom 0.2.17",
  "rand_core 0.6.4",
+ "ring",
  "sha2",
  "subtle",
  "tatami_ssh_auth",

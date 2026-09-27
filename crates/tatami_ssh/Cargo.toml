@@ -31,6 +31,27 @@ quic-diag = [
     "tatami_ssh_keys/known-hosts",
     "tatami_ssh_keys/openssh-key",
 ]
+# RSA host keys (`ssh-rsa` blob, rsa-sha2-512 / rsa-sha2-256 signatures,
+# 2048-8192 bits) on both transports: TCP host-signature verification
+# through the `ring` provider in `host::signature` (verification only), and
+# with `quic-diag` RSA SSH host keys as raw public keys (`--host-key` on the
+# server: 2048/3072/4096 bits, what `ring` can sign with). Host-only:
+# requires std and pulls ring (C/asm). The `rsa` crate is never used.
+rsa = [
+    "std",
+    "kex",
+    "dep:ring",
+    "tatami_ssh_keys/rsa",
+    "tatami_ssh_quic?/rsa",
+]
+# ECDSA P-256 host keys (`ecdsa-sha2-nistp256`), same shape as `rsa`.
+ecdsa-p256 = [
+    "std",
+    "kex",
+    "dep:ring",
+    "tatami_ssh_keys/ecdsa-p256",
+    "tatami_ssh_quic?/ecdsa-p256",
+]
 # Legacy OpenSSH hashed host names (`|1|salt|hash`, HMAC-SHA1) in
 # `--known-hosts` files. Off by default and deliberately not part of `kex` or
 # `quic-diag`: without it a hashed entry is an explicit
@@ -44,6 +65,10 @@ tatami_ssh_auth = { workspace = true }
 tatami_ssh_connection = { workspace = true }
 tatami_ssh_tcp = { workspace = true, optional = true }
 tatami_ssh_quic = { workspace = true, optional = true }
+# Host adapter only (features `rsa` / `ecdsa-p256`): RSA PKCS#1 v1.5 and
+# ECDSA P-256 signature *verification* for the TCP handshake. The same
+# version rustls already uses; no signing or key generation happens here.
+ring = { version = "0.17.14", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 # Test-only: an independent JSON parser to validate JSON Lines output.

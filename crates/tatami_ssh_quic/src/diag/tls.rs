@@ -17,12 +17,15 @@
 //! - [`PinnedRawPublicKeyVerifier`]: the RFC 7250 counterpart, pinning the
 //!   SPKI SHA-256 and verifying with `verify_tls13_signature_with_raw_key`.
 //! - [`SshHostKeyVerifier`]: RFC 7250 raw public key judged as an **SSH host
-//!   key**: the SPKI is converted strictly to the canonical `ssh-ed25519`
-//!   blob and handed to the same `HostTrustPolicy` the TCP handshake uses
-//!   (a `known_hosts` file bound to the lookup name, or an SSH `SHA256:`
-//!   pin). The policy is preloaded and immutable; the verifier does no file
-//!   or DNS I/O. `CertificateVerify` is still verified by the provider: a
-//!   matching key alone never counts as proof of possession.
+//!   key**: the SPKI is converted strictly to the canonical SSH blob
+//!   (`ssh-ed25519`, and `ssh-rsa` / `ecdsa-sha2-nistp256` with the `rsa` /
+//!   `ecdsa-p256` features) and handed to the same `HostTrustPolicy` the
+//!   TCP handshake uses (a `known_hosts` file bound to the lookup name, or
+//!   an SSH `SHA256:` pin). The policy is preloaded and immutable; the
+//!   verifier does no file or DNS I/O. `CertificateVerify` is still verified
+//!   by the provider: a matching key alone never counts as proof of
+//!   possession. The TLS signature scheme must also belong to the key's
+//!   type (Ed25519; RSA-PSS for RSA; ECDSA P-256/SHA-256 for P-256).
 //! - Config builders producing `quinn-proto` crypto configs with 0-RTT and
 //!   resumption disabled.
 
@@ -313,7 +316,8 @@ impl ServerCertVerifier for PinnedRawPublicKeyVerifier {
 pub enum SshIdentityCheck {
     /// The raw public key converted to an SSH identity and was judged.
     Judged {
-        /// SSH public-key algorithm (always `ssh-ed25519` here).
+        /// SSH public-key algorithm (`ssh-ed25519`, `ssh-rsa` or
+        /// `ecdsa-sha2-nistp256`).
         algorithm: String,
         /// The canonical SSH public-key blob.
         blob: Vec<u8>,
@@ -322,8 +326,9 @@ pub enum SshIdentityCheck {
         /// The policy's decision.
         decision: TrustDecision,
     },
-    /// The presented bytes are not a supported Ed25519 SPKI (for example a
-    /// certificate where a raw key was required, or malformed DER).
+    /// The presented bytes are not a supported SPKI (for example a
+    /// certificate where a raw key was required, an unsupported algorithm or
+    /// curve, or malformed DER).
     NotConvertible {
         /// Why, from `tatami_ssh_keys::spki`.
         reason: String,
@@ -424,8 +429,8 @@ impl ServerCertVerifier for SshHostKeyVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let blob = match tatami_ssh_keys::spki::spki_to_ssh_blob(end_entity.as_ref()) {
-            Ok(b) => b,
+        let key = match tatami_ssh_keys::spki::host_key_from_spki(end_entity.as_ref()) {
+            Ok(k) => k,
             Err(e) => {
                 self.record(SshIdentityCheck::NotConvertible {
                     reason: e.to_string(),
@@ -435,16 +440,17 @@ impl ServerCertVerifier for SshHostKeyVerifier {
                 ));
             }
         };
+        let blob = key.to_blob();
         let fingerprint = Sha256Fingerprint::of_blob(&blob);
         let identity = HostIdentity {
-            algorithm: tatami_ssh_keys::blob::SSH_ED25519,
+            algorithm: key.algorithm(),
             blob: &blob,
             sha256: fingerprint,
         };
         let decision = self.trust.policy.decide(&identity);
         self.record(SshIdentityCheck::Judged {
-            algorithm: String::from("ssh-ed25519"),
-            blob: blob.to_vec(),
+            algorithm: key.key_type().to_string(),
+            blob,
             fingerprint,
             decision,
         });
@@ -473,6 +479,18 @@ impl ServerCertVerifier for SshHostKeyVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        // The scheme must be the TLS 1.3 scheme for this key type; webpki
+        // also ties the scheme to the SPKI algorithm, this makes the
+        // expectation explicit and independent of that mapping.
+        let key = tatami_ssh_keys::spki::host_key_from_spki(cert.as_ref())
+            .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+        if !scheme_matches_key(dss.scheme, key.key_type()) {
+            return Err(rustls::Error::General(format!(
+                "TLS signature scheme {:?} does not belong to the {} host key",
+                dss.scheme,
+                key.key_type()
+            )));
+        }
         // Proof of possession, independent of the trust decision above.
         let spki = SubjectPublicKeyInfoDer::from(cert.as_ref());
         rustls::crypto::verify_tls13_signature_with_raw_key(message, &spki, dss, &self.algs)
@@ -485,6 +503,26 @@ impl ServerCertVerifier for SshHostKeyVerifier {
     fn requires_raw_public_keys(&self) -> bool {
         true
     }
+}
+
+/// The TLS 1.3 `CertificateVerify` schemes acceptable for an SSH host key
+/// of type `key_type` (RFC 8446 §4.2.3): Ed25519 for Ed25519; RSA-PSS
+/// (rsaEncryption key) for RSA — never PKCS#1 v1.5 in TLS 1.3; ECDSA with
+/// SHA-256 on P-256 for P-256.
+#[must_use]
+pub fn scheme_matches_key(scheme: SignatureScheme, key_type: tatami_ssh_keys::KeyType) -> bool {
+    use tatami_ssh_keys::KeyType;
+    matches!(
+        (key_type, scheme),
+        (KeyType::Ed25519, SignatureScheme::ED25519)
+            | (
+                KeyType::Rsa,
+                SignatureScheme::RSA_PSS_SHA256
+                    | SignatureScheme::RSA_PSS_SHA384
+                    | SignatureScheme::RSA_PSS_SHA512
+            )
+            | (KeyType::EcdsaP256, SignatureScheme::ECDSA_NISTP256_SHA256)
+    )
 }
 
 /// How the server presents its identity.

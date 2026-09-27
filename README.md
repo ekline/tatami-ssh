@@ -308,6 +308,14 @@ cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-client -- 
   show the SSH fingerprint and the SSHFP value (`4 2 <hex>`, as `ssh-keygen
   -r` prints) as fingerprint equivalence only: no DNS lookup or DNSSEC
   validation takes place (W-36, W-40).
+- **Key types (round 6).** With `--features rsa,ecdsa-p256` the same works
+  for RSA (`rsa-sha2-512` / `rsa-sha2-256`; 2048–4096-bit keys as QUIC
+  identities, up to 8192 bits on TCP) and ECDSA P-256 host keys, with SSHFP
+  algorithms 1 and 3. `tatami-client handshake --host-key-algorithms LIST`
+  forces the TCP host-key algorithm list; `ssh-rsa` (RSA/SHA-1) is never
+  offered or accepted. RSA and P-256 signatures are checked by `ring`, the
+  provider rustls already uses; the portable crates stay free of C/asm
+  (W-43).
 - **Lookup name.** The host as typed, lowercased; `[host]:port` unless the
   port is 22 (OpenSSH's rule), bound before connecting. TCP and UDP on the
   same port number share an entry; different ports do not. The resolved

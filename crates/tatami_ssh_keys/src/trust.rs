@@ -26,8 +26,10 @@
 //! connection, so a broken configuration can never look like "unknown
 //! host".
 //!
-//! This module is feature-free. Computing the fingerprint in a
-//! [`HostIdentity`] needs the `ed25519` feature (`sha2`); the decision
+//! This module is feature-free and key-type agnostic: policies compare the
+//! complete blob (and its algorithm name), so Ed25519, RSA and ECDSA P-256
+//! keys are judged the same way. Computing the fingerprint in a
+//! [`HostIdentity`] needs the `fingerprint` feature (`sha2`); the decision
 //! itself does not.
 
 use crate::fingerprint::Sha256Fingerprint;
@@ -182,7 +184,7 @@ pub struct HostIdentity<'a> {
     pub sha256: Sha256Fingerprint,
 }
 
-#[cfg(feature = "ed25519")]
+#[cfg(feature = "fingerprint")]
 impl<'a> HostIdentity<'a> {
     /// Builds the identity for a parsed blob, computing its fingerprint.
     #[must_use]

@@ -214,10 +214,23 @@ pub mod lists {
             out
         }
 
-        /// The lists Tatami's `ClientProposal` sends, restated from the
-        /// negotiate module documentation.
+        /// The lists Tatami's `ClientProposal` sends with the default
+        /// `HostKeyAlgorithms::ED25519_ONLY`, restated from the negotiate
+        /// module documentation.
         #[must_use]
         pub fn tatami_client(cookie: [u8; 16], ext_info: bool, strict: bool) -> Lists {
+            Self::tatami_client_with_host_keys(cookie, ext_info, strict, &[b"ssh-ed25519"])
+        }
+
+        /// [`Lists::tatami_client`] offering `host_keys` (the scheme names of
+        /// a `HostKeyAlgorithms`, in order) as `server_host_key_algorithms`.
+        #[must_use]
+        pub fn tatami_client_with_host_keys(
+            cookie: [u8; 16],
+            ext_info: bool,
+            strict: bool,
+            host_keys: &[&[u8]],
+        ) -> Lists {
             let mut kex: Vec<Vec<u8>> = vec![b"curve25519-sha256".to_vec()];
             if ext_info {
                 kex.push(b"ext-info-c".to_vec());
@@ -230,7 +243,7 @@ pub mod lists {
             Lists {
                 cookie,
                 kex,
-                host_key: one(b"ssh-ed25519"),
+                host_key: host_keys.iter().map(|n| n.to_vec()).collect(),
                 enc_c2s: one(b"aes128-gcm@openssh.com"),
                 enc_s2c: one(b"aes128-gcm@openssh.com"),
                 mac_c2s: one(b"hmac-sha2-256"),
@@ -430,7 +443,17 @@ pub mod negotiate_ref {
         })
     }
 
-    /// The profile check: only the first-profile selection is implemented.
+    /// The four host signature schemes Tatami implements (round 6). RSA/SHA-1
+    /// `ssh-rsa` is deliberately absent.
+    pub const HOST_KEY_SCHEMES: [&str; 4] = [
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "rsa-sha2-512",
+        "rsa-sha2-256",
+    ];
+
+    /// The profile check: only implemented selections pass (any of
+    /// [`HOST_KEY_SCHEMES`] for the host key).
     pub fn check_profile(n: &Negotiated) -> Result<(), NegotiationError> {
         let bad = |field: &'static str, name: &str| {
             Err(NegotiationError::UnsupportedSelection {
@@ -441,7 +464,7 @@ pub mod negotiate_ref {
         if n.kex != "curve25519-sha256" {
             return bad("kex_algorithms", &n.kex);
         }
-        if n.host_key != "ssh-ed25519" {
+        if !HOST_KEY_SCHEMES.contains(&n.host_key.as_str()) {
             return bad("server_host_key_algorithms", &n.host_key);
         }
         if n.encryption_client_to_server != "aes128-gcm@openssh.com" {

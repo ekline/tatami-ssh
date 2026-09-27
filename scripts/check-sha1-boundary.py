@@ -54,9 +54,18 @@ ALLOWED_CALL_SITE = "src/known_hosts.rs"
 
 COMPAT_ON = [
     "std,tcp,kex,quic-diag,openssh-hashed-hosts",
+    "std,tcp,kex,quic-diag,rsa,ecdsa-p256,openssh-hashed-hosts",
     "kex,openssh-hashed-hosts",
 ]
-COMPAT_OFF = ["std,tcp,kex,quic-diag", "std,tcp,kex", "kex", "std,tcp", "quic-diag", ""]
+COMPAT_OFF = [
+    "std,tcp,kex,quic-diag,rsa,ecdsa-p256",
+    "std,tcp,kex,quic-diag",
+    "std,tcp,kex",
+    "kex",
+    "std,tcp",
+    "quic-diag",
+    "",
+]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

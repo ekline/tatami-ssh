@@ -11,6 +11,10 @@
 //!          bit 2: proposal offers strict KEX (both spellings)
 //!          bit 3: also feed the raw remainder to `KexInit::decode` as a
 //!                 server payload
+//!          bit 4: (proposal only) host-key algorithms from fuzz, else
+//!                 `HostKeyAlgorithms::ED25519_ONLY`: `count u8` (mod 6),
+//!                 `count` scheme indices (mod 4, duplicates allowed) and a
+//!                 `preferred` mask byte, all right after the cookie
 //! rest     client lists (unless bit 0), then server lists, each per
 //!          `kex_support::lists::gen_lists`: cookie 16, ten lists of
 //!          `count u8 mod 5` names chosen from small pools (real methods,
@@ -35,9 +39,20 @@
 //!   first host-key algorithm differs.
 //! - `check_profile` equals the model (`UnsupportedSelection{field,name}`
 //!   for the first field outside the profile).
-//! - `ClientProposal::encode` equals a hand-assembled `KEXINIT`,
+//! - `ClientProposal::encode` equals a hand-assembled `KEXINIT` (with the
+//!   configured host-key list as `server_host_key_algorithms`),
 //!   `kex_algorithms()` lists the method then the markers in order, decode
 //!   returns the lists, and `negotiate(ours, server)` equals the model.
+//! - Host-key algorithms: `HostKeyAlgorithms::new` refuses exactly an empty
+//!   list (`Empty`) or the first repeated scheme (`Duplicate`), else keeps
+//!   the order; `preferred(pred)` is `PREFERENCE` filtered by `pred` (`None`
+//!   if empty); `Default` is `ED25519_ONLY`. The encoded client list never
+//!   contains `ssh-rsa` or `ssh-dss`. With our proposal, success selects the
+//!   first client-listed scheme the server also offers, `host_key_scheme()`
+//!   is that scheme (never `ssh-rsa`), and `check_profile` passes; a server
+//!   offering none of our schemes gives `NoCommonHostKey`.
+//! - `check_profile` (both paths) accepts exactly the four scheme names
+//!   for the host key, and `host_key_scheme()` is `Some` exactly for them.
 //! - `NegotiationError::code()` is from the closed six-string set and
 //!   `Display` is non-empty for every error and direction.
 
@@ -45,8 +60,10 @@ use libfuzzer_sys::fuzz_target;
 use tatami_ssh_fuzz_protocol::kex_support::lists::{Lists, gen_lists};
 use tatami_ssh_fuzz_protocol::kex_support::negotiate_ref;
 use tatami_ssh_fuzz_protocol::tcp_support::Cursor;
+use tatami_ssh_keys::algorithm::SignatureScheme;
 use tatami_ssh_tcp::negotiate::{
-    ClientProposal, Direction, Mac, NegotiationError, StrictKex, is_aead, negotiate,
+    ClientProposal, Direction, HostKeyAlgorithms, HostKeyAlgorithmsError, Mac, NegotiationError,
+    StrictKex, is_aead, negotiate,
 };
 use tatami_ssh_wire::kexinit::{KexInit, KexName, classify_kex_name};
 
@@ -115,6 +132,12 @@ fn check_pair(client: &Lists, server: &Lists) {
             if !server.first_kex_packet_follows {
                 assert!(!n.server_guess_wrong);
             }
+            let known = negotiate_ref::HOST_KEY_SCHEMES.contains(&n.host_key.as_str());
+            assert_eq!(n.host_key_scheme().is_some(), known, "{}", n.host_key);
+            if let Some(s) = n.host_key_scheme() {
+                assert_eq!(s.name(), n.host_key.as_bytes());
+                assert_ne!(n.host_key, "ssh-rsa");
+            }
             assert_eq!(
                 n.check_profile(),
                 negotiate_ref::check_profile(n),
@@ -142,13 +165,76 @@ fn check_pair(client: &Lists, server: &Lists) {
     }
 }
 
-fn check_proposal(cookie: [u8; 16], ext_info: bool, strict: bool, server: &Lists) {
+const SCHEMES: [SignatureScheme; 4] = SignatureScheme::PREFERENCE;
+
+/// A fuzz-described host-key list: `count u8 % 6`, indices, `preferred`
+/// mask. Checks the constructors against their documented rules and returns
+/// the list to offer.
+fn gen_host_key_algorithms(cur: &mut Cursor<'_>) -> HostKeyAlgorithms {
+    let count = usize::from(cur.u8()) % 6;
+    let raw: Vec<SignatureScheme> = (0..count)
+        .map(|_| SCHEMES[usize::from(cur.u8()) % 4])
+        .collect();
+    let mask = cur.u8();
+    let mut want: Result<Vec<SignatureScheme>, HostKeyAlgorithmsError> = Ok(Vec::new());
+    if raw.is_empty() {
+        want = Err(HostKeyAlgorithmsError::Empty);
+    }
+    for (i, s) in raw.iter().enumerate() {
+        if raw[..i].contains(s) {
+            want = Err(HostKeyAlgorithmsError::Duplicate(*s));
+            break;
+        }
+    }
+    let got = HostKeyAlgorithms::new(&raw);
+    assert_eq!(
+        got.map(|h| h.as_slice().to_vec()),
+        want.map(|_| raw.clone()),
+        "HostKeyAlgorithms::new({raw:?})"
+    );
+    let filtered: Vec<SignatureScheme> = SCHEMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, s)| *s)
+        .collect();
+    let preferred = HostKeyAlgorithms::preferred(|s| {
+        mask & (1 << SCHEMES.iter().position(|&x| x == s).expect("known")) != 0
+    });
+    assert_eq!(
+        preferred.map(|h| h.as_slice().to_vec()),
+        (!filtered.is_empty()).then(|| filtered.clone())
+    );
+    assert_eq!(
+        HostKeyAlgorithms::default(),
+        HostKeyAlgorithms::ED25519_ONLY
+    );
+    assert_eq!(
+        HostKeyAlgorithms::ED25519_ONLY.as_slice(),
+        &[SignatureScheme::Ed25519]
+    );
+    match (got, preferred) {
+        (Ok(h), _) => h,
+        (Err(_), Some(p)) if mask & 0x80 != 0 => p,
+        _ => HostKeyAlgorithms::ED25519_ONLY,
+    }
+}
+
+fn check_proposal(
+    cookie: [u8; 16],
+    ext_info: bool,
+    strict: bool,
+    host_keys: HostKeyAlgorithms,
+    server: &Lists,
+) {
     let p = ClientProposal {
         cookie,
         advertise_ext_info: ext_info,
         offer_strict_kex: strict,
+        host_key_algorithms: host_keys,
     };
-    let ours = Lists::tatami_client(cookie, ext_info, strict);
+    let names: Vec<&[u8]> = host_keys.as_slice().iter().map(|s| s.name()).collect();
+    let ours = Lists::tatami_client_with_host_keys(cookie, ext_info, strict, &names);
     let encoded = p.encode().expect("fixed proposal encodes");
     assert_eq!(
         encoded,
@@ -170,6 +256,17 @@ fn check_proposal(cookie: [u8; 16], ext_info: bool, strict: bool, server: &Lists
     }
     assert!(!k.first_kex_packet_follows);
     assert_eq!(k.reserved, 0);
+    let offered: Vec<&[u8]> = k.server_host_key_algorithms.iter().collect();
+    assert_eq!(
+        offered, names,
+        "server_host_key_algorithms in configured order"
+    );
+    for legacy in [&b"ssh-rsa"[..], b"ssh-dss"] {
+        assert!(
+            !k.server_host_key_algorithms.contains(legacy),
+            "{legacy:?} offered"
+        );
+    }
     assert_eq!(
         k.empty_algorithm_lists().count(),
         0,
@@ -184,15 +281,30 @@ fn check_proposal(cookie: [u8; 16], ext_info: bool, strict: bool, server: &Lists
     // With our proposal, success implies the first profile exactly.
     let i_s = server.payload();
     let s = KexInit::decode(&i_s).expect("decodes");
-    if let Ok(n) = negotiate(&k, &s) {
-        assert_eq!(
-            n.check_profile(),
-            Ok(()),
-            "our proposal can only select the profile"
-        );
-        assert_eq!(n.kex, "curve25519-sha256");
-        assert_eq!(n.host_key, "ssh-ed25519");
-        assert_eq!(n.ext_info, server.kex.contains(&b"ext-info-s".to_vec()));
+    let first_shared = host_keys
+        .as_slice()
+        .iter()
+        .copied()
+        .find(|sch| server.host_key.iter().any(|h| h == sch.name()));
+    match negotiate(&k, &s) {
+        Ok(n) => {
+            assert_eq!(
+                n.check_profile(),
+                Ok(()),
+                "our proposal can only select the profile"
+            );
+            assert_eq!(n.kex, "curve25519-sha256");
+            let want = first_shared.expect("a host key was selected");
+            assert_eq!(n.host_key.as_bytes(), want.name(), "first shared scheme");
+            assert_eq!(n.host_key_scheme(), Some(want));
+            assert_eq!(n.ext_info, server.kex.contains(&b"ext-info-s".to_vec()));
+        }
+        Err(NegotiationError::NoCommonKex) => {}
+        Err(e) => {
+            if first_shared.is_none() {
+                assert_eq!(e, NegotiationError::NoCommonHostKey);
+            }
+        }
     }
 }
 
@@ -221,8 +333,13 @@ fuzz_target!(|data: &[u8]| {
     let flags = cur.u8();
     if flags & 1 != 0 {
         let cookie: [u8; 16] = cur.take_filled(16, 29).try_into().expect("16");
+        let host_keys = if flags & 0x10 != 0 {
+            gen_host_key_algorithms(&mut cur)
+        } else {
+            HostKeyAlgorithms::ED25519_ONLY
+        };
         let server = gen_lists(&mut cur);
-        check_proposal(cookie, flags & 2 != 0, flags & 4 != 0, &server);
+        check_proposal(cookie, flags & 2 != 0, flags & 4 != 0, host_keys, &server);
     } else {
         let client = gen_lists(&mut cur);
         let server = gen_lists(&mut cur);
@@ -279,7 +396,16 @@ fuzz_target!(|data: &[u8]| {
                 first_kex_packet_follows: s.first_kex_packet_follows,
                 reserved: s.reserved,
             };
-            check_proposal([0x5a; 16], true, true, &server);
+            check_proposal(
+                [0x5a; 16],
+                true,
+                true,
+                HostKeyAlgorithms::ED25519_ONLY,
+                &server,
+            );
+            if let Some(all) = HostKeyAlgorithms::preferred(|_| true) {
+                check_proposal([0x5a; 16], false, true, all, &server);
+            }
         }
     }
 });

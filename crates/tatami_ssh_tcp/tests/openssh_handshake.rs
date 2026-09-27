@@ -264,7 +264,7 @@ impl Sshd {
             read_chunk: 4096,
         };
         let stream = io.connect("127.0.0.1", self.port).expect("connect to sshd");
-        run_handshake(stream, config, &PinnedSha256(pin), &io).expect("run handshake")
+        run_handshake(stream, config, &PinnedSha256(pin), None, &io).expect("run handshake")
     }
 
     fn print_evidence(&self, run: &HandshakeRun, log: &str) {

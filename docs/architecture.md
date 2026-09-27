@@ -97,6 +97,7 @@ no-allocation mode for them.
 | `std,tcp,quic-diag` | TCP with `std` + QUIC backend | `tatami-client probe`, `tatami-client handshake --transport quic`, `tatami-server observe [--transport quic]` |
 | `std,tcp,kex,quic-diag` | everything above | every command of both binaries (W-35) |
 | `+openssh-hashed-hosts` (with any of the above) | + `tatami_ssh_keys/openssh-hashed-hosts` → `tatami_ssh_openssh_compat` (`hmac`, `sha1`) | none; `--known-hosts` accepts hashed `\|1\|` names instead of refusing them as `unsupported_configuration`. Not part of `kex` or `quic-diag` (W-42) |
+| `+rsa`, `+ecdsa-p256` (imply `std,kex`) | + `tatami_ssh_keys/{rsa,ecdsa-p256}`, `tatami_ssh_quic/{rsa,ecdsa-p256}` with `quic-diag`, and `ring` for `host::signature` | `tatami-client handshake` offers and verifies `rsa-sha2-512`/`rsa-sha2-256`/`ecdsa-sha2-nistp256` (`--host-key-algorithms` forces a list); `tatami-server observe --transport quic --host-key` accepts RSA / P-256 OpenSSH keys (W-43) |
 
 Weak dependency feature forwarding (`tatami_ssh_tcp?/std`, `tatami_ssh_quic?/std`) ensures
 that `std` does not itself select a transport. Cargo features are additive and

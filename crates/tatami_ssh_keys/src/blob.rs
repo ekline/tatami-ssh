@@ -128,6 +128,21 @@ pub(crate) fn field<'a, T>(
     })
 }
 
+/// Reads a strictly encoded **positive** `mpint` (RFC 4251 §5: minimal
+/// two's-complement, no sign bit, not zero) and returns its big-endian
+/// magnitude without the leading `0x00` that a set high bit requires.
+#[cfg_attr(not(any(feature = "rsa", feature = "ecdsa-p256")), allow(dead_code))]
+pub(crate) fn positive_mpint<'a>(
+    r: &mut Reader<'a>,
+    name: &'static str,
+) -> Result<&'a [u8], crate::error::KeyError> {
+    let m = field(r, name, Reader::read_mpint)?;
+    if m.is_zero() || m.is_negative() || !m.is_canonical() {
+        return Err(crate::error::KeyError::NonCanonicalInteger { field: name });
+    }
+    Ok(m.positive_magnitude().unwrap_or_default())
+}
+
 /// Fails with [`BlobError::TrailingBytes`] unless the reader is exhausted.
 pub(crate) fn finish(r: &Reader<'_>) -> Result<(), BlobError> {
     r.finish()

@@ -7,7 +7,8 @@
 //! the state machine is never asked to reserialize), reads at most
 //! [`ClientHandshake::room`] bytes at a time, answers the trust question
 //! with the caller's [`HostTrustPolicy`], and shuts the socket down when the
-//! state machine finishes.
+//! state machine finishes. RSA and ECDSA P-256 host keys are offered and
+//! verified only when the caller passes a [`SignatureProvider`].
 //!
 //! # Deadline
 //!
@@ -30,12 +31,14 @@
 //! handling can be exercised deterministically against a scripted server
 //! (see the tests).
 
+use std::boxed::Box;
 use std::io;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::string::{String, ToString};
 use std::time::{Duration, Instant};
 
 use rand_core::{CryptoRng, RngCore};
+use tatami_ssh_keys::provider::SignatureProvider;
 use tatami_ssh_keys::trust::HostTrustPolicy;
 
 use super::seam::{Clock, Conn, SystemClock, remaining_until, write_all_by};
@@ -178,20 +181,25 @@ impl CryptoRng for OsEntropy {}
 /// down. The overall deadline starts when this function is called.
 ///
 /// Returns `Err` only for failures before any byte is exchanged: the
-/// socket's addresses could not be read, the configured software version is
-/// invalid, or the OS entropy source failed.
+/// socket's addresses could not be read, the configured software version or
+/// host-key algorithm list is invalid, or the OS entropy source failed.
 pub fn run_handshake(
     mut stream: TcpStream,
     config: HandshakeConfig,
     policy: &dyn HostTrustPolicy,
+    provider: Option<Box<dyn SignatureProvider + Send>>,
     io: &HandshakeIo,
 ) -> io::Result<HandshakeRun> {
     let started = Instant::now();
     let deadline = started + io.overall_timeout;
     let peer = stream.peer_addr()?;
     let local = stream.local_addr()?;
-    let mut handshake = ClientHandshake::new(config, &mut OsEntropy)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let built = match provider {
+        Some(p) => ClientHandshake::with_signature_provider(config, &mut OsEntropy, p),
+        None => ClientHandshake::new(config, &mut OsEntropy),
+    };
+    let mut handshake =
+        built.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     let _ = stream.set_nodelay(true);
 

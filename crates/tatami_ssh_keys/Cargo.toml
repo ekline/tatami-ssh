@@ -10,10 +10,19 @@ publish.workspace = true
 
 [features]
 default = []
-# Ed25519 host-key verification (RFC 8709) and SHA-256 fingerprints via
-# maintained pure-Rust implementations; portable (no_std + alloc). See
+# SHA-256 fingerprints (`SHA256:` text), SSHFP digests and
+# `HostIdentity::from_blob`, for every key type; portable. See
 # docs/crypto-provider-audit.md before changing versions or features.
-ed25519 = ["dep:ed25519-dalek", "dep:sha2", "dep:base64ct"]
+fingerprint = ["dep:sha2", "dep:base64ct"]
+# Ed25519 host keys (RFC 8709), verified in this crate with ed25519-dalek.
+ed25519 = ["fingerprint", "dep:ed25519-dalek"]
+# RSA host keys (`ssh-rsa` blob, 2048-8192 bits) with RSA/SHA-2 signatures
+# (RFC 8332). Parsing, policy and scheme binding only: the final check goes
+# to a host `provider::SignatureProvider`. Adds no dependency.
+rsa = ["fingerprint"]
+# ECDSA P-256 host keys (RFC 5656), same division of labour as `rsa`. With
+# `openssh-key`, enables ssh-key's ECDSA key parsing (sec1).
+ecdsa-p256 = ["fingerprint", "ssh-key?/ecdsa"]
 # Read-only OpenSSH known_hosts parsing, matching and trust decisions
 # (portable). Plaintext host patterns only: a hashed `|1|salt|hash` entry is
 # an explicit unsupported-format error unless `openssh-hashed-hosts` is on.
@@ -22,9 +31,12 @@ known-hosts = ["ed25519"]
 # code lives only in `tatami_ssh_openssh_compat`, called only from
 # `known_hosts.rs`; see docs/crypto-provider-audit.md (SHA-1 boundary).
 openssh-hashed-hosts = ["known-hosts", "dep:tatami_ssh_openssh_compat"]
-# Unencrypted Ed25519 `openssh-key-v1` private keys decoded from bytes
-# (portable; file access belongs to the facade's host layer).
-openssh-key = ["ed25519", "dep:ssh-key", "dep:zeroize"]
+# Unencrypted `openssh-key-v1` host private keys decoded from bytes and
+# converted in memory for a TLS stack: Ed25519 always, RSA / P-256 with
+# `rsa` / `ecdsa-p256` (portable; file access belongs to the facade's host
+# layer). crypto-bigint computes the RSA CRT exponents (d mod p-1, d mod
+# q-1) that PKCS#1 needs and OpenSSH does not store.
+openssh-key = ["ed25519", "dep:ssh-key", "dep:zeroize", "dep:crypto-bigint"]
 
 [dependencies]
 tatami_ssh_wire = { workspace = true, features = ["alloc"] }
@@ -34,3 +46,8 @@ base64ct = { version = "1.6", default-features = false, features = ["alloc"], op
 tatami_ssh_openssh_compat = { workspace = true, optional = true }
 ssh-key = { version = "0.6.7", default-features = false, features = ["alloc"], optional = true }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"], optional = true }
+crypto-bigint = { version = "0.5.5", default-features = false, features = ["zeroize"], optional = true }
+
+[dev-dependencies]
+# Test-only: decoding fixture blobs in RSA / ECDSA tests.
+base64ct = { version = "1.6", default-features = false, features = ["alloc"] }

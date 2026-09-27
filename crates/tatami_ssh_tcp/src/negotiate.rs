@@ -12,6 +12,12 @@
 //!   also lists. RFC 4253 additionally requires the chosen algorithm to be
 //!   capable of what the key-exchange method needs; `curve25519-sha256`
 //!   needs only a signature-capable key, which every host-key algorithm is.
+//!   The client offers a [`HostKeyAlgorithms`] list: by default (see
+//!   `HandshakeConfig::host_key_algorithms`) every scheme it can verify, in
+//!   [`SignatureScheme::PREFERENCE`] order — `ssh-ed25519`,
+//!   `ecdsa-sha2-nistp256`, `rsa-sha2-512`, `rsa-sha2-256` — or exactly the
+//!   configured list, so a caller (or test) can force one scheme. The
+//!   `ssh-rsa` (RSA/SHA-1) signature scheme is never offered or accepted.
 //! - **Encryption** (per direction): the first algorithm in the client's
 //!   list that the server also lists.
 //! - **MAC** (per direction): when the selected cipher is an AEAD, MAC
@@ -50,6 +56,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use tatami_ssh_keys::algorithm::SignatureScheme;
 use tatami_ssh_wire::EncodeError;
 use tatami_ssh_wire::algorithms;
 use tatami_ssh_wire::kexinit::{
@@ -58,8 +65,91 @@ use tatami_ssh_wire::kexinit::{
 };
 use tatami_ssh_wire::namelist::NameList;
 
-/// The client's `KEXINIT` proposal: the fixed first-profile algorithm lists
-/// plus the two optional markers and an injected cookie.
+/// An ordered, non-empty, duplicate-free list of host signature schemes to
+/// offer in `server_host_key_algorithms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostKeyAlgorithms {
+    schemes: [SignatureScheme; 4],
+    len: u8,
+}
+
+/// Why a [`HostKeyAlgorithms`] list was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKeyAlgorithmsError {
+    /// The list is empty.
+    Empty,
+    /// A scheme appears twice.
+    Duplicate(SignatureScheme),
+}
+
+impl fmt::Display for HostKeyAlgorithmsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostKeyAlgorithmsError::Empty => f.write_str("no host-key algorithm to offer"),
+            HostKeyAlgorithmsError::Duplicate(s) => {
+                write!(f, "host-key algorithm {s} listed twice")
+            }
+        }
+    }
+}
+
+impl core::error::Error for HostKeyAlgorithmsError {}
+
+impl HostKeyAlgorithms {
+    /// `ssh-ed25519` only (the first interoperability profile).
+    pub const ED25519_ONLY: HostKeyAlgorithms = HostKeyAlgorithms {
+        schemes: [SignatureScheme::Ed25519; 4],
+        len: 1,
+    };
+
+    /// Exactly `schemes`, in this order.
+    pub fn new(schemes: &[SignatureScheme]) -> Result<Self, HostKeyAlgorithmsError> {
+        let first = *schemes.first().ok_or(HostKeyAlgorithmsError::Empty)?;
+        let mut out = HostKeyAlgorithms {
+            schemes: [first; 4],
+            len: 0,
+        };
+        for &s in schemes {
+            if out.as_slice().contains(&s) {
+                return Err(HostKeyAlgorithmsError::Duplicate(s));
+            }
+            // Four distinct schemes exist, so this never overflows.
+            out.schemes[usize::from(out.len)] = s;
+            out.len += 1;
+        }
+        Ok(out)
+    }
+
+    /// Every scheme for which `can_verify` holds, in
+    /// [`SignatureScheme::PREFERENCE`] order; `None` if there is none.
+    pub fn preferred(can_verify: impl Fn(SignatureScheme) -> bool) -> Option<Self> {
+        let mut list = [SignatureScheme::Ed25519; 4];
+        let mut n = 0;
+        for s in SignatureScheme::PREFERENCE {
+            if can_verify(s) {
+                list[n] = s;
+                n += 1;
+            }
+        }
+        Self::new(&list[..n]).ok()
+    }
+
+    /// The schemes, in order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[SignatureScheme] {
+        &self.schemes[..usize::from(self.len)]
+    }
+}
+
+impl Default for HostKeyAlgorithms {
+    fn default() -> Self {
+        Self::ED25519_ONLY
+    }
+}
+
+/// The client's `KEXINIT` proposal: the fixed first-profile algorithm lists,
+/// the host-key algorithms to offer, the two optional markers and an
+/// injected cookie.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientProposal {
     /// Sixteen random bytes supplied by the caller's entropy source.
@@ -69,6 +159,8 @@ pub struct ClientProposal {
     /// Offer both strict-KEX client markers (draft-ietf-sshm-strict-kex-02
     /// §3.1 recommends offering both spellings).
     pub offer_strict_kex: bool,
+    /// `server_host_key_algorithms`, in order.
+    pub host_key_algorithms: HostKeyAlgorithms,
 }
 
 impl ClientProposal {
@@ -96,7 +188,7 @@ impl ClientProposal {
         w.write_u8(tatami_ssh_wire::msg::KEXINIT)?;
         w.write_bytes(&self.cookie)?;
         w.write_name_list(kex.iter())?;
-        w.write_name_list([algorithms::SSH_ED25519])?;
+        w.write_name_list(self.host_key_algorithms.as_slice().iter().map(|s| s.name()))?;
         w.write_name_list([algorithms::AES128_GCM_OPENSSH])?;
         w.write_name_list([algorithms::AES128_GCM_OPENSSH])?;
         // See the MAC-list policy in the module documentation.
@@ -250,7 +342,7 @@ impl Negotiated {
         if self.kex.as_bytes() != algorithms::CURVE25519_SHA256 {
             return unsupported("kex_algorithms", &self.kex);
         }
-        if self.host_key.as_bytes() != algorithms::SSH_ED25519 {
+        if self.host_key_scheme().is_none() {
             return unsupported("server_host_key_algorithms", &self.host_key);
         }
         if !is_aead(self.encryption_client_to_server.as_bytes()) {
@@ -278,6 +370,13 @@ impl Negotiated {
             );
         }
         Ok(())
+    }
+
+    /// The negotiated host signature scheme, if it is one this crate knows
+    /// (never `ssh-rsa`/SHA-1).
+    #[must_use]
+    pub fn host_key_scheme(&self) -> Option<SignatureScheme> {
+        SignatureScheme::from_name(self.host_key.as_bytes())
     }
 }
 
@@ -538,6 +637,7 @@ mod tests {
             cookie: [7; 16],
             advertise_ext_info: true,
             offer_strict_kex: true,
+            host_key_algorithms: HostKeyAlgorithms::ED25519_ONLY,
         };
         let bytes = p.encode().unwrap();
         let k = KexInit::decode(&bytes).unwrap();
@@ -569,6 +669,7 @@ mod tests {
             cookie: [0; 16],
             advertise_ext_info: false,
             offer_strict_kex: false,
+            host_key_algorithms: HostKeyAlgorithms::default(),
         };
         let bytes = minimal.encode().unwrap();
         let k = KexInit::decode(&bytes).unwrap();
@@ -582,6 +683,79 @@ mod tests {
             KexInit::decode(&bytes).unwrap().kex_algorithms.as_str(),
             "curve25519-sha256,ext-info-c"
         );
+    }
+
+    #[test]
+    fn host_key_algorithm_lists() {
+        use SignatureScheme::*;
+        let all = HostKeyAlgorithms::preferred(|_| true).unwrap();
+        let p = ClientProposal {
+            cookie: [0; 16],
+            advertise_ext_info: false,
+            offer_strict_kex: false,
+            host_key_algorithms: all,
+        };
+        let bytes = p.encode().unwrap();
+        assert_eq!(
+            KexInit::decode(&bytes)
+                .unwrap()
+                .server_host_key_algorithms
+                .as_str(),
+            "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256"
+        );
+        assert_eq!(
+            HostKeyAlgorithms::preferred(|s| s != EcdsaP256Sha256)
+                .unwrap()
+                .as_slice(),
+            &[Ed25519, RsaSha2_512, RsaSha2_256]
+        );
+        assert_eq!(HostKeyAlgorithms::preferred(|_| false), None);
+        // A forced single scheme and a caller-chosen order.
+        let forced = HostKeyAlgorithms::new(&[RsaSha2_256]).unwrap();
+        assert_eq!(forced.as_slice(), &[RsaSha2_256]);
+        let order = HostKeyAlgorithms::new(&[RsaSha2_256, Ed25519]).unwrap();
+        let bytes = ClientProposal {
+            host_key_algorithms: order,
+            ..p
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            KexInit::decode(&bytes)
+                .unwrap()
+                .server_host_key_algorithms
+                .as_str(),
+            "rsa-sha2-256,ssh-ed25519"
+        );
+        assert_eq!(
+            HostKeyAlgorithms::new(&[]),
+            Err(HostKeyAlgorithmsError::Empty)
+        );
+        assert_eq!(
+            HostKeyAlgorithms::new(&[Ed25519, RsaSha2_512, Ed25519]),
+            Err(HostKeyAlgorithmsError::Duplicate(Ed25519))
+        );
+    }
+
+    #[test]
+    fn every_known_scheme_passes_the_profile_and_sha1_does_not() {
+        for (name, ok) in [
+            ("ssh-ed25519", true),
+            ("ecdsa-sha2-nistp256", true),
+            ("rsa-sha2-512", true),
+            ("rsa-sha2-256", true),
+            ("ssh-rsa", false),
+            ("ssh-dss", false),
+            ("ecdsa-sha2-nistp384", false),
+        ] {
+            let lists = Lists {
+                host_key: name,
+                ..Lists::default()
+            };
+            let n = run(&lists, &lists).unwrap();
+            assert_eq!(n.check_profile().is_ok(), ok, "{name}");
+            assert_eq!(n.host_key_scheme().is_some(), ok, "{name}");
+        }
     }
 
     #[test]

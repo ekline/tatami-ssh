@@ -4,18 +4,24 @@
 //! be shown and compared with `ssh-keygen -r`. It is not DNSSEC trust and
 //! not live SSHFP verification.
 //!
-//! For Ed25519 with SHA-256 the record is algorithm 4 (RFC 7479), type 2
-//! (RFC 6594), and the digest is SHA-256 over the **complete** canonical
-//! public-key blob — not the certificate DER, not the SPKI DER, and not the
-//! raw 32 key bytes.
+//! Only fingerprint type 2 (SHA-256, RFC 6594) is produced or parsed; type
+//! 1 (SHA-1) never is. The algorithm number follows the key type: RSA 1
+//! (RFC 4255), ECDSA 3 (RFC 6594), Ed25519 4 (RFC 7479). The digest is
+//! SHA-256 over the **complete** canonical public-key blob — not the
+//! certificate DER, not the SPKI DER, and not the raw key bytes — so it
+//! equals the OpenSSH `SHA256:` fingerprint of the same key.
 
 use core::fmt;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::ed25519::HostKey;
 use crate::error::KeyError;
+use crate::host_key::HostKey;
 
+/// SSHFP algorithm number for RSA (RFC 4255).
+pub const ALGORITHM_RSA: u8 = 1;
+/// SSHFP algorithm number for ECDSA (RFC 6594).
+pub const ALGORITHM_ECDSA: u8 = 3;
 /// SSHFP algorithm number for Ed25519 (RFC 7479).
 pub const ALGORITHM_ED25519: u8 = 4;
 /// SSHFP fingerprint type for SHA-256 (RFC 6594).
@@ -34,11 +40,9 @@ pub struct Sshfp {
 
 impl Sshfp {
     /// The SHA-256 SSHFP value for a complete public-key blob. The blob is
-    /// parsed strictly; only `ssh-ed25519` is supported.
+    /// parsed strictly for any enabled key type.
     pub fn sha256_of_blob(blob: &[u8]) -> Result<Self, KeyError> {
-        let algorithm = match HostKey::parse(blob)? {
-            HostKey::Ed25519(_) => ALGORITHM_ED25519,
-        };
+        let algorithm = HostKey::parse(blob)?.key_type().sshfp_algorithm();
         Ok(Sshfp {
             algorithm,
             fingerprint_type: TYPE_SHA256,
@@ -46,8 +50,9 @@ impl Sshfp {
         })
     }
 
-    /// Parses RDATA presentation text `4 2 <64 hex digits>` (hex in either
-    /// case, whitespace-separated), as printed by `ssh-keygen -r`.
+    /// Parses RDATA presentation text such as `4 2 <64 hex digits>` (hex in
+    /// either case, whitespace-separated), as printed by `ssh-keygen -r`.
+    /// Any fingerprint type other than 2 is refused.
     pub fn parse_rdata(text: &str) -> Option<Self> {
         let mut it = text.split_ascii_whitespace();
         let algorithm = it.next()?.parse().ok()?;
@@ -87,7 +92,7 @@ impl fmt::Debug for Sshfp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ed25519"))]
 mod tests {
     use super::*;
     use crate::blob::fixtures::{TEST1_PUBLIC_KEY, test1_key_blob};
@@ -144,5 +149,38 @@ mod tests {
         blob.push(0);
         assert!(Sshfp::sha256_of_blob(&blob).is_err());
         assert!(Sshfp::sha256_of_blob(&TEST1_PUBLIC_KEY).is_err());
+    }
+}
+
+#[cfg(all(test, any(feature = "rsa", feature = "ecdsa-p256")))]
+mod other_type_tests {
+    use super::*;
+    use crate::test_vectors::*;
+    use alloc::string::ToString;
+
+    #[cfg(feature = "rsa")]
+    #[test]
+    fn rsa_matches_ssh_keygen_r() {
+        let fp = Sshfp::sha256_of_blob(&b64(RSA_2048_PUB)).unwrap();
+        assert_eq!(fp.algorithm, ALGORITHM_RSA);
+        assert_eq!(fp.to_string(), RSA_2048_SSHFP);
+        assert_eq!(Sshfp::parse_rdata(RSA_2048_SSHFP), Some(fp));
+        assert_eq!(Sshfp::parse_rdata(RSA_2048_SSHFP_SHA1), None);
+        // Signature scheme does not enter: same value for both SHA-2 schemes.
+        assert_eq!(
+            &fp.digest,
+            crate::Sha256Fingerprint::of_blob(&b64(RSA_2048_PUB)).as_bytes()
+        );
+        // Outside the key policy: no value.
+        assert!(Sshfp::sha256_of_blob(&b64(RSA_1024_PUB)).is_err());
+    }
+
+    #[cfg(feature = "ecdsa-p256")]
+    #[test]
+    fn p256_matches_ssh_keygen_r() {
+        let fp = Sshfp::sha256_of_blob(&b64(P256_PUB)).unwrap();
+        assert_eq!(fp.algorithm, ALGORITHM_ECDSA);
+        assert_eq!(fp.to_string(), P256_SSHFP);
+        assert!(Sshfp::sha256_of_blob(&b64(P384_PUB)).is_err());
     }
 }

@@ -13,6 +13,27 @@ pub const CURVE25519_SHA256: &[u8] = b"curve25519-sha256";
 /// Public-key algorithm `ssh-ed25519` (RFC 8709 §4).
 pub const SSH_ED25519: &[u8] = b"ssh-ed25519";
 
+/// RSA public-key **blob** format `ssh-rsa` (RFC 4253 §6.6). As a signature
+/// scheme the same name means RSA/SHA-1, which Tatami never offers or
+/// accepts; RSA keys are used only with [`RSA_SHA2_512`] / [`RSA_SHA2_256`].
+pub const SSH_RSA: &[u8] = b"ssh-rsa";
+
+/// Host-key signature scheme `rsa-sha2-256` (RFC 8332 §3): an `ssh-rsa` key
+/// with RSASSA-PKCS1-v1_5 over SHA-256.
+pub const RSA_SHA2_256: &[u8] = b"rsa-sha2-256";
+
+/// Host-key signature scheme `rsa-sha2-512` (RFC 8332 §3): an `ssh-rsa` key
+/// with RSASSA-PKCS1-v1_5 over SHA-512.
+pub const RSA_SHA2_512: &[u8] = b"rsa-sha2-512";
+
+/// ECDSA P-256 public-key format and signature scheme
+/// `ecdsa-sha2-nistp256` (RFC 5656 §3.1).
+pub const ECDSA_SHA2_NISTP256: &[u8] = b"ecdsa-sha2-nistp256";
+
+/// Curve identifier `nistp256` inside an `ecdsa-sha2-nistp256` key blob
+/// (RFC 5656 §3.1, §10.1).
+pub const NISTP256: &[u8] = b"nistp256";
+
 /// AEAD cipher `aes128-gcm@openssh.com` (RFC 5647 construction under the
 /// OpenSSH name; negotiation per OpenSSH `PROTOCOL` §1.6 /
 /// draft-miller-sshm-aes-gcm-01 §2).
@@ -64,6 +85,11 @@ mod tests {
         for name in [
             CURVE25519_SHA256,
             SSH_ED25519,
+            SSH_RSA,
+            RSA_SHA2_256,
+            RSA_SHA2_512,
+            ECDSA_SHA2_NISTP256,
+            NISTP256,
             AES128_GCM_OPENSSH,
             HMAC_SHA2_256,
             NONE,

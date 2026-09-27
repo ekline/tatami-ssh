@@ -9,3 +9,5 @@ pub mod environment;
 pub mod files;
 pub mod process;
 pub mod pty;
+#[cfg(any(feature = "rsa", feature = "ecdsa-p256"))]
+pub mod signature;
