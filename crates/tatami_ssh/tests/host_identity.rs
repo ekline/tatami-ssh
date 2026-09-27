@@ -433,7 +433,11 @@ fn one_known_hosts_entry_covers_tcp_and_quic() {
             .unwrap()
     ))
     .unwrap();
-    let hex: String = tcp_digest.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = tcp_digest.iter().fold(String::new(), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     assert_eq!(format!("4 2 {hex}"), sshfp);
 
     // The SSH pin means the same on both transports.
