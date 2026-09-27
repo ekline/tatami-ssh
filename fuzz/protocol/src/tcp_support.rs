@@ -1447,7 +1447,6 @@ pub mod stream_gen {
 
     use super::drive::{End, Ev, Run, STAGE_PACKETS};
     use super::{Cursor, filler, ident_ref, msg_ref, packet_ref, put_string};
-
     /// Known algorithm names and markers (unknown names are also generated).
     pub const NAMES: &[&[u8]] = &[
         b"curve25519-sha256",
@@ -2188,10 +2187,30 @@ pub mod stream_gen {
     /// Checks a driver run against the model. `eof` is the harness EOF flag.
     pub fn check_expectation(g: &GenStream, run: &Run, exp: &Expectation, eof: bool) {
         assert!(!g.mutated, "the model only applies to unmutated streams");
-        assert_eq!(
-            run.events, exp.events,
-            "events differ from the generated description"
-        );
+        if matches!(exp.end, ExpEnd::Incomplete) && !g.trailing.is_empty() {
+            // The raw tail is parsed as packets and may produce events the
+            // model does not describe (only the drivers' agreement covers
+            // them). The modeled events must still be an exact prefix, and
+            // the tail can only yield packet-stage events.
+            let n = exp.events.len();
+            assert!(
+                run.events.len() >= n && run.events[..n] == exp.events[..],
+                "modeled events are not a prefix of the actual events\n  actual: {:?}\n modeled: {:?}",
+                run.events,
+                exp.events
+            );
+            for ev in &run.events[n..] {
+                assert!(
+                    matches!(ev, Ev::Skipped(_)),
+                    "raw tail produced a non-packet event {ev:?}"
+                );
+            }
+        } else {
+            assert_eq!(
+                run.events, exp.events,
+                "events differ from the generated description"
+            );
+        }
         match &exp.end {
             ExpEnd::Incomplete => {
                 // Trailing bytes are parsed as packets; only the drivers'
@@ -2250,6 +2269,304 @@ pub mod stream_gen {
                 "expected unexpected input, got {:?}",
                 run.end
             ),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use tatami_tcp::ident::{LineTerminator, OwnedIdentification, VersionSupport};
+        use tatami_tcp::initial::SkippedMessage;
+        use tatami_tcp::observer::{Observer, ObserverConfig};
+        use tatami_tcp::packet::encode_initial_packet;
+        use tatami_tcp::probe::{Probe, ProbeConfig};
+
+        use super::super::drive::{End, Ev, Machine, Run, STAGE_PACKETS, drive};
+        use super::super::{ChunkMode, Cursor, put_string};
+        use super::{
+            Expectation, GenStream, ModelLimits, Role, check_expectation, expect, generate,
+        };
+
+        /// Hand-reduced input for the scheduled `tcp_probe` failures (runs
+        /// 35580802901 and 35705609489): `SSH-2.0-x\r\n`, no modeled packets,
+        /// and a 16-byte raw tail holding an empty `SSH_MSG_IGNORE`. The
+        /// same bytes are a valid `tcp_observer` input (client head: no junk).
+        const PROBE_SEED: &[u8] = include_bytes!("../seeds/tcp_probe/regression_raw_tail_ignore");
+        const OBSERVER_SEED: &[u8] =
+            include_bytes!("../seeds/tcp_observer/regression_raw_tail_ignore");
+
+        #[derive(Clone, Copy, Debug)]
+        enum Consumer {
+            Probe,
+            Observer,
+        }
+
+        const CONSUMERS: [Consumer; 2] = [Consumer::Probe, Consumer::Observer];
+
+        fn packet(payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![0u8; payload.len() + 5 + 12];
+            let n = encode_initial_packet(payload, 0, &mut out).expect("bounded payload");
+            out.truncate(n);
+            out
+        }
+
+        fn ignore(data: &[u8]) -> Vec<u8> {
+            let mut p = vec![2u8];
+            put_string(&mut p, data);
+            packet(&p)
+        }
+
+        fn unimplemented(sequence_number: u32) -> Vec<u8> {
+            let mut p = vec![3u8];
+            p.extend_from_slice(&sequence_number.to_be_bytes());
+            packet(&p)
+        }
+
+        fn disconnect(reason_code: u32, description: &[u8]) -> Vec<u8> {
+            let mut p = vec![1u8];
+            p.extend_from_slice(&reason_code.to_be_bytes());
+            put_string(&mut p, description);
+            put_string(&mut p, b"");
+            packet(&p)
+        }
+
+        /// Modeled element descriptors (`pad_byte`, then `gen_msg` layout).
+        const MODELED_IGNORE_4: &[u8] = &[0, 0, 0x00, 0x04];
+        const MODELED_DISCONNECT: &[u8] = &[0, 3, 0, 0, 0, 11, 3, b'b', b'y', b'e', 0];
+
+        /// A `generate` description: no prelude / no junk, `SSH-2.0-x`,
+        /// `n_msgs` modeled elements, then a raw tail, unmutated.
+        fn description(n_msgs: u8, msgs: &[u8], tail: &[u8]) -> Vec<u8> {
+            let mut d = vec![0, 0, 0, 0, n_msgs];
+            d.extend_from_slice(msgs);
+            d.extend_from_slice(&u16::try_from(tail.len()).unwrap().to_be_bytes());
+            d.extend_from_slice(tail);
+            d.push(0);
+            d
+        }
+
+        fn probe_limits(c: &ProbeConfig) -> ModelLimits {
+            ModelLimits {
+                ident: c.ident,
+                cap: c.packet.max_packet_length,
+                max_packets: c.max_packets_before_kexinit,
+                max_bytes: c.max_bytes_before_kexinit,
+                banner_only: false,
+            }
+        }
+
+        fn observer_limits(c: &ObserverConfig) -> ModelLimits {
+            ModelLimits {
+                ident: tatami_tcp::ident::IdentLimits {
+                    max_prelude_lines: 0,
+                    max_prelude_bytes: 0,
+                    max_prelude_line: c.max_identification_line,
+                    max_identification_line: c.max_identification_line,
+                },
+                cap: c.initial.packet.max_packet_length,
+                max_packets: c.initial.max_packets,
+                max_bytes: c.initial.max_bytes,
+                banner_only: c.banner_only,
+            }
+        }
+
+        fn schedules() -> [ChunkMode; 4] {
+            [
+                ChunkMode::ByteAtATime,
+                ChunkMode::Fixed(3),
+                ChunkMode::List(vec![1, 16, 2]),
+                ChunkMode::All,
+            ]
+        }
+
+        fn runs_of<M: Machine>(make: impl Fn() -> M, stream: &[u8], eof: bool) -> Vec<Run> {
+            schedules()
+                .iter()
+                .map(|mode| drive(&mut make(), stream, mode, eof))
+                .collect()
+        }
+
+        /// Generates, models and drives `desc` under every schedule; checks
+        /// the oracle on each run and returns the byte-at-a-time run.
+        fn case(consumer: Consumer, desc: &[u8], eof: bool) -> (GenStream, Expectation, Run) {
+            let (g, exp, runs) = match consumer {
+                Consumer::Probe => {
+                    let c = ProbeConfig::default();
+                    let g = generate(
+                        &mut Cursor::new(desc),
+                        Role::Server,
+                        c.packet.max_packet_length,
+                    );
+                    let exp = expect(&g, &probe_limits(&c));
+                    let runs = runs_of(|| Probe::new(c.clone()).unwrap(), &g.bytes, eof);
+                    (g, exp, runs)
+                }
+                Consumer::Observer => {
+                    let c = ObserverConfig::default();
+                    let cap = c.initial.packet.max_packet_length;
+                    let g = generate(&mut Cursor::new(desc), Role::Client, cap);
+                    let exp = expect(&g, &observer_limits(&c));
+                    let runs = runs_of(|| Observer::new(&c).unwrap(), &g.bytes, eof);
+                    (g, exp, runs)
+                }
+            };
+            assert!(!g.mutated);
+            for run in &runs {
+                assert_eq!(
+                    run.events, runs[0].events,
+                    "{consumer:?}: schedules disagree"
+                );
+                check_expectation(&g, run, &exp, eof);
+            }
+            let byte_run = runs.into_iter().next().unwrap();
+            (g, exp, byte_run)
+        }
+
+        fn oracle_rejects(g: &GenStream, run: &Run, exp: &Expectation, eof: bool) -> bool {
+            catch_unwind(AssertUnwindSafe(|| check_expectation(g, run, exp, eof))).is_err()
+        }
+
+        fn ident_x() -> Ev {
+            Ev::Ident(OwnedIdentification {
+                line: b"SSH-2.0-x".to_vec(),
+                terminator: LineTerminator::CrLf,
+                protocol_version: String::from("2.0"),
+                software_version: String::from("x"),
+                comments: None,
+                support: VersionSupport::Ssh2,
+            })
+        }
+
+        #[test]
+        fn regression_seed_raw_tail_ignore() {
+            assert_eq!(PROBE_SEED, OBSERVER_SEED);
+            assert_eq!(PROBE_SEED.len(), 27);
+            // Target header: b0 = structured, config 0, no EOF; no chunk
+            // list; overflow prefix 0.
+            assert_eq!(&PROBE_SEED[..4], &[0x80, 0, 0, 0]);
+            let desc = &PROBE_SEED[4..];
+            for consumer in CONSUMERS {
+                for eof in [false, true] {
+                    let (g, exp, run) = case(consumer, desc, eof);
+                    assert_eq!(g.trailing, ignore(b""));
+                    assert_eq!(exp.events, vec![ident_x()]);
+                    assert_eq!(
+                        run.events,
+                        vec![
+                            ident_x(),
+                            Ev::Skipped(SkippedMessage::Ignored { data_len: 0 })
+                        ]
+                    );
+                    let expected_end = eof.then_some(End::Eof {
+                        stage: STAGE_PACKETS,
+                        pending_bytes: 0,
+                    });
+                    assert_eq!(run.end, expected_end, "{consumer:?} eof={eof}");
+                }
+            }
+        }
+
+        #[test]
+        fn valid_tail_messages_follow_the_modeled_prefix() {
+            let tail = [ignore(b"abc"), unimplemented(5)].concat();
+            let desc = description(1, MODELED_IGNORE_4, &tail);
+            for consumer in CONSUMERS {
+                let (_, exp, run) = case(consumer, &desc, false);
+                let modeled = vec![
+                    ident_x(),
+                    Ev::Skipped(SkippedMessage::Ignored { data_len: 4 }),
+                ];
+                assert_eq!(exp.events, modeled);
+                let mut expected = modeled;
+                expected.push(Ev::Skipped(SkippedMessage::Ignored { data_len: 3 }));
+                expected.push(Ev::Skipped(SkippedMessage::Unimplemented {
+                    sequence_number: 5,
+                }));
+                assert_eq!(run.events, expected, "{consumer:?}");
+                assert_eq!(run.end, None);
+            }
+        }
+
+        #[test]
+        fn tail_disconnect_partial_and_malformed_packets() {
+            let bye = disconnect(11, b"tail");
+            let full = ignore(b"abcdef");
+            let partial = full[..full.len() - 3].to_vec();
+            let malformed = vec![0xff; 8];
+            for consumer in CONSUMERS {
+                let (_, _, run) = case(consumer, &description(0, &[], &bye), false);
+                assert!(
+                    matches!(
+                        run.end,
+                        Some(End::Disconnected {
+                            reason_code: 11,
+                            ..
+                        })
+                    ),
+                    "{consumer:?}: {:?}",
+                    run.end
+                );
+
+                let (_, _, run) = case(consumer, &description(0, &[], &partial), true);
+                assert_eq!(
+                    run.end,
+                    Some(End::Eof {
+                        stage: STAGE_PACKETS,
+                        pending_bytes: partial.len(),
+                    }),
+                    "{consumer:?}"
+                );
+                let (_, _, run) = case(consumer, &description(0, &[], &partial), false);
+                assert_eq!(run.end, None, "{consumer:?}");
+
+                let (_, _, run) = case(consumer, &description(0, &[], &malformed), false);
+                assert!(
+                    matches!(run.end, Some(End::Error(_))),
+                    "{consumer:?}: {:?}",
+                    run.end
+                );
+                assert_eq!(run.events, vec![ident_x()]);
+            }
+        }
+
+        #[test]
+        fn missing_modeled_events_still_fail() {
+            let with_tail = description(1, MODELED_IGNORE_4, &ignore(b""));
+            let without_tail = description(1, MODELED_IGNORE_4, &[]);
+            for consumer in CONSUMERS {
+                for desc in [&with_tail, &without_tail] {
+                    let (g, exp, run) = case(consumer, desc, false);
+                    let mut missing = run.clone();
+                    missing.events.remove(1);
+                    assert!(oracle_rejects(&g, &missing, &exp, false), "{consumer:?}");
+                    let mut reordered = run.clone();
+                    reordered.events.swap(0, 1);
+                    assert!(oracle_rejects(&g, &reordered, &exp, false), "{consumer:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn forbidden_extra_events_still_fail() {
+            let extra = Ev::Skipped(SkippedMessage::Ignored { data_len: 0 });
+            // No raw tail: nothing may follow the modeled events.
+            let no_tail = description(1, MODELED_IGNORE_4, &[]);
+            // Terminal description: the tail is never parsed.
+            let terminal = description(1, MODELED_DISCONNECT, &ignore(b""));
+            for consumer in CONSUMERS {
+                for desc in [&no_tail, &terminal] {
+                    let (g, exp, run) = case(consumer, desc, false);
+                    let mut added = run.clone();
+                    added.events.push(extra.clone());
+                    assert!(oracle_rejects(&g, &added, &exp, false), "{consumer:?}");
+                }
+                // With a raw tail, only packet-stage events may follow.
+                let (g, exp, run) = case(consumer, &description(0, &[], &ignore(b"")), false);
+                let mut added = run.clone();
+                added.events.push(ident_x());
+                assert!(oracle_rejects(&g, &added, &exp, false), "{consumer:?}");
+            }
         }
     }
 }

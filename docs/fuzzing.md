@@ -55,7 +55,8 @@ With rustup (the CI path):
 ```sh
 . fuzz/toolchain.env
 rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal --component rustfmt,clippy,llvm-tools-preview
-rustup run "$FUZZ_NIGHTLY" cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+# Build cargo-fuzz with stable; it then runs under the pinned nightly (W-34).
+rustup run stable cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
 ```
 
 A C++ compiler (`clang++` or `g++`) is needed to build libFuzzer.
@@ -78,7 +79,7 @@ configuration on every command. Coverage reports work with the system
 
 ```sh
 scripts/fuzz.sh list                       # targets, workspaces, seed counts
-scripts/fuzz.sh lint                       # fmt --check and clippy -D warnings for fuzz code
+scripts/fuzz.sh lint                       # fmt --check, clippy -D warnings, harness library unit tests
 scripts/fuzz.sh build                      # build both workspaces
 scripts/fuzz.sh replay [TARGET...]         # run every committed seed once (-runs=0)
 scripts/fuzz.sh smoke [SECONDS]            # build, replay, then a short run per target
@@ -186,7 +187,7 @@ than truncated JSON.
 ## Seeds, corpora and artifacts
 
 `fuzz/<ws>/seeds/<target>/` holds small, individually named regression and
-deep-state fixtures (432 files across 18 targets, ~2 MB, including one 65 536-byte maximum
+deep-state fixtures (434 files across 18 targets, ~2 MB, including one 65 536-byte maximum
 packet). Provenance: hand-constructed from RFC layouts by the harness authors;
 the wire-core set is regenerable with `fuzz/wire-core/seeds/generate_seeds.py`.
 No traffic captures, keys or credentials. Seeds named `regression_*` come from
@@ -218,6 +219,7 @@ On a crash, timeout or oracle failure libFuzzer writes an artifact under
 | `packet_ref::max_packet_length` underflowed for cap 0 in the `tcp_initial_packets` reference | harness | Fixed with `checked_sub` |
 | Probe driver reported a write-phase deadline as `RunEnd::Io` while the listener reported the same case as `TimedOut` | production (adapter) | Unified to `RunEnd::TimedOut`; the write path now recomputes its timeout between partial writes; scripted I/O tests cover both |
 | `handle_open_confirmation` did not reject a peer `sender_channel` already in use by another live channel | production (round-3 observation, fixed round 4) | `locate_reply`/`consume_reply` split; `DuplicatePeerNumber` rejected before any state change for live and late confirmations (tombstone kept); four regressions; the fuzz model now derives peer-number liveness from its own sets (`peer_number_live`) and asserts the invariant independently; seed `regression_duplicate_peer_number_on_confirmation` |
+| Scheduled `tcp_probe` failures (runs [35580802901](https://github.com/ekline/tatami-ssh/actions/runs/35580802901), [35705609489](https://github.com/ekline/tatami-ssh/actions/runs/35705609489)): `stream_gen::check_expectation` required exact event equality even when an unterminated description had a raw trailing tail, which the parser (correctly) decodes as packets; a tail holding a valid `SSH_MSG_IGNORE` added one `Skipped(Ignored)` event the model does not describe | harness | Fixed: with a raw tail after a nonterminal description, the modeled events must be an exact prefix and any further events must be packet-stage (`Skipped`); exact equality otherwise. Driver agreement, terminal and identification checks unchanged. Regression seed `regression_raw_tail_ignore` (hand-reduced 27-byte input, in `tcp_probe` and `tcp_observer`; the original CI artifacts were not available locally); harness unit tests in `tcp_support::stream_gen::tests`, run by `scripts/fuzz.sh lint`, include negative checks that missing and forbidden extra events still fail |
 | Round-4 harness bugs (all fixed, none production): `wire_kex_codecs` expected the lazy EXT_INFO iterator to stop before yielding its terminal error; `tcp_gcm_packets` seeded a counter at `u64::MAX` in the general path; `tcp_handshake` model omitted that `kexinit_was_first_packet` is recorded before the KEXINIT body decodes (minimized input kept as `seeds/tcp_handshake/regression_malformed_kexinit_first_recorded`); `handshake_report_json` assumed optional keys are absent rather than `null` | harness | Fixed; oracle sabotage checks (little-endian assembler, mpint sign-byte rule, mixed strict spellings) each made replay fail as intended |
 
 ## Deterministic host I/O tests

@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/fuzz.sh list
 #   scripts/fuzz.sh build
-#   scripts/fuzz.sh lint
+#   scripts/fuzz.sh lint          (fmt, clippy -D warnings, harness unit tests)
 #   scripts/fuzz.sh replay [TARGET...]
 #   scripts/fuzz.sh smoke [SECONDS]
 #   scripts/fuzz.sh run TARGET [-- LIBFUZZER_ARGS...]
@@ -127,6 +127,9 @@ cmd_lint() {
         # Harness crates need the fuzzing cfg only when built by cargo-fuzz;
         # plain clippy on the manifest is enough for lint purposes.
         (cd "fuzz/$ws" && cargo clippy --all-targets -- -D warnings)
+        echo "==> test fuzz/$ws (harness library unit tests)"
+        # Oracle/model regressions; plain `cargo test`, no fuzzing cfg.
+        (cd "fuzz/$ws" && cargo test --lib --locked)
     done
 }
 
