@@ -795,7 +795,10 @@ pub mod handshake {
         match run_handshake(
             stream,
             options.config.clone(),
-            &*prepared.policy,
+            // Use HostTrustPolicy's forwarding impl for &P. Coercing the
+            // shared-policy trait object directly requires trait upcasting,
+            // which is unavailable on the workspace's Rust 1.85 MSRV.
+            &prepared.policy.as_ref(),
             &options.io,
         ) {
             Ok(run) => from_run(options, lookup_name, run),
