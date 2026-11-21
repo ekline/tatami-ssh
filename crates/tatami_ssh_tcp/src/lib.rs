@@ -22,16 +22,16 @@
 //! | [`negotiate`] (`kex`) | Client proposal and RFC 4253 §7.1 negotiation for the first profile; strict-KEX and `first_kex_packet_follows` evaluation. |
 //! | [`transcript`] (`kex`) | X25519 agreement, exchange hash, session id and key derivation for `curve25519-sha256`. |
 //! | [`gcm`] (`kex`) | `aes128-gcm@openssh.com` protected packets with a never-repeating nonce counter. |
-//! | [`handshake`] (`kex`) | Portable client state machine: identification → `KEXINIT` → `KEX_ECDH_*` → host signature → trust decision → `NEWKEYS` → `SERVICE_REQUEST`/`EXT_INFO`/`SERVICE_ACCEPT` → `DISCONNECT`. |
+//! | [`handshake`] (`kex`) | Portable client state machine: identification → `KEXINIT` → `KEX_ECDH_*` → host signature → trust decision → `NEWKEYS` → `SERVICE_REQUEST`/`EXT_INFO`/`SERVICE_ACCEPT` → diagnostic disconnect or live service handoff. |
 //! | [`io`] (`std`) | Blocking TCP client adapter and bounded diagnostic listener. |
 //! | [`io::handshake`] (`std` + `kex`) | Blocking driver for the handshake with one overall deadline and OS entropy. |
 //!
-//! The `kex` feature implements exactly the first interoperability profile
-//! of `docs/crypto-provider-audit.md`: `curve25519-sha256`, `ssh-ed25519`
-//! host keys, `aes128-gcm@openssh.com` in both directions, `none`
-//! compression, strict KEX and `EXT_INFO` receive. The handshake stops after
-//! `SERVICE_ACCEPT` for `ssh-userauth`; user authentication, re-exchange,
-//! other algorithms and the connection protocol are **not** implemented.
+//! The `kex` feature implements `curve25519-sha256`, Ed25519 host keys
+//! (also RSA/SHA-2 and ECDSA P-256 with the corresponding key features and
+//! provider), `aes128-gcm@openssh.com` in both directions, `none`
+//! compression, strict KEX and `EXT_INFO` receive. Library callers may keep
+//! the protected connection after `SERVICE_ACCEPT` for `ssh-userauth`;
+//! user authentication, re-exchange and channel data are **not** implemented.
 //!
 //! # Portability
 //!

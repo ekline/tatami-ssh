@@ -12,7 +12,7 @@
 
 #![cfg(all(feature = "std", feature = "kex"))]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use tatami_ssh_keys::fingerprint::Sha256Fingerprint;
 use tatami_ssh_keys::trust::PinnedSha256;
 use tatami_ssh_tcp::handshake::{HandshakeConfig, HandshakeOutcome};
-use tatami_ssh_tcp::io::handshake::{HandshakeEnd, HandshakeIo, HandshakeRun, run_handshake};
+use tatami_ssh_tcp::io::handshake::{
+    HandshakeEnd, HandshakeIo, HandshakeRun, establish_service, run_handshake,
+};
 use tatami_ssh_tcp::negotiate::NegotiationError;
 
 const SSHD: &str = "/usr/sbin/sshd";
@@ -420,6 +422,44 @@ fn default_sshd_completes_the_profile_handshake() {
         log.contains("Received disconnect") || log.contains("Disconnected from"),
         "no disconnect line:\n{log}"
     );
+    assert_no_authentication_attempt(&log);
+}
+
+#[test]
+fn service_handoff_leaves_the_verified_socket_open() {
+    if !openssh_available("service_handoff_leaves_the_verified_socket_open") {
+        return;
+    }
+    let sshd = Sshd::start(&[]);
+    let io = HandshakeIo::default();
+    let stream = io.connect("127.0.0.1", sshd.port).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    let peer = stream.peer_addr().unwrap();
+    let (mut stream, transport) = establish_service(
+        stream,
+        HandshakeConfig::default(),
+        &PinnedSha256(sshd.pin),
+        None,
+        &io,
+    )
+    .unwrap();
+    assert_eq!(stream.peer_addr().unwrap(), peer);
+    assert_eq!(stream.read_timeout().unwrap(), Some(Duration::from_secs(3)));
+    assert_eq!(
+        stream.write_timeout().unwrap(),
+        Some(Duration::from_secs(4))
+    );
+    assert_eq!(transport.service(), b"ssh-userauth");
+    assert_eq!(transport.host_identity().sha256, sshd.pin);
+    stream.write_all(&transport.disconnect().unwrap()).unwrap();
+    let log = sshd.wait_for_log("service closed by application");
+    assert!(log.contains("service closed by application"), "{log}");
+    assert!(!log.contains("tatami diagnostic complete"), "{log}");
     assert_no_authentication_attempt(&log);
 }
 

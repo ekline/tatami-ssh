@@ -11,9 +11,10 @@ This is the current design and implementation handoff. The historical checkpoint
 The workspace has the original seven packages plus `tatami_ssh_openssh_compat`.
 At `d7bb394`, workspace CI (stable and 1.85.0, required OpenSSH and bare-metal
 builds) and fuzz CI (ASan, all 21 targets) passed. [Validation evidence](../README.md#checks).
-The next implementation slice is reusable TCP transport with rekeying, not
-user login or an SSH-over-QUIC service. The table distinguishes implemented
-mechanisms from planned work.
+After round 6, the library gained a [verified TCP service handoff](tcp-rekey.md):
+callers can keep the protected connection at `SERVICE_ACCEPT`. The diagnostic
+CLI still closes. Next is a second key exchange on that live connection;
+no on-wire rekey, user login or SSH-over-QUIC service is claimed.
 
 | Area | State | Where |
 |---|---|---|

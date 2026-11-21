@@ -1,6 +1,6 @@
 # TCP rekey: scope and acceptance criteria
 
-**Status:** design for the next TCP slice, not a supported command. The client now has a connection-scoped key schedule with a two-exchange test. The live diagnostic still disconnects on a peer `KEXINIT` after `NEWKEYS`; no rekey has been demonstrated on the wire.
+**Status:** service handoff implemented; on-wire rekey not yet implemented. The library can continue using the verified TCP connection after `SERVICE_ACCEPT`. The CLI diagnostic still disconnects. The connection-scoped key schedule has a two-exchange test, not evidence of a second on-wire exchange.
 
 ## Keep the connection, replace the traffic keys
 
@@ -16,9 +16,15 @@ RFC 4253 permits the server to change host keys at re-exchange; it does not give
 
 ## Implementation order
 
-1. **Separate the diagnostic's exit from the transport.** Let the caller take over after `SERVICE_ACCEPT` with the same socket, buffered input, packet ciphers, counters and session ID. Keep `tatami-client handshake` as a short-lived diagnostic. Today `ClientHandshake::on_service_accept` queues `DISCONNECT` and `run_handshake` closes the socket: returning just the report would lose live state.
+1. **Done: separate the diagnostic's exit from the transport.** `tatami_ssh_tcp::io::handshake::establish_service` (`std,kex`) returns the connected `TcpStream` with its original I/O timeouts and a non-cloneable `ServiceTransport`. The portable path (`kex`) drives `ClientHandshake::step_until_service` until it returns `None`, then calls `into_service`. Both paths require the normal signature, trust and service-name checks. The transport retains its original session ID, accepted host identity, extension information, ciphers, counters, padding state and unread input. `run_handshake` and the CLI retain the diagnostic exit.
 2. **Drive a second exchange through the protected packet path.** Reuse the KEX codecs, negotiation, signature provider and trust checks; do not construct another `ClientHandshake` (it sends a banner and starts unprotected). Inject fresh entropy per exchange, not the padding generator. Omit initial-only extension markers; do not renegotiate strictness or reopen the first `EXT_INFO` opportunity. Pause new service sends during KEX. Process messages already in flight in order as required by RFC 4253 §7.1; bound any buffering. Fail closed on a bad signature, key mismatch, malformed/out-of-phase packet, or timeout.
 3. **Schedule and bound rekey.** Track bytes and packets per direction under each key and elapsed monotonic time in the driver. Start with the RFC 4253 §9 recommendation (1 GB or 1 hour), with test-injectable limits. Trigger early enough to finish KEX under the old keys; never cross the cipher's hard usage limit or wrap a nonce. Suppress duplicate local triggers while KEX is pending and retain a deadline for completion. Do not turn an SSH sequence reset into a GCM nonce reset under an old key.
+
+### Driving the handed-off service
+
+The caller owns service deadlines and I/O. Call `receive()` before reading the socket: one read may have delivered `SERVICE_ACCEPT` and the next protected packet. On `Ok(None)`, read at most `room()` bytes and `feed()` them; on EOF, stop. `send(payload)` accepts an upper-layer SSH payload including its message number and returns a sealed packet. Write those exact bytes once, in order; never reseal after a short write. `disconnect()` consumes the transport and returns its final packet to write. Drop the transport and stream together on terminal I/O or protocol errors. No raw keys, shell, or userauth implementation are exposed.
+
+Until rekey exists this is a bounded single-key transport: `max_protected_packets` (64 by default) counts protected traffic from `NEWKEYS`, per direction, including service negotiation. A peer `KEXINIT` is terminal, not passed up as service data. Deterministic tests in `handshake.rs` exercise a complete and a partial packet coalesced with acceptance, both cipher directions, and failure on a bad tag. `service_handoff_leaves_the_verified_socket_open` proves OpenSSH can decrypt a caller-initiated disconnect on the original socket, not that a user logged in.
 
 ## Evidence before calling rekey supported
 

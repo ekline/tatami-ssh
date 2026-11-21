@@ -10,6 +10,9 @@
 //! state machine finishes. RSA and ECDSA P-256 host keys are offered and
 //! verified only when the caller passes a [`SignatureProvider`].
 //!
+//! [`establish_service`] drives the same verified handshake but returns
+//! the connected socket and live packet state instead of disconnecting.
+//!
 //! # Deadline
 //!
 //! One deadline, [`HandshakeIo::overall_timeout`], runs from the call to
@@ -44,7 +47,8 @@ use tatami_ssh_keys::trust::HostTrustPolicy;
 use super::seam::{Clock, Conn, SystemClock, remaining_until, write_all_by};
 use super::{ConnectError, IoConfig, connect, is_timeout};
 use crate::handshake::{
-    ClientHandshake, HandshakeConfig, HandshakeOutcome, HandshakeReport, Phase, Step,
+    ClientHandshake, HandshakeConfig, HandshakeOutcome, HandshakeReport, Phase, ServiceTransport,
+    Step,
 };
 
 /// Host-side timing policy for a handshake run.
@@ -194,12 +198,7 @@ pub fn run_handshake(
     let deadline = started + io.overall_timeout;
     let peer = stream.peer_addr()?;
     let local = stream.local_addr()?;
-    let built = match provider {
-        Some(p) => ClientHandshake::with_signature_provider(config, &mut OsEntropy, p),
-        None => ClientHandshake::new(config, &mut OsEntropy),
-    };
-    let mut handshake =
-        built.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let mut handshake = new_client(config, provider)?;
 
     let _ = stream.set_nodelay(true);
 
@@ -225,7 +224,72 @@ pub fn run_handshake(
     })
 }
 
-/// The driver body over the testing seam.
+fn new_client(
+    config: HandshakeConfig,
+    provider: Option<Box<dyn SignatureProvider + Send>>,
+) -> io::Result<ClientHandshake> {
+    match provider {
+        Some(p) => ClientHandshake::with_signature_provider(config, &mut OsEntropy, p),
+        None => ClientHandshake::new(config, &mut OsEntropy),
+    }
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+}
+
+/// Establishes a server-verified TCP transport without the diagnostic exit.
+/// Returns the original socket with its original read/write timeouts restored.
+/// Call [`ServiceTransport::receive`] **before** the next socket read: bytes
+/// after `SERVICE_ACCEPT` may already be buffered. From here the caller owns
+/// service deadlines and I/O. An error drops the socket; no partial session
+/// is returned. No user authentication or rekey is performed.
+pub fn establish_service(
+    mut stream: TcpStream,
+    config: HandshakeConfig,
+    policy: &dyn HostTrustPolicy,
+    provider: Option<Box<dyn SignatureProvider + Send>>,
+    io: &HandshakeIo,
+) -> Result<(TcpStream, ServiceTransport), HandshakeEnd> {
+    let setup = |error| HandshakeEnd::Io {
+        phase: Phase::ServerIdentification,
+        error,
+    };
+    let deadline = Instant::now()
+        .checked_add(io.overall_timeout)
+        .ok_or_else(|| {
+            setup(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "handshake timeout too large",
+            ))
+        })?;
+    let read_timeout = stream.read_timeout().map_err(setup)?;
+    let write_timeout = stream.write_timeout().map_err(setup)?;
+    let mut handshake = new_client(config, provider).map_err(setup)?;
+    if let Some(end) = drive_on(
+        &mut stream,
+        &SystemClock,
+        &mut handshake,
+        policy,
+        deadline,
+        io.read_chunk,
+        ClientHandshake::step_until_service,
+    ) {
+        return Err(end);
+    }
+    stream
+        .set_read_timeout(read_timeout)
+        .and_then(|()| stream.set_write_timeout(write_timeout))
+        .map_err(|error| HandshakeEnd::Io {
+            phase: Phase::Established,
+            error,
+        })?;
+    Ok((
+        stream,
+        handshake
+            .into_service()
+            .expect("driver stopped at service acceptance"),
+    ))
+}
+
+/// The diagnostic driver body over the testing seam.
 pub(crate) fn run_handshake_on<C: Conn, K: Clock>(
     conn: &mut C,
     clock: &K,
@@ -234,66 +298,71 @@ pub(crate) fn run_handshake_on<C: Conn, K: Clock>(
     deadline: Instant,
     chunk: usize,
 ) -> HandshakeEnd {
-    let mut buf = std::vec![0u8; chunk.max(1)];
+    drive_on(conn, clock, handshake, policy, deadline, chunk, |h| {
+        Some(h.step())
+    })
+    .expect("diagnostic always runs to a terminal outcome")
+}
+
+/// `None` is the handoff boundary; `Some` is terminal (including a completed diagnostic).
+fn drive_on<C: Conn, K: Clock>(
+    conn: &mut C,
+    clock: &K,
+    handshake: &mut ClientHandshake,
+    policy: &dyn HostTrustPolicy,
+    deadline: Instant,
+    chunk: usize,
+    advance: fn(&mut ClientHandshake) -> Option<Step>,
+) -> Option<HandshakeEnd> {
+    let mut buf = std::vec![0u8; chunk.min(handshake.room()).max(1)];
     loop {
-        match handshake.step() {
-            Step::Finished(outcome) => return HandshakeEnd::Finished(*outcome),
-            Step::Send => {
-                let out = handshake.take_output();
-                match write_all_by(conn, clock, &out, deadline) {
-                    Ok(()) => {}
-                    Err(e) if is_timeout(&e) => {
-                        return HandshakeEnd::TimedOut {
-                            phase: handshake.phase(),
-                            pending_bytes: handshake.pending_bytes(),
-                        };
-                    }
-                    Err(error) => {
-                        return HandshakeEnd::Io {
-                            phase: handshake.phase(),
-                            error,
-                        };
-                    }
-                }
-            }
+        let error = match advance(handshake)? {
+            Step::Finished(outcome) => return Some(HandshakeEnd::Finished(*outcome)),
+            Step::Send => match write_all_by(conn, clock, &handshake.take_output(), deadline) {
+                Ok(()) => continue,
+                Err(e) => e,
+            },
             Step::TrustDecisionRequired(identity) => {
                 handshake.provide_trust(policy.decide(&identity.as_identity()));
+                continue;
             }
             Step::NeedMore => {
                 let Some(remaining) = remaining_until(clock, deadline) else {
-                    return HandshakeEnd::TimedOut {
+                    return Some(HandshakeEnd::TimedOut {
                         phase: handshake.phase(),
                         pending_bytes: handshake.pending_bytes(),
-                    };
+                    });
                 };
                 if let Err(error) = conn.set_read_timeout(Some(remaining)) {
-                    return HandshakeEnd::Io {
+                    return Some(HandshakeEnd::Io {
                         phase: handshake.phase(),
                         error,
-                    };
+                    });
                 }
-                // Never read more than the state machine can hold; a
-                // zero-room read of one byte lets it report the overflow.
+                // A zero-room read of one byte lets the handshake report overflow.
                 let want = buf.len().min(handshake.room()).max(1);
                 match conn.read(&mut buf[..want]) {
-                    Ok(0) => return HandshakeEnd::Finished(handshake.input_ended()),
-                    Ok(n) => handshake.feed(&buf[..n]),
-                    Err(e) if is_timeout(&e) => {
-                        return HandshakeEnd::TimedOut {
-                            phase: handshake.phase(),
-                            pending_bytes: handshake.pending_bytes(),
-                        };
+                    Ok(0) => return Some(HandshakeEnd::Finished(handshake.input_ended())),
+                    Ok(n) => {
+                        handshake.feed(&buf[..n]);
+                        continue;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => {
-                        return HandshakeEnd::Io {
-                            phase: handshake.phase(),
-                            error,
-                        };
-                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => e,
                 }
             }
-        }
+        };
+        return Some(if is_timeout(&error) {
+            HandshakeEnd::TimedOut {
+                phase: handshake.phase(),
+                pending_bytes: handshake.pending_bytes(),
+            }
+        } else {
+            HandshakeEnd::Io {
+                phase: handshake.phase(),
+                error,
+            }
+        });
     }
 }
 

@@ -361,10 +361,10 @@ for key-size/import limits and the [verified gates](../README.md#checks).
 All slices retain W-44: no SSH transport compression, including at rekey,
 after user authentication, or in the proposed QUIC record layer.
 
-1. **Reusable TCP transport and rekeying:** both initiators, strict-KEX key
-   rollover (and the `EXT_INFO`-before-`USERAUTH_SUCCESS` opportunity),
-   byte/time limits, preservation of the first session identifier, and an
-   interface usable by userauth instead of the diagnostic's automatic exit.
+1. **TCP rekeying:** the [service handoff](tcp-rekey.md) now preserves the
+   verified TCP stream, packet state and first session identifier for a caller.
+   Implement rekey from either endpoint, strict-KEX key rollover and byte/time
+   limits. The `EXT_INFO`-before-`USERAUTH_SUCCESS` opportunity still needs userauth.
 2. **QUIC mapping proposal and implementation:** identification placement,
    control-stream bootstrap, bounded record framing, exporter binding and
    userauth inputs, channel/stream association (one channel per

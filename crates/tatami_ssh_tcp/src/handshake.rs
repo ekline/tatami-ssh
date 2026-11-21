@@ -37,6 +37,10 @@
 //! request) ends the run as [`HandshakeOutcome::RekeyNotSupported`] after a
 //! `DISCONNECT` is queued.
 //!
+//! Library callers can instead drive [`ClientHandshake::step_until_service`]
+//! and take the verified transport with [`ClientHandshake::into_service`].
+//! This path does not send a diagnostic `DISCONNECT` at `SERVICE_ACCEPT`.
+//!
 //! # Strictness
 //!
 //! Unlike the passive [`crate::probe`], which skips whatever it can, this
@@ -162,7 +166,8 @@ pub struct HandshakeConfig {
     pub max_pre_kex_packets: usize,
     /// Maximum framed bytes accepted before the server `NEWKEYS`, inclusive.
     pub max_pre_kex_bytes: usize,
-    /// Maximum protected packets accepted after the server `NEWKEYS`.
+    /// Maximum protected packets accepted after the server `NEWKEYS`. On
+    /// handoff this also caps total protected sends, including `SERVICE_REQUEST`.
     pub max_protected_packets: usize,
     /// Maximum `nr-extensions` accepted in `EXT_INFO`.
     pub max_ext_info_extensions: usize,
@@ -225,6 +230,8 @@ pub enum Phase {
     ServerNewKeys,
     /// Both directions protected; `SERVICE_REQUEST` sent.
     Service,
+    /// The caller took over the accepted service; no user login is implied.
+    Established,
     /// A terminal outcome exists.
     Finished,
 }
@@ -240,6 +247,7 @@ impl Phase {
             Phase::TrustDecision => "trust_decision",
             Phase::ServerNewKeys => "server_newkeys",
             Phase::Service => "service",
+            Phase::Established => "established",
             Phase::Finished => "finished",
         }
     }
@@ -254,6 +262,7 @@ impl fmt::Display for Phase {
             Phase::TrustDecision => "awaiting host trust decision",
             Phase::ServerNewKeys => "awaiting server NEWKEYS",
             Phase::Service => "awaiting SERVICE_ACCEPT",
+            Phase::Established => "using the accepted service",
             Phase::Finished => "finished",
         })
     }
@@ -427,7 +436,8 @@ pub enum HandshakeOutcome {
         description: Vec<u8>,
     },
     /// The server requested a re-exchange, which this diagnostic does not
-    /// support; a `DISCONNECT` was queued.
+    /// support. The diagnostic queues a `DISCONNECT`; a handed-off transport
+    /// instead fails closed.
     RekeyNotSupported,
     /// A message that is not valid in the phase it arrived in.
     UnexpectedMessage {
@@ -990,14 +1000,34 @@ impl ClientHandshake {
         }
     }
 
-    /// Advances the state machine as far as the buffered input allows.
+    /// Advances the diagnostic, sending a protected `DISCONNECT` on success.
     pub fn step(&mut self) -> Step {
+        if let Some(step) = self.step_until_service() {
+            return step;
+        }
+        match self.send_disconnect(COMPLETE_DESCRIPTION) {
+            Ok(()) => {
+                self.pending_outcome = Some(HandshakeOutcome::Completed);
+                Step::Send
+            }
+            Err(o) => {
+                self.finish(o.clone());
+                Step::Finished(Box::new(o))
+            }
+        }
+    }
+
+    /// Advances the handshake without automatically closing the accepted service.
+    /// `Some` has the same I/O and trust contract as [`Self::step`]. `None`
+    /// means a matching protected `SERVICE_ACCEPT` was consumed; no further
+    /// input is consumed until the caller takes the transport with [`Self::into_service`].
+    pub fn step_until_service(&mut self) -> Option<Step> {
         loop {
             if let Some(o) = &self.outcome {
-                return Step::Finished(Box::new(o.clone()));
+                return Some(Step::Finished(Box::new(o.clone())));
             }
             if !self.out.is_empty() {
-                return Step::Send;
+                return Some(Step::Send);
             }
             if let Some(o) = self.pending_outcome.take() {
                 self.finish(o);
@@ -1010,16 +1040,33 @@ impl ClientHandshake {
                 }
                 Phase::TrustDecision => {
                     let identity = self.identity.clone().expect("identity set with phase");
-                    return Step::TrustDecisionRequired(identity);
+                    return Some(Step::TrustDecisionRequired(identity));
                 }
+                Phase::Service if self.service_accepted.is_some() => return None,
                 Phase::Service => self.step_protected(),
+                Phase::Established => unreachable!("owned by the accepted service"),
                 Phase::Finished => unreachable!("finished without an outcome"),
             };
             match flow {
                 Flow::Continue => {}
-                Flow::NeedMore => return Step::NeedMore,
+                Flow::NeedMore => return Some(Step::NeedMore),
             }
         }
+    }
+
+    /// Consumes the handshake at the live service boundary. Returns `None`
+    /// before acceptance, after a failure, or if the diagnostic has already
+    /// queued its disconnect. No keys or buffered bytes are copied or reset.
+    pub fn into_service(mut self) -> Option<ServiceTransport> {
+        if self.phase != Phase::Service
+            || self.service_accepted.is_none()
+            || self.pending_outcome.is_some()
+            || !self.out.is_empty()
+        {
+            return None;
+        }
+        self.phase = Phase::Established;
+        Some(ServiceTransport { state: self })
     }
 
     /// A snapshot of everything observed so far.
@@ -1077,6 +1124,8 @@ impl ClientHandshake {
         self.pending_outcome = None;
         self.ephemeral = None;
         self.keys = None;
+        self.send_aead = None;
+        self.recv_aead = None;
         self.outcome = Some(outcome);
     }
 
@@ -1501,29 +1550,39 @@ impl ClientHandshake {
     }
 
     fn step_protected(&mut self) -> Flow {
+        match self.open_protected() {
+            Ok(Some(payload)) => self.handle_protected(&payload),
+            Ok(None) => Flow::NeedMore,
+            Err(o) => self.fail(o),
+        }
+    }
+
+    fn open_protected(&mut self) -> Result<Option<Vec<u8>>, HandshakeOutcome> {
         let aead = self
             .recv_aead
             .as_mut()
             .expect("protected receive after NEWKEYS");
         let (payload, total_len) = match aead.open(self.buf.as_mut_slice(), &self.config.packet) {
-            Ok(OpenStep::NeedMore { .. }) => return Flow::NeedMore,
+            Ok(OpenStep::NeedMore { .. }) => return Ok(None),
             Ok(OpenStep::Packet(p)) => (p.payload.to_vec(), p.total_len),
-            Err(OpenError::TagMismatch) => return self.fail(HandshakeOutcome::TagMismatch),
-            Err(e) => return self.fail(ProtocolViolation::Protected(e).into()),
+            Err(OpenError::TagMismatch) => return Err(HandshakeOutcome::TagMismatch),
+            Err(e) => return Err(ProtocolViolation::Protected(e).into()),
         };
         self.buf.consume(total_len);
-        if usize::try_from(self.protected_received)
-            .is_ok_and(|n| n >= self.config.max_protected_packets)
-        {
-            return self.fail(HandshakeOutcome::Limit(LimitKind::ProtectedPackets {
-                limit: self.config.max_protected_packets,
+        self.check_protected_budget(self.protected_received)?;
+        self.protected_received += 1;
+        self.bump_sequence(false)?;
+        Ok(Some(payload))
+    }
+
+    fn check_protected_budget(&self, used: u32) -> Result<(), HandshakeOutcome> {
+        let limit = u32::try_from(self.config.max_protected_packets).unwrap_or(u32::MAX);
+        if used >= limit {
+            return Err(HandshakeOutcome::Limit(LimitKind::ProtectedPackets {
+                limit: limit as usize,
             }));
         }
-        self.protected_received += 1;
-        if let Err(o) = self.bump_sequence(false) {
-            return self.fail(o);
-        }
-        self.handle_protected(&payload)
+        Ok(())
     }
 
     fn handle_protected(&mut self, payload: &[u8]) -> Flow {
@@ -1606,11 +1665,151 @@ impl ClientHandshake {
             return self.fail(violation.into());
         }
         self.service_accepted = Some(String::from_utf8_lossy(accept.service_name).into_owned());
-        if let Err(o) = self.send_disconnect(COMPLETE_DESCRIPTION) {
-            return self.fail(o);
-        }
-        self.pending_outcome = Some(HandshakeOutcome::Completed);
         Flow::Continue
+    }
+}
+
+/// Live, server-authenticated TCP packet state for an accepted SSH service.
+/// This is not an authenticated user session. The caller owns the byte I/O:
+/// write each returned ciphertext exactly once, in order, handling partial
+/// writes; drop both transport and stream on EOF or unrecoverable I/O error.
+/// Packet errors are terminal. The configured packet-count cap applies in
+/// each direction (including the initial service exchange); no rekey yet.
+#[derive(Debug)]
+pub struct ServiceTransport {
+    state: ClientHandshake,
+}
+
+impl ServiceTransport {
+    /// Identifier from the initial key exchange, for the upper-layer protocol.
+    pub fn session_id(&self) -> &SessionId {
+        self.state
+            .session_id()
+            .expect("service follows verified KEX")
+    }
+
+    /// The host key accepted by the caller's trust policy.
+    pub fn host_identity(&self) -> HostIdentity<'_> {
+        self.state
+            .identity
+            .as_ref()
+            .expect("host verified")
+            .as_identity()
+    }
+
+    /// Initial extension information, including any `server-sig-algs` list.
+    pub fn ext_info(&self) -> &ExtInfoSummary {
+        self.state
+            .ext_info
+            .as_ref()
+            .expect("service follows NEWKEYS")
+    }
+
+    /// Exact service name accepted by the peer.
+    pub fn service(&self) -> &[u8] {
+        &self.state.config.service
+    }
+
+    /// Number of additional socket bytes that can be buffered.
+    pub fn room(&self) -> usize {
+        self.state.room()
+    }
+
+    /// Buffer socket bytes; first drain already-buffered packets with [`Self::receive`].
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), HandshakeOutcome> {
+        self.live(|s| s.buf.push(bytes).map_err(HandshakeOutcome::InputOverflow))
+    }
+
+    /// Open the next service payload (including its message number), or
+    /// `None` if more socket bytes are needed. Transport messages are not
+    /// service payloads: IGNORE/DEBUG are validated and skipped, and a
+    /// DISCONNECT, unsupported rekey or unexpected control message ends use.
+    pub fn receive(&mut self) -> Result<Option<Vec<u8>>, HandshakeOutcome> {
+        self.live(|s| {
+            while let Some(p) = s.open_protected()? {
+                match p.first().copied().ok_or(ProtocolViolation::EmptyPayload)? {
+                    50..=255 => return Ok(Some(p)),
+                    msg::IGNORE => {
+                        Ignore::decode(&p).map_err(|error| ProtocolViolation::Message {
+                            number: msg::IGNORE,
+                            error,
+                        })?;
+                    }
+                    msg::DEBUG => {
+                        DebugMsg::decode(&p).map_err(|error| ProtocolViolation::Message {
+                            number: msg::DEBUG,
+                            error,
+                        })?;
+                    }
+                    msg::DISCONNECT => {
+                        let d =
+                            Disconnect::decode(&p).map_err(|error| ProtocolViolation::Message {
+                                number: msg::DISCONNECT,
+                                error,
+                            })?;
+                        return Err(HandshakeOutcome::ServerDisconnected {
+                            reason_code: d.reason_code,
+                            description: d.description.to_vec(),
+                        });
+                    }
+                    msg::KEXINIT => return Err(HandshakeOutcome::RekeyNotSupported),
+                    number => {
+                        return Err(HandshakeOutcome::UnexpectedMessage {
+                            number,
+                            phase: Phase::Established,
+                        });
+                    }
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// Seal one upper-layer payload. Transport and KEX messages cannot be
+    /// injected through this interface. The service owns its message syntax.
+    pub fn send(&mut self, payload: &[u8]) -> Result<Vec<u8>, HandshakeOutcome> {
+        self.live(|s| {
+            let number = *payload.first().ok_or(ProtocolViolation::EmptyPayload)?;
+            if number < 50 {
+                return Err(HandshakeOutcome::UnexpectedMessage {
+                    number,
+                    phase: Phase::Established,
+                });
+            }
+            s.check_protected_budget(s.protected_sent)?;
+            // Largest whole GCM block under the cap, less the padding-length
+            // byte and mandatory padding. Reject before allocating or sealing.
+            let block = crate::gcm::BLOCK_SIZE;
+            let cap = s.config.packet.max_packet_length as usize / block * block;
+            if payload.len() > cap.saturating_sub(1 + crate::gcm::MIN_PADDING) {
+                return Err(ProtocolViolation::Seal(SealError::PayloadTooLarge).into());
+            }
+            s.send_protected(payload)?;
+            Ok(s.take_output())
+        })
+    }
+
+    /// Consume the transport and return a final protected `DISCONNECT` to write.
+    pub fn disconnect(mut self) -> Result<Vec<u8>, HandshakeOutcome> {
+        self.live(|s| {
+            s.check_protected_budget(s.protected_sent)?;
+            s.send_disconnect(b"service closed by application")?;
+            Ok(s.take_output())
+        })
+    }
+
+    fn live<T>(
+        &mut self,
+        op: impl FnOnce(&mut ClientHandshake) -> Result<T, HandshakeOutcome>,
+    ) -> Result<T, HandshakeOutcome> {
+        if let Some(o) = &self.state.outcome {
+            return Err(o.clone());
+        }
+        let result = op(&mut self.state);
+        if let Err(o) = &result {
+            self.state.finish(o.clone());
+        }
+        result
     }
 }
 
@@ -2065,6 +2264,122 @@ mod tests {
             ClientHandshake::new(config(), &mut none),
             Err(HandshakeInitError::Entropy(_))
         ));
+    }
+
+    // Coalesce all handshake bytes and a caller-chosen suffix into one read.
+    fn drive_to_service(hs: &mut ClientHandshake, script: &Script, suffix: &[u8]) -> Vec<u8> {
+        let mut wire = server_to_newkeys(script);
+        wire.extend(server_protected(script, b"ssh-userauth"));
+        wire.extend_from_slice(suffix);
+        hs.feed(&wire);
+        let mut written = Vec::new();
+        while let Some(step) = hs.step_until_service() {
+            match step {
+                Step::Send => written.extend(hs.take_output()),
+                Step::TrustDecisionRequired(id) => {
+                    hs.provide_trust(pin().decide(&id.as_identity()))
+                }
+                other => panic!("expected accepted service, got {other:?}"),
+            }
+        }
+        assert_eq!(hs.pending_bytes(), suffix.len());
+        written
+    }
+
+    #[test]
+    fn handoff_preserves_pipelined_bytes_and_both_packet_directions() {
+        for script in [strict(), plain()] {
+            let mut peer = Sealer::new(&script.key_d, &script.iv_b);
+            if script.ext_info {
+                peer.seal(&ext_info_payload());
+            }
+            peer.seal(&service_accept_payload(b"ssh-userauth"));
+            let ignored = peer.seal(&[msg::IGNORE, 0, 0, 0, 0]);
+            let first = peer.seal(&[192, 1]);
+            let second = peer.seal(&[192, 2]);
+            let mut suffix = ignored;
+            suffix.extend(first);
+            suffix.extend_from_slice(&second[..3]);
+            let mut hs = handshake(config());
+            let written = drive_to_service(&mut hs, &script, &suffix);
+            let before = hs.report();
+            assert_eq!(before.protected_packets_sent, 1);
+            let mut service = hs.into_service().unwrap();
+            assert_eq!(service.session_id().as_bytes(), &script.h);
+            assert_eq!(service.host_identity().blob, k_s());
+            assert_eq!(service.ext_info().received, script.ext_info);
+            assert_eq!(service.receive().unwrap().unwrap(), [192, 1]);
+            assert_eq!(service.receive().unwrap(), None);
+            service.feed(&second[3..]).unwrap();
+            assert_eq!(service.receive().unwrap().unwrap(), [192, 2]);
+            assert_eq!(service.state.recv_seq, before.receive_sequence + 3);
+
+            // The independently keyed peer opens SERVICE_REQUEST, then the
+            // caller's packet: no extra disconnect or reset nonce in between.
+            let mut opener = Sealer::new(&script.key_c, &script.iv_a);
+            let mut tail = &written[written.iter().position(|&b| b == b'\n').unwrap() + 1..];
+            for _ in 0..3 {
+                let len = u32::from_be_bytes(tail[..4].try_into().unwrap()) as usize;
+                tail = &tail[4 + len..];
+            }
+            let (request, n) = opener.open(tail);
+            assert_eq!(request[0], msg::SERVICE_REQUEST);
+            assert_eq!(n, tail.len());
+            assert_eq!(opener.open(&service.send(&[192, 3]).unwrap()).0, [192, 3]);
+            assert_eq!(service.state.send_seq, before.send_sequence + 1);
+        }
+    }
+
+    #[test]
+    fn handoff_is_not_available_before_acceptance_or_after_disconnect() {
+        let script = strict();
+        let mut hs = handshake(config());
+        hs.feed(&server_to_newkeys(&script));
+        drive(&mut hs, trusted());
+        assert!(hs.into_service().is_none());
+        let mut hs = handshake(config());
+        drive_to_service(&mut hs, &script, &[]);
+        assert_eq!(hs.step(), Step::Send); // Chose the diagnostic exit instead.
+        hs.take_output();
+        assert!(hs.into_service().is_none());
+    }
+
+    #[test]
+    fn service_packet_errors_prevent_further_use() {
+        let script = plain();
+        let mut peer = Sealer::new(&script.key_d, &script.iv_b);
+        peer.seal(&service_accept_payload(b"ssh-userauth"));
+        let rekey = peer.seal(&script.i_s);
+        let mut tampered = rekey.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        for (wire, expected) in [
+            (rekey, HandshakeOutcome::RekeyNotSupported),
+            (tampered, HandshakeOutcome::TagMismatch),
+        ] {
+            let mut hs = handshake(config());
+            drive_to_service(&mut hs, &script, &wire);
+            let mut service = hs.into_service().unwrap();
+            assert_eq!(service.receive(), Err(expected.clone()));
+            assert_eq!(service.send(&[192]), Err(expected.clone()));
+            assert_eq!(service.feed(&[]), Err(expected));
+        }
+    }
+
+    #[test]
+    fn service_packet_budget_includes_the_initial_exchange() {
+        let mut hs = handshake(HandshakeConfig {
+            max_protected_packets: 2,
+            ..config()
+        });
+        drive_to_service(&mut hs, &plain(), &[]);
+        let mut service = hs.into_service().unwrap();
+        service.send(&[192]).unwrap();
+        assert_eq!(
+            service.send(&[192]),
+            Err(HandshakeOutcome::Limit(LimitKind::ProtectedPackets {
+                limit: 2
+            }))
+        );
     }
 
     #[test]

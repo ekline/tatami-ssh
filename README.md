@@ -416,9 +416,10 @@ Ordinary `cargo test` never depends on nightly, cargo-fuzz or the corpora.
 
 ## Next milestones
 
-1. **[Reusable TCP transport and rekeying](docs/tcp-rekey.md):** both initiators, strict-KEX key
-   rollover, byte/time limits, preservation of the first session identifier,
-   and an interface userauth can use instead of the diagnostic's exit.
+1. **[TCP rekeying](docs/tcp-rekey.md):** the library now hands off the verified
+   connection at `SERVICE_ACCEPT` (`tatami_ssh_tcp::io::handshake::establish_service`);
+   the CLI still disconnects. Next: client- and server-initiated rekey on the
+   protected connection, directional key rollover, and byte/time limits.
 2. **QUIC mapping proposal, then implementation:** identification placement,
    control-stream bootstrap, bounded record framing, exporter binding and
    userauth inputs, channel/stream association (one channel per
