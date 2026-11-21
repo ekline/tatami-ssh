@@ -462,19 +462,15 @@ impl Listener {
                 Ok((stream, peer)) => {
                     accepted += 1;
                     let accepted_at = Instant::now();
-                    // Acquire capacity before spawning.
-                    let admitted = shared
-                        .active
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                            (n < self.config.max_concurrent).then_some(n + 1)
-                        })
-                        .is_ok();
-                    if !admitted {
+                    // Only this accept loop acquires slots; workers can only
+                    // release them between the capacity check and increment.
+                    if shared.active.load(Ordering::SeqCst) >= self.config.max_concurrent {
                         dropped += 1;
                         let _ = stream.shutdown(Shutdown::Both);
                         drop(stream);
                         continue;
                     }
+                    shared.active.fetch_add(1, Ordering::SeqCst);
                     observed += 1;
                     let id = observed;
                     let shared = shared.clone();
