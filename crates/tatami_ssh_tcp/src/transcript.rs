@@ -280,6 +280,26 @@ pub struct AeadKeys {
     pub iv: [u8; GCM_IV_LEN],
 }
 
+/// Per-connection KDF state (RFC 4253 §§7.2, 9). The session identifier is
+/// set by the first verified exchange and never replaced by a later hash.
+#[derive(Default)]
+pub(crate) struct KeySchedule {
+    session_id: Option<SessionId>,
+}
+
+impl KeySchedule {
+    pub(crate) const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    pub(crate) fn derive(&mut self, k: &SharedSecret, h: &ExchangeHash) -> KeySet {
+        let id = self
+            .session_id
+            .get_or_insert_with(|| SessionId::from_initial_exchange(*h));
+        derive_aes128_gcm_keys(k, h, id)
+    }
+}
+
 /// Both directions' key material.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct KeySet {
@@ -832,23 +852,37 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_a_distinct_type_from_later_hashes() {
-        let h = ExchangeHash(H);
-        let sid = SessionId::from_initial_exchange(h);
-        let later = ExchangeHash([9; 32]);
-        // The derivation for a later exchange keeps the original session id.
-        let k = alice().agree(&BOB_PUBLIC).unwrap();
-        let mut a = [0u8; 16];
-        derive_key(&k, &later, b'A', &sid, &mut a);
-        let mut b = [0u8; 16];
-        derive_key(
-            &k,
-            &later,
-            b'A',
-            &SessionId::from_initial_exchange(later),
-            &mut b,
+    fn second_exchange_derives_both_directions_with_the_first_session_id() {
+        let mut schedule = KeySchedule::default();
+        assert!(schedule.session_id().is_none());
+        let first = ExchangeHash([7; 32]);
+        let k1 = alice().agree(&BOB_PUBLIC).unwrap();
+        let initial = schedule.derive(&k1, &first);
+        let later = schedule.derive(
+            &SharedSecret::from_bytes([0x80; 32]),
+            &ExchangeHash([9; 32]),
         );
-        assert_ne!(a, b);
+        assert_eq!(schedule.session_id().unwrap().as_bytes(), first.as_bytes());
+        assert_ne!(initial.client_to_server.key, later.client_to_server.key);
+        assert_ne!(initial.server_to_client.key, later.server_to_client.key);
+        // Independent Python oracle, truncated to 12 (IV) or 16 (key) bytes:
+        // sha256(bytes.fromhex('0000002100') + b'\x80'*32 + b'\x09'*32 + letter + b'\x07'*32)
+        assert_eq!(
+            alloc::format!("{}", Hex(&later.client_to_server.iv)),
+            "865061d0a65cb74064ef1bce"
+        );
+        assert_eq!(
+            alloc::format!("{}", Hex(&later.server_to_client.iv)),
+            "57d4b38149b7025d8f6e91f4"
+        );
+        assert_eq!(
+            alloc::format!("{}", Hex(&later.client_to_server.key)),
+            "35b7436e212627e54e4fe02ed612cbb9"
+        );
+        assert_eq!(
+            alloc::format!("{}", Hex(&later.server_to_client.key)),
+            "9e9ab7a7f5ed6de9d535eb3190a86eb9"
+        );
     }
 
     #[test]

@@ -345,7 +345,7 @@ fn default_sshd_completes_the_profile_handshake() {
     }
     let sshd = Sshd::start(&[]);
     let run = sshd.run(HandshakeConfig::default(), sshd.pin);
-    let log = sshd.wait_for_log("[preauth]");
+    let log = sshd.wait_for_log("tatami diagnostic complete");
     sshd.print_evidence(&run, &log);
 
     assert_eq!(
@@ -479,7 +479,7 @@ fn sshd_restricted_to_the_profile_completes() {
         "Ciphers=aes128-gcm@openssh.com",
     ]);
     let run = sshd.run(HandshakeConfig::default(), sshd.pin);
-    let log = sshd.wait_for_log("[preauth]");
+    let log = sshd.wait_for_log("tatami diagnostic complete");
     sshd.print_evidence(&run, &log);
 
     assert_eq!(

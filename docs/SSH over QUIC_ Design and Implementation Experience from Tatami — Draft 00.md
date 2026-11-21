@@ -260,6 +260,14 @@ Some transport functions are naturally supplied by QUIC and TLS. Examples includ
 
 The precise correspondence between these functions and SSH mechanisms is analyzed later rather than assumed to be exact.
 
+#### 5.2.1. Traffic key updates
+
+In SSH over TCP, either endpoint can initiate a new key exchange (Section 9 of [RFC4253]). This exchange replaces the packet protection keys. It does not change the session identifier, which is the exchange hash from the first key exchange.
+
+In the proposed QUIC binding, updates to 1-RTT packet protection keys use the QUIC key update procedure (Section 6 of [RFC9001]). Endpoints do not exchange `SSH_MSG_KEXINIT` or `SSH_MSG_NEWKEYS` on SSH streams to perform such an update. A key phase change does not establish a new SSH session binding, repeat user authentication, or change an open channel. The construction of the initial binding is a separate question (Section 5.3).
+
+The two mechanisms have different security properties. An SSH key re-exchange using ephemeral Diffie–Hellman contributes fresh key agreement material. A QUIC key update derives the next traffic secret from the current one; it does not perform another Diffie–Hellman exchange or reauthenticate the server.
+
 ### 5.3. Functions requiring an SSH/QUIC binding
 
 Other functions require an explicit protocol binding because SSH semantics depend on information that is not represented in QUIC alone.

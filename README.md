@@ -416,7 +416,7 @@ Ordinary `cargo test` never depends on nightly, cargo-fuzz or the corpora.
 
 ## Next milestones
 
-1. **Reusable TCP transport and rekeying:** both initiators, strict-KEX key
+1. **[Reusable TCP transport and rekeying](docs/tcp-rekey.md):** both initiators, strict-KEX key
    rollover, byte/time limits, preservation of the first session identifier,
    and an interface userauth can use instead of the diagnostic's exit.
 2. **QUIC mapping proposal, then implementation:** identification placement,

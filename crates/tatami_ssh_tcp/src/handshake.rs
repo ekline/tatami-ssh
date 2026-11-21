@@ -132,8 +132,8 @@ use crate::packet::{
     encode_initial_packet_with,
 };
 use crate::transcript::{
-    EphemeralKeyPair, ExchangeHashInputs, KexError, KeySet, SessionId, X25519_LEN,
-    derive_aes128_gcm_keys, exchange_hash,
+    EphemeralKeyPair, ExchangeHashInputs, KexError, KeySchedule, KeySet, SessionId, X25519_LEN,
+    exchange_hash,
 };
 
 /// Software version token sent in the client identification.
@@ -752,7 +752,7 @@ pub struct ClientHandshake {
     signature_error: Option<String>,
     provider: Option<Box<dyn SignatureProvider + Send>>,
     trust: Option<TrustDecision>,
-    session_id: Option<SessionId>,
+    key_schedule: KeySchedule,
     keys: Option<KeySet>,
     send_aead: Option<AeadDirection>,
     recv_aead: Option<AeadDirection>,
@@ -877,7 +877,7 @@ impl ClientHandshake {
             signature_error: None,
             provider,
             trust: None,
-            session_id: None,
+            key_schedule: KeySchedule::default(),
             keys: None,
             send_aead: None,
             recv_aead: None,
@@ -915,7 +915,7 @@ impl ClientHandshake {
     /// The session identifier, once the exchange hash has been computed.
     #[must_use]
     pub const fn session_id(&self) -> Option<&SessionId> {
-        self.session_id.as_ref()
+        self.key_schedule.session_id()
     }
 
     /// Bytes fed but not yet consumed.
@@ -1442,7 +1442,6 @@ impl ClientHandshake {
             },
             &k,
         );
-        let session_id = SessionId::from_initial_exchange(h);
 
         let verified = SignatureBlob::decode(reply.signature_blob)
             .map_err(|e| alloc::format!("signature blob: {e}"))
@@ -1463,9 +1462,8 @@ impl ClientHandshake {
         self.signature_valid = Some(true);
 
         // Derive now so `K` can be dropped (zeroized) immediately.
-        self.keys = Some(derive_aes128_gcm_keys(&k, &h, &session_id));
+        self.keys = Some(self.key_schedule.derive(&k, &h));
         drop(k);
-        self.session_id = Some(session_id);
         self.identity = Some(identity);
         self.phase = Phase::TrustDecision;
         Flow::Continue
