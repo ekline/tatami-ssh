@@ -11,7 +11,7 @@
 //! |---|---|
 //! | RSA PKCS#1 v1.5 / SHA-256 (`rsa-sha2-256`) | `RSA_PKCS1_2048_8192_SHA256` over the raw `(n, e)` components |
 //! | RSA PKCS#1 v1.5 / SHA-512 (`rsa-sha2-512`) | `RSA_PKCS1_2048_8192_SHA512` |
-//! | ECDSA P-256 / SHA-256 (`ecdsa-sha2-nistp256`) | `ECDSA_P256_SHA256_FIXED` over the SEC1 point and `r || s` |
+//! | ECDSA P-256 / SHA-256 (`ecdsa-sha2-nistp256`) | `ECDSA_P256_SHA256_FIXED` over the SEC1 point and `r \|\| s` |
 //!
 //! `ring` enforces the same 2048–8192-bit RSA bounds as the portable
 //! policy, requires the signature to be exactly the modulus length (the

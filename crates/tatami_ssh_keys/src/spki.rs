@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | Ed25519 (`ed25519`) | id-Ed25519 1.3.101.112, parameters **absent** (RFC 8410 §3) | the 32-byte key, a canonical point (checked with `ed25519-dalek`) |
 //! | RSA (`rsa`) | rsaEncryption 1.2.840.113549.1.1.1, parameters exactly `NULL` (RFC 3279 §2.3.1, RFC 4055 §1.2) | DER `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }` (RFC 8017 A.1.1), both minimal positive INTEGERs, within the [`crate::rsa`] policy |
-//! | ECDSA P-256 (`ecdsa-p256`) | id-ecPublicKey 1.2.840.10045.2.1 with the named curve prime256v1 1.2.840.10045.3.1.7 (RFC 5480 §2.1.1) | the 65-byte SEC1 uncompressed point `04 || X || Y` (RFC 5480 §2.2) |
+//! | ECDSA P-256 (`ecdsa-p256`) | id-ecPublicKey 1.2.840.10045.2.1 with the named curve prime256v1 1.2.840.10045.3.1.7 (RFC 5480 §2.1.1) | the 65-byte SEC1 uncompressed point `04 \|\| X \|\| Y` (RFC 5480 §2.2) |
 //!
 //! Rejected in every build: any other algorithm (Ed448, X25519, RSA-PSS
 //! `id-RSASSA-PSS`, DSA, ...), other curves (P-384, P-521, explicit curve
