@@ -1,12 +1,12 @@
 # Workspace architecture
 
-Status: round 5, 2026-09-26. Package boundaries are an implementation
+Status: round 6 complete. Package boundaries are an implementation
 starting point; unresolved protocol choices remain unresolved and are tracked
 in `tatami-ssh-design-state-checkpoint.md`.
 
-All libraries are `no_std`. All seven proposed package boundaries exist so
-that the layout, dependency direction and feature policy can be checked
-mechanically. `tatami_ssh_wire`, `tatami_ssh_keys`, `tatami_ssh_tcp`, `tatami_ssh_connection`,
+All eight workspace libraries declare `no_std`; host adapters opt into `std`.
+The original seven packages are joined by `tatami_ssh_openssh_compat` (W-42).
+`tatami_ssh_wire`, `tatami_ssh_keys`, `tatami_ssh_tcp`, `tatami_ssh_connection`,
 `tatami_ssh_quic` (diagnostic backend only) and the `tatami_ssh` facade contain
 working code (see "Implemented" below); `tatami_ssh_auth` remains
 documentation-only.
@@ -72,12 +72,11 @@ extra empty role-specific packages.
 
 ## Feature behavior
 
-All package defaults are empty. In the four shared protocol packages the only
-opt-in features are `tatami_ssh_wire/alloc` and `tatami_ssh_keys/{ed25519,
-known-hosts, openssh-key, openssh-hashed-hosts}` (providers and portable
-parsers, not portability changes; the latter three imply `ed25519`, and
-`openssh-hashed-hosts` implies `known-hosts`). The three shared packages other than
-`tatami_ssh_wire` permit allocation unconditionally (and enable
+All package defaults are empty. `tatami_ssh_wire/alloc` adds owned helpers.
+In `tatami_ssh_keys`, `ed25519`, `rsa` and `ecdsa-p256` each enable
+`fingerprint`; `known-hosts` and `openssh-key` enable `ed25519`, and
+`openssh-hashed-hosts` implies `known-hosts`. None requires `std`. The keys, auth and
+connection packages permit allocation unconditionally (and enable
 `tatami_ssh_wire/alloc` themselves); `--no-default-features` is not a
 no-allocation mode for them.
 
@@ -91,7 +90,7 @@ no-allocation mode for them.
 | `std,tcp` | TCP with `std` | Facade and TCP; `tatami-client probe`, `tatami-server observe` |
 | `std,quic` | QUIC with `std` | Facade and QUIC (no backend) |
 | `std,tcp,quic` | Both with `std` | Facade and both bindings |
-| `kex` (implies `tcp`) | TCP + `tatami_ssh_tcp/kex` + `tatami_ssh_keys/{ed25519,known-hosts}` | None; portable — `check-workspace.sh` checks it on `thumbv7em-none-eabi` (CI gate; first run not yet observed) and that it pulls no `ssh-key`/`rustls`/`ring` |
+| `kex` (implies `tcp`) | TCP + `tatami_ssh_tcp/kex` + `tatami_ssh_keys/{ed25519,known-hosts}` | None; portable — `check-workspace.sh` checks it on `thumbv7em-none-eabi` (required in CI) and that it pulls no `ssh-key`/`rustls`/`ring` |
 | `std,tcp,kex` | as above with `std` | `tatami-client handshake` (pin or `--known-hosts`) |
 | `quic-diag` (implies `std,quic`) | QUIC + `tatami_ssh_quic/quinn-backend` + `tatami_ssh_keys/{known-hosts,openssh-key}` | `tatami_ssh::quic_diag` (no binaries without `tcp`) |
 | `std,tcp,quic-diag` | TCP with `std` + QUIC backend | `tatami-client probe`, `tatami-client handshake --transport quic`, `tatami-server observe [--transport quic]` |
@@ -253,9 +252,10 @@ oracles; committed seeds reach the deep states; `scripts/fuzz.sh` wraps
 build/replay/run/reproduce/minimize/coverage; CI runs bounded campaigns.
 Details, execution evidence and findings are in `fuzzing.md`.
 
-**TCP handshake (round 4).** `tatami_ssh_tcp/kex` implements exactly the first
-interoperability profile (W-29): `negotiate` builds the client `KEXINIT`
-(one method, one host-key algorithm, one AEAD cipher, `none` compression,
+**TCP handshake (round 4).** `tatami_ssh_tcp/kex` implements the first
+interoperability profile (W-29), extended with host-key choices in round 6.
+`negotiate` builds the client `KEXINIT` (one method, the enabled host-key
+algorithms, one AEAD cipher, `none` compression,
 `hmac-sha2-256` listed only to satisfy the non-empty name-list syntax, W-30)
 and applies RFC 4253 §7.1 selection with markers excluded on both sides,
 strict-KEX markers matched only within the same spelling, and
@@ -266,7 +266,7 @@ verbatim (EID 4533), sets `session_id = H`, and derives the four GCM
 keys/IVs (§7.2). `gcm` seals and opens `aes128-gcm@openssh.com` packets with
 the 4-byte length as AAD and a 64-bit invocation counter that is never reset
 or reused. `handshake::ClientHandshake` is a sans-I/O validator: it stops at
-`Step::TrustDecisionRequired` after the Ed25519 signature over `H` verifies,
+`Step::TrustDecisionRequired` after the negotiated host-key signature over `H` verifies,
 and only a `Trusted` answer (from `tatami_ssh_keys::trust::HostTrustPolicy`;
 the CLI uses `PinnedSha256`, W-32, or since round 5 `KnownHostsPolicy`,
 W-37) lets `NEWKEYS` be sent. Under strict KEX
@@ -288,13 +288,14 @@ sshd completes; `Ciphers=aes256-ctr` fails negotiation cleanly).
 **Keys (round 4).** `tatami_ssh_keys` owns the algorithm-agnostic public-key
 and signature blob codecs (key-format name and signature-algorithm name are
 separate fields, as RFC 8332 requires; `HostKey::from_blob` and
-`verify_signature_blob` check both for `ssh-ed25519`),
+scheme-bound verification check both),
 `Ed25519PublicKey::from_bytes` (invalid points rejected at construction) and
 `verify_strict`, the `SHA256:` fingerprint of the complete blob (equal to
 `ssh-keygen -lf`), and the trust contract:
 `HostTrustPolicy::decide(&HostIdentity) -> TrustDecision`. Signature
 validity and trust are separate facts. Unknown algorithms are reported with
-their name; RSA/ECDSA/certificates and signing are not implemented here.
+their name. Round 6 added RSA/P-256 host-key verification (below); host
+certificates and user authentication remain unsupported.
 (Round 5 moved SPKI conversion here and added `known_hosts`; see below.)
 
 **Connection (round 4 fix).** `OpeningEngine::handle_open_confirmation`
@@ -345,7 +346,20 @@ rustls glue in `tatami_ssh_quic`, portable parsing and decisions in
 entry) and `tatami_ssh_quic/tests/host_key.rs` (in-memory). This is identity
 continuity only: no SSH byte crosses QUIC.
 
+**Host-key interoperability (round 6, W-42/W-43).** The TCP client and the
+QUIC diagnostic now support the same SSH-blob pin or `known_hosts` entry
+for Ed25519, RSA/SHA-2 and ECDSA P-256. The portable libraries parse the key,
+check bounds and bind the signature to the negotiated scheme; the host
+facade uses `ring` for RSA/P-256 verification. Without an injected provider,
+portable TCP offers only Ed25519. SHA-1 is confined to the optional legacy
+hashed-hostname matcher, never an SSH signature scheme. See the
+[provider audit](crypto-provider-audit.md#rsa-and-ecdsa-p-256-host-keys-round-6)
+for key-size/import limits and the [verified gates](../README.md#checks).
+
 ### Next implementation slices
+
+All slices retain W-44: no SSH transport compression, including at rekey,
+after user authentication, or in the proposed QUIC record layer.
 
 1. **Reusable TCP transport and rekeying:** both initiators, strict-KEX key
    rollover (and the `EXT_INFO`-before-`USERAUTH_SUCCESS` opportunity),

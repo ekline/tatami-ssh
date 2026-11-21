@@ -27,8 +27,8 @@
 //!   [`NegotiationError::NoMacImplemented`]: Tatami implements no HMAC, so
 //!   there is no MAC it could honestly select. See the MAC-list policy below.
 //! - **Compression** (per direction): the first algorithm in the client's
-//!   list that the server also lists; only `none` is implemented, and the
-//!   client offers only `none`.
+//!   list that the server also lists. Tatami offers and accepts only `none`
+//!   by policy (W-44), not merely as the default.
 //! - **Strict KEX**: enabled when the client offered a client-role marker
 //!   and the server offered the server-role marker of the *same spelling*
 //!   (both pre-standard or both standard), never across spellings.

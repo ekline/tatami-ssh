@@ -456,6 +456,11 @@ This separation is intentional. It permits interoperability testing against conv
 
 This appendix records what the Tatami implementation has actually done as of round 5, so that later sections of this document can cite implementation experience rather than intent. It is a status report inside an Informational draft intended for the Independent Submission Stream; nothing here has been adopted, reviewed or accepted by any IETF working group, and no interoperability with any implementation other than OpenSSH (TCP transport handshake, client role only) is claimed. Terms: **decided** refers to a workspace decision (`W-nn`) or checkpoint entry (`P-nn`, `AQ-nnn`) in the project's ledgers; **open** means no wire behaviour has been selected.
 
+> Subsequent implementation: round 6 extended host identity to RSA/SHA-2
+> and ECDSA P-256. Tatami also rules out SSH transport compression on either
+> binding (W-44). The matrix below is the round 5 snapshot, not the live
+> support list; see the [implementation checkpoint](tatami-ssh-design-state-checkpoint.md).
+
 ### A.1. Mechanism matrix
 
 | Mechanism | TCP behaviour ([RFC 4253](https://www.rfc-editor.org/rfc/rfc4253.html) unless noted) | Proposed QUIC mapping | Decision / open ID | Implementation state | Test evidence |

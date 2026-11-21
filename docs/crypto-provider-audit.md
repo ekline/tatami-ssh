@@ -1,11 +1,9 @@
 # Cryptographic provider and QUIC backend audit
 
-Status: round 4, 2026-09-20; round 5 (host identity) added 2026-09-26 in
-[Host-identity crates](#host-identity-crates-round-5). This audit precedes
-and governs the provider features added in those rounds. It selects a deliberately small first
-interoperability profile; it is not a claim that SSH's full algorithm
-requirements (RFC 9142 MUSTs, RFC 8332, etc.) are met — those gaps remain in
-`specification-inventory.md`.
+This audit records the first TCP/QUIC provider selections (round 4), shared
+host identity (round 5), and the [RSA and P-256 provider boundary](#rsa-and-ecdsa-p-256-host-keys-round-6)
+(round 6). The profile is deliberately small; unmet requirements such as
+RFC 9142's mandatory KEX are listed in `specification-inventory.md`.
 
 ## Method
 
@@ -25,9 +23,7 @@ The portable set was additionally resolved in an isolated `#![no_std]`
 scratch crate (`target/audit-crypto`, not committed) to confirm that no
 `std` feature, `getrandom`, `libc` or C build appears in its normal
 dependency graph. Bare-metal compilation on `thumbv7em-none-eabi` runs in
-CI (`scripts/check-workspace.sh`); it could not be run on the development
-machine (no `rust-std` for that target) and is therefore a **pending CI
-gate**, not a local claim. Advisory review used the RustSec database as
+CI (`scripts/check-workspace.sh`) and passed for round 6. Advisory review used the RustSec database as
 known to the author at the audit date; no automated `cargo audit` run was
 possible offline and none is claimed.
 
@@ -38,7 +34,7 @@ possible offline and none is claimed.
 | Key exchange | `curve25519-sha256` | [RFC 8731](https://www.rfc-editor.org/rfc/rfc8731.html), [RFC 5656 §4](https://www.rfc-editor.org/rfc/rfc5656.html#section-4) | `x25519-dalek` + `sha2` |
 | Host-key signature | `ssh-ed25519` | [RFC 8709](https://www.rfc-editor.org/rfc/rfc8709.html) | `ed25519-dalek` |
 | Packet protection (both directions) | `aes128-gcm@openssh.com` | [RFC 5647](https://www.rfc-editor.org/rfc/rfc5647.html) construction; negotiation per [draft-miller-sshm-aes-gcm-01 §2](https://datatracker.ietf.org/doc/html/draft-miller-sshm-aes-gcm-01) and [OpenSSH PROTOCOL §1.6](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL) | `aes-gcm` |
-| Compression | `none` | RFC 4253 §6.2 | — |
+| Compression | `none` only, both directions, by policy (W-44) | RFC 4253 §6.2 | — |
 | Strict KEX | `kex-strict-c-v00@openssh.com` marker | [draft-ietf-sshm-strict-kex-02](https://datatracker.ietf.org/doc/html/draft-ietf-sshm-strict-kex-02) | — |
 | Extension negotiation | `ext-info-c` marker, `EXT_INFO` receive only | [RFC 8308 §2](https://www.rfc-editor.org/rfc/rfc8308.html#section-2) | — |
 | Host fingerprint | `SHA256:` base64 (no padding) of the complete key blob | OpenSSH `ssh-keygen -l` convention | `sha2` + `base64ct` |
@@ -153,7 +149,7 @@ sources and the resolved graph above (W-37, W-39, W-42):
 | `hmac` | 0.12.1 | none (defaults off) | unset (edition 2018) | `digest` 0.10.7 (`mac`) | none (salts are public) | HMAC-SHA1 for `\|1\|salt\|hash` hostnames only (`verify_slice`, constant time); dependency of `tatami_ssh_openssh_compat` only |
 | `sha1` | 0.10.7 | none (defaults off) | unset (edition 2018) | `digest`, `cpufeatures` 0.2.17 (already present via `sha2`) | none | Hash for the legacy hashed-hostname format only; dependency of `tatami_ssh_openssh_compat` only |
 
-`ssh-key` features deliberately **not** enabled: `ed25519` (would pull
+For the Ed25519 profile, `ssh-key` features deliberately **not** enabled (round 6 enables `ecdsa` for P-256 import): `ed25519` (would pull
 `rand_core` and its own seed→public derivation check, which Tatami performs
 with `ed25519-dalek` instead), `encryption` (would pull `bcrypt-pbkdf` and
 AES/ChaCha implementations; `grep bcrypt Cargo.lock` finds nothing, so no
@@ -219,7 +215,7 @@ exporter/signature operation uses it.
   enforceable boundary is the dependency graph above plus the enabled
   algorithm configuration.
 
-Validation split, confirmed in `ssh-key-0.6.7/src/private.rs` and
+Ed25519 validation split (see the next section for RSA/P-256), confirmed in `ssh-key-0.6.7/src/private.rs` and
 `src/private/ed25519.rs`:
 
 | Check | Performed by |
@@ -317,15 +313,10 @@ an off-curve P-256 key parses but can never verify.
 
 ## Open items
 
-- Bare-metal (`thumbv7em-none-eabi`) build of `tatami_ssh_tcp --features kex`,
-  `tatami_ssh_keys --features ed25519` and (round 5) `tatami_ssh_keys --features
-  known-hosts,openssh-key` is pending its first observed CI run; the target
-  is not installed on the development machine, where the step was skipped.
-- Round 5 code has been built and tested locally on stable (rustc 1.98.1)
-  only; the Rust 1.85 CI run is pending.
+The round 6 Rust 1.85, stable, bare-metal and required-OpenSSH gates passed
+at `d7bb394` ([validation evidence](../README.md#checks)).
 - `cargo audit` has not been executed (offline); run it before any release.
-- Round 6 (SHA-1 boundary): the new crate adds no registry package; its
-  `hmac`/`sha1`/`base64ct` versions are the ones already locked.
+
 - `ed25519-dalek` 3.x and `x25519-dalek` 3.x exist; they were not adopted
   because they move to `rand_core` 0.9 and newer MSRVs and offer nothing the
   profile needs.

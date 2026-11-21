@@ -4,7 +4,7 @@
 
 **Date:** 2026-09-10
 
-> Implementation note (2026-09-26): this snapshot predates the implementation; current state is in `tatami-ssh-design-state-checkpoint.md` §0. The server-trust path sketched below (TLS raw public key → `known_hosts`) now exists as a diagnostic for Ed25519 host keys (round 5, `decisions.md` W-36–W-41). It is identity continuity only: no SSH bytes are carried over QUIC and there is no SSH session over QUIC yet.
+> Historical snapshot; see [the current checkpoint](tatami-ssh-design-state-checkpoint.md) §0 for implementation and milestones. Through round 6 the TLS raw public key → SSH `known_hosts` path works for Ed25519, RSA and P-256; no SSH bytes cross QUIC. The compression question below has been decided: SSH transport compression is disabled (W-44).
 
 ---
 

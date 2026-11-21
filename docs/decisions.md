@@ -51,11 +51,30 @@ decision was recorded.
 | W-43 | 2026-09-27 | RSA/SHA-2 (`ssh-rsa` blob; `rsa-sha2-512`, `rsa-sha2-256`) and ECDSA P-256 host keys join Ed25519 behind explicit features (`tatami_ssh_keys/{rsa,ecdsa-p256}`, facade `rsa`/`ecdsa-p256`). Portable crates parse, police (RSA 2048–8192 bits, bounded odd exponent; strict mpints; P-256 uncompressed points) and bind verification to the negotiated scheme; the final check is a host `SignatureProvider`, implemented with `ring` in the facade. Without a provider only `ssh-ed25519` is offered. The same OpenSSH key serves TCP and QUIC (RFC 7250 raw public key, TLS RSA-PSS/ECDSA via rustls on `ring`); OpenSSH import converts to PKCS#1/SEC1 in memory with `crypto-bigint` for the CRT exponents and proves possession at load. The `rsa` crate is not used. | Option B of the provider review: one audited provider already in the graph, no RUSTSEC-2023-0071 exposure, no C/asm in portable crates. Cost: bare-metal builds verify only Ed25519 unless they supply a provider. See the audit section "RSA and ECDSA P-256 host keys (round 6)". |
 | W-25 | 2026-09-20 | Accepted file-transfer direction (implementation deferred): SFTP v3 per `draft-ietf-secsh-filexfer-02` (an Internet-Draft, not an RFC) as the baseline, extensions only on demonstrated interoperability need; legacy SCP protocol out of scope (modern OpenSSH `scp` uses SFTP, a future acceptance target); experiment with one transfer per SSH channel per QUIC bidirectional stream within one authenticated connection, a separate metadata channel distinct from the transport control stream; confirm parent directories before each file, apply final directory timestamps/permissions after descendants, express cross-stream ordering as explicit successful-operation dependencies; bound concurrent files/memory/handles, measure per-file setup cost against a channel pool, never share session-scoped handles across sessions; benchmark ordinary/parallel SFTP over TCP and QUIC across sizes, latency and loss. | Recorded so later work starts from agreed constraints. Performance gain is a hypothesis; one stream per file is an experiment. No SFTP crate or wire change exists yet. |
 
-## Package naming (W-42, 2026-09-27)
+## W-44 — No SSH transport compression (2026-11-20)
+
+Tatami offers and accepts only `none` in both RFC 4253 compression lists.
+This holds for both roles, initial exchange and rekey, before and after
+user authentication. Do not enable `zlib`, `zlib@openssh.com`, RFC 8308
+`delay-compression`, or a CLI override. A mixed offer can match `none`; if
+either direction lacks `none`, the handshake fails. Diagnostics may record
+any peer offer. The future SSH-over-QUIC binding must not introduce payload
+compression either; the current QUIC/TLS diagnostic carries no SSH records.
+
+When peer-controlled input and secrets share a compression context, encrypted
+lengths can reveal information about the secrets. Authenticated encryption does not hide
+message lengths; delaying compression until login does
+not remove that channel. See [RFC 7457 §2.6](https://www.rfc-editor.org/rfc/rfc7457.html#section-2.6)
+for examples of this class of attack in TLS/HTTP, not a claim of an exploit
+in Tatami. This decision concerns transport compression, not opaque files an
+application has already compressed. TCP enforcement and tests live in
+`crates/tatami_ssh_tcp/src/negotiate.rs`.
+
+## Package naming (2026-09-27)
 
 All Cargo packages and Rust crate identifiers use the `tatami_ssh` prefix.
-The facade is `tatami_ssh`; the six supporting libraries are
-`tatami_ssh_{wire,keys,auth,connection,tcp,quic}`. Their directories match
+The facade is `tatami_ssh`; the supporting libraries are
+`tatami_ssh_{wire,keys,auth,connection,tcp,quic,openssh_compat}`. Their directories match
 their package names. The isolated harness packages are
 `tatami_ssh_fuzz_wire_core` and `tatami_ssh_fuzz_protocol`. This avoids using
 the unrelated `tatami` package name. Dependency versions, features and

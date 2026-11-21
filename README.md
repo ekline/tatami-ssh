@@ -17,7 +17,8 @@ decisions. Protocol design state lives in
 
 ## Status
 
-Early. What runs today (round 5, 2026-09-26):
+Round 6 is complete. Tatami can verify the same server identity over SSH/TCP
+and QUIC/TLS. Neither diagnostic logs in a user or runs a command.
 
 - **`tatami-client probe`** — connects to an SSH server, sends a client
   identification, and reports the server's identification and its initial
@@ -31,7 +32,7 @@ Early. What runs today (round 5, 2026-09-26):
   It observes early peer offers; it is **not an SSH service**.
 - **`tatami-client handshake`** (feature `kex`) — a genuine SSH transport
   handshake against a real server: `curve25519-sha256` key exchange,
-  `ssh-ed25519` host-key signature verification, host trust from an
+  Ed25519 (optionally RSA/SHA-2 or ECDSA P-256) host-key verification, trust from an
   operator-supplied fingerprint pin or an explicitly named `known_hosts`
   file, `aes128-gcm@openssh.com` protected packets in both
   directions, strict KEX, `EXT_INFO` receive, `SERVICE_REQUEST` /
@@ -42,29 +43,27 @@ Early. What runs today (round 5, 2026-09-26):
   --transport quic`** (feature `quic-diag`) — a QUIC v1 + TLS 1.3
   **handshake observer experiment** on `quinn-proto` + `rustls`, built into
   the same two binaries. It completes and reports handshakes; it carries
-  **no SSH bytes** and is not SSH over QUIC. Since round 5 the server can
-  present an OpenSSH Ed25519 host key as an RFC 7250 raw public key, which
+  **no SSH bytes** and is not SSH over QUIC. The server can present any of
+  the three supported OpenSSH key types as an RFC 7250 raw public key, which
   the client judges with the same pin or `known_hosts` entry as on TCP
   ([below](#one-host-identity-across-tcp-and-quic)).
 
-Library pieces behind that: bounded SSH primitive codecs (including `mpint`)
-and `KEXINIT` / `KEX_ECDH_*` / `NEWKEYS` / `EXT_INFO` / service / transport /
-channel-opening codecs (`tatami_ssh_wire`); key and signature blobs, Ed25519
-verification, `SHA256:` fingerprints, the trust policies (pin and read-only
-`known_hosts`), strict Ed25519 SPKI conversion, SSHFP values and unencrypted
-OpenSSH Ed25519 private-key decoding (`tatami_ssh_keys`); identification and
-packet framing, negotiation, exchange hash and key derivation, AES-GCM packet
-protection, the probe/observer and handshake state machines, and blocking
-host adapters (`tatami_ssh_tcp`); a pure
-channel-opening engine (`tatami_ssh_connection`); the QUIC diagnostic backend
-(`tatami_ssh_quic`, feature `quinn-backend`); and reporting, bounded file reads
-and trust selection (`tatami_ssh`).
+**Transport compression is disabled by policy**, not deferred. TCP offers only
+`none` in both directions; a peer that requires compression fails negotiation.
+This also rules out compression after login and in the future SSH-over-QUIC
+binding. Compressing secrets together with peer-controlled data can leak
+information through ciphertext lengths. Probe and observer reports may still
+show a peer advertising `zlib`; reporting is not negotiation
+([W-44](docs/decisions.md#w-44--no-ssh-transport-compression-2026-11-20)).
+
+The [architecture guide](docs/architecture.md) describes the portable wire
+codecs, key and trust policies, channel-opening engine, and host adapters.
 
 Not implemented: user authentication, rekeying, a TCP SSH server handshake,
 writing or enrolling `known_hosts` (or reading `~/.ssh` implicitly),
-`@cert-authority` and host certificates, encrypted host keys, RSA/ECDSA host
-keys, compression, any cipher other than `aes128-gcm@openssh.com`, channels
-and data flow, PTY/exec/forwarding/SFTP,
+`@cert-authority` and host certificates, encrypted host keys, any SSH cipher
+other than `aes128-gcm@openssh.com`, live channels and data flow (only the
+channel-opening codecs and state machine exist), PTY/exec/forwarding/SFTP,
 and SSH over QUIC (the ALPN value is experimental and unregistered; record
 framing, control stream and session binding are open).
 
@@ -193,11 +192,12 @@ also in `trust_error`) when no decision was made; the message is in `outcome`.
 `~/.ssh/known_hosts` is never read implicitly; there is no prompt and no
 enrollment (`docs/decisions.md` W-32, W-37).
 
-What it does: identification exchange, `KEXINIT` (offering exactly
-`curve25519-sha256`, `ssh-ed25519`, `aes128-gcm@openssh.com`, `none`, plus the
+What it does: identification exchange, `KEXINIT` (offering
+`curve25519-sha256`, the enabled host-key algorithms, `aes128-gcm@openssh.com`,
+compression `none`, plus the
 `ext-info-c`, `kex-strict-c-v00@openssh.com` and `kex-strict-c` markers),
-`KEX_ECDH_INIT`/`REPLY`, exchange hash and Ed25519 signature verification, the
-pin check, `NEWKEYS` both ways with sequence-number reset under strict KEX,
+`KEX_ECDH_INIT`/`REPLY`, verification of the negotiated signature over the
+exchange hash, host trust check, `NEWKEYS` both ways with sequence-number reset under strict KEX,
 protected `SERVICE_REQUEST("ssh-userauth")`, `EXT_INFO` receive
 (`server-sig-algs` recorded, nothing enabled), `SERVICE_ACCEPT`, protected
 `DISCONNECT` (`tatami diagnostic complete`). What it does **not** do: send
@@ -305,12 +305,13 @@ cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-client -- 
   `--host-key-sha256` is the SSH fingerprint `ssh-keygen -lf` prints, not a
   certificate or SPKI hash; the SSH modes require a raw public key and refuse
   a certificate, and `--cert-sha256`/`--root-cert` are unchanged. Reports
-  show the SSH fingerprint and the SSHFP value (`4 2 <hex>`, as `ssh-keygen
+  show the SSH fingerprint and the SSHFP value (e.g. `4 2 <hex>` for Ed25519, as `ssh-keygen
   -r` prints) as fingerprint equivalence only: no DNS lookup or DNSSEC
   validation takes place (W-36, W-40).
 - **Key types (round 6).** With `--features rsa,ecdsa-p256` the same works
-  for RSA (`rsa-sha2-512` / `rsa-sha2-256`; 2048–4096-bit keys as QUIC
-  identities, up to 8192 bits on TCP) and ECDSA P-256 host keys, with SSHFP
+  for RSA (`rsa-sha2-512` / `rsa-sha2-256`; 2048, 3072 or 4096 bits and
+  `e >= 65537` for QUIC signing, 2048–8192 bits for TCP verification) and
+  ECDSA P-256 host keys, with SSHFP
   algorithms 1 and 3. `tatami-client handshake --host-key-algorithms LIST`
   forces the TCP host-key algorithm list; `ssh-rsa` (RSA/SHA-1) is never
   offered or accepted. RSA and P-256 signatures are checked by `ring`, the
@@ -337,7 +338,9 @@ cargo run -p tatami_ssh --features std,tcp,kex,quic-diag --bin tatami-client -- 
   with the line number). `@cert-authority` and other-algorithm lines never
   confer trust. Limits: 1 MiB, 16 KiB per line, 10 000 entries, 256 patterns
   per line. Stricter than OpenSSH by design (W-37, W-41).
-- **Host key.** Unencrypted Ed25519 `openssh-key-v1` only, at most 16 KiB.
+- **Host key.** Unencrypted `openssh-key-v1`, at most 16 KiB: Ed25519 or,
+  with the corresponding feature, RSA or P-256. See the [provider audit](docs/crypto-provider-audit.md#rsa-and-ecdsa-p-256-host-keys-round-6)
+  for the P-256 short-scalar import limitation.
   Encrypted keys are refused with a specific error and there is no
   passphrase input. On Unix the file must not be group/other-accessible
   (checked on the opened file); other platforms get no permission check.
@@ -382,11 +385,14 @@ reachable only through `tatami_ssh_openssh_compat` with
 builds, including `tatami_ssh_tcp --features kex` and `tatami_ssh_keys --features
 known-hosts,openssh-key` with no standard library. CI runs it on Rust 1.85.0
 and stable, with OpenSSH installed and `TATAMI_REQUIRE_OPENSSH=1` so the
-OpenSSH interoperability tests fail rather than skip. Round 5 ran it locally
-on stable only (rustc 1.98.1, 529 tests, none skipped; bare-metal step
-skipped, target not installed); the 1.85, bare-metal and CI OpenSSH runs
-(non-root `sshd` on the runner included) are gates not yet observed
-(`docs/crypto-provider-audit.md`).
+OpenSSH interoperability tests fail rather than skip.
+
+**Round 6 validation (`d7bb394`):** [workspace CI](https://github.com/ekline/tatami-ssh/actions/runs/36355563768)
+passed on stable and Rust 1.85.0, including required OpenSSH interop and
+`thumbv7em-none-eabi` builds. The local workspace gate passed 895 tests on
+each toolchain, with none failed or ignored. [Fuzz CI](https://github.com/ekline/tatami-ssh/actions/runs/36355563773)
+passed the ASan build, seed replay and bounded campaigns for all 21 targets;
+this is separate from the shorter local runs without ASan.
 
 ## Fuzzing
 
@@ -431,9 +437,3 @@ Ordinary `cargo test` never depends on nightly, cargo-fuzz or the corpora.
 Also deferred: encrypted host keys, signing agents/HSMs, `@cert-authority`
 and host certificates, implicit `~/.ssh` files and enrollment, and SSHFP/DNSSEC
 verification.
-
-Pending gates: the remote fuzz CI run with ASan (including the round-5
-targets), Rust 1.85 on the round-5 code, the first CI bare-metal build of
-the `kex`/`ed25519`/`known-hosts`/`openssh-key` features, and the first CI run
-of the OpenSSH tests with `TATAMI_REQUIRE_OPENSSH=1` (non-root `sshd` on the
-runner is unverified).

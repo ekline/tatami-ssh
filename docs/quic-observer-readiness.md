@@ -1,22 +1,23 @@
 # QUIC observer readiness: status and corrections
 
-Status: round 4, 2026-09-20. Observer **(a)** below — the TLS/QUIC handshake
+Status through round 6. Observer **(a)** below — the TLS/QUIC handshake
 observer — is **implemented** as `tatami_ssh_quic::diag` behind the
 `quinn-backend` feature (W-31), exposed as `tatami-server observe
 --transport quic` and `tatami-client handshake --transport quic` behind the
 facade feature `quic-diag` (W-35; originally separate `tatami-quic-*`
 binaries). Observer **(b)** — the SSH-over-QUIC observer — is **not
 started**; every mapping question it depends on remains open (P-03–P-05,
-AQ-015, AQ-018–AQ-023, AQ-026). Sections 1 and 2 are kept as written in
-round 3 because they still hold; §3 records the decision, §4 the corrections
+AQ-015, AQ-018–AQ-023, AQ-026). Sections 1 and 2 distinguish the two observers; §3 records the backend decision, §4 the corrections
 learned by compiling and testing against the backend, §5 what (b) requires.
 
 Round 5 (2026-09-26) added an SSH host-key identity mode to observer (a):
 the server presents an OpenSSH Ed25519 host key as an RFC 7250 raw public
 key and the client judges it with the same pin or `known_hosts` policy as
 the TCP handshake (W-36–W-41). That settles the *identity mapping* for
-Ed25519; it does not make (a) an SSH-over-QUIC observer. No SSH byte is sent,
-and a trusted host key over QUIC/TLS is not an SSH session.
+Ed25519; round 6 extended it to RSA and ECDSA P-256 behind the `rsa` and
+`ecdsa-p256` features (W-43). No SSH byte is sent, and a trusted host key
+over QUIC/TLS is not an SSH session. The future binding must not compress
+SSH payloads (W-44).
 
 ## 0. What was built (evidence)
 
@@ -34,9 +35,11 @@ and a trusted host key over QUIC/TLS is not an SSH session.
 | No SSH byte on the wire: every captured datagram checked for `SSH-` | `tests/inmem_handshake.rs::assert_no_ssh_bytes` |
 | 0-RTT never attempted (`zero_rtt_attempted: false` both ends) | `tests/inmem_handshake.rs` |
 | (Round 5) SSH host key as raw public key: SSH-blob pin and `known_hosts` succeed; wrong pin, changed key, revoked key, a port-22 entry for UDP 4433 and negated entries fail; a certificate peer is refused by SSH trust; an X.509 client is refused by a host-key server; a host key cannot be presented as a certificate; a trusted key with a foreign `CertificateVerify` signature fails | `tatami_ssh_quic/tests/host_key.rs` (in-memory) |
-| (Round 5) Same key served by OpenSSH `sshd` on TCP port P and `tatami-server --host-key` on UDP port P; one `known_hosts` entry accepts both; same fingerprint as `ssh-keygen -lf`; SSHFP from the QUIC raw key equals the TCP one and `ssh-keygen -r` | `tatami_ssh/tests/host_identity.rs` (passed locally with `OpenSSH_10.2p1`; skips without OpenSSH except under `TATAMI_REQUIRE_OPENSSH=1`, which CI sets; first CI run not yet observed) |
+| (Round 5) Same key served by OpenSSH `sshd` on TCP port P and `tatami-server --host-key` on UDP port P; one `known_hosts` entry accepts both; same fingerprint as `ssh-keygen -lf`; SSHFP from the QUIC raw key equals the TCP one and `ssh-keygen -r` | `tatami_ssh/tests/host_identity.rs` (passed locally with `OpenSSH_10.2p1`; skips without OpenSSH except under `TATAMI_REQUIRE_OPENSSH=1`, which CI sets) |
 
-All of the above passed on the development machine on 2026-09-20
+Round 6 tests also cover RSA and P-256 (`tatami_ssh_quic/tests/host_key_types.rs`,
+`tatami_ssh/tests/host_identity.rs`); see the [CI evidence](../README.md#checks).
+The original round 4 tests passed on the development machine on 2026-09-20
 (`cargo test -p tatami_ssh_quic --features quinn-backend`; `cargo test -p tatami_ssh
 --features std,tcp,quic-diag --test quic_cli`). This is a loopback experiment with
 Tatami on both ends; **no interoperability with any other QUIC or TLS
@@ -75,7 +78,7 @@ Consequences that are fixed regardless of backend:
 |---|---|---|
 | Purpose | Learn what a real QUIC client sends: version, ClientHello SNI, offered vs negotiated ALPN, handshake success/failure, validation/Retry status, migration events. | Observe the *Tatami mapping's* first SSH artefacts on a QUIC connection. |
 | SSH content | None. No identification string, no `KEXINIT`. | Identification placement and the control-stream bootstrap as decided under AQ-015, AQ-020–AQ-023, AQ-026. Not decided yet. |
-| Identity | A locally generated certificate or raw public key sufficient to complete a TLS handshake; trust decisions are out of scope. | Real identity configuration (P-06: raw public keys are the candidate) and the exporter-derived binding (P-04) — still open. |
+| Identity | A test certificate or an OpenSSH host key as a raw public key; the latter uses the same pin/`known_hosts` trust as TCP. | Real identity configuration (P-06: raw public keys are the candidate) and the exporter-derived binding (P-04) — still open. |
 | Application protocol | An experimental, configurable ALPN value; no IANA registration is claimed (AQ-019 / P-08). Observing which values clients *offer* is the point. | Same value, but now it must be *agreed* (RFC 9001 §8.1 requires authenticated negotiation). |
 | Must not | Reply on UDP outside the backend; treat Initial source as peer. | Inherit TCP packet framing (`tatami_ssh_tcp::packet` is the TCP envelope, W-12), or manufacture an SSH KEX / session ID. The QUIC record rule is AQ-018 and is unwritten. |
 | Prerequisite | A backend that compiles under an explicit `std`-enabling feature. | (a) plus the mapping decisions above. |
@@ -172,7 +175,7 @@ migration.
 | Control-stream bootstrap: initiator, direction, recognition, first record | P-03, AQ-015 | open |
 | Bounded enclosing record rule on QUIC streams (TCP's binary packet is **not** inherited, W-12) | P-02, AQ-018 | open |
 | Session-binding construction from the exporter (label, context, length, transcript inputs, identification strings) and its proof of authentication | P-04, AQ-003, AQ-024 | exporter *availability* shown; construction open |
-| Host identity: SPKI ↔ SSH key mapping and the fingerprint an operator pins | P-06 | Ed25519 mapping implemented in the diagnostic (round 5, W-36, W-40): strict SPKI → SSH blob, SSH-blob fingerprint and `known_hosts`, same policy as TCP. Other algorithms, host certificates and how the identity feeds the session binding remain open |
+| Host identity: SPKI ↔ SSH key mapping and the fingerprint an operator pins | P-06 | Implemented in the diagnostic for Ed25519, RSA and P-256 (W-36, W-40, W-43): strict SPKI → SSH blob, SSH-blob fingerprint and `known_hosts`, same policy as TCP. Host certificates and how the identity feeds the session binding remain open |
 | Channel-opening placement and stream association | AQ-026, AQ-001, AQ-004 | open |
 | ALPN value | AQ-019, P-08 | experimental `tatami-diag/0`; unregistered |
 | Interoperability partner other than Tatami itself | — | none |
@@ -190,6 +193,6 @@ separate `tatami-quic-*` binaries were removed by W-35).
 | `std` in `tatami_ssh_quic` | Resolved as designed: `quinn-backend` enables `std`; `check-workspace.sh` verifies the backend is absent without the feature and that portable builds still pass. |
 | MSRV drift | Contained: `quinn-proto` pinned to 0.11.18 by `Cargo.lock`; 0.12 requires 1.88. Raising MSRV is a W-07 change. |
 | Crypto provider | `ring` selected for the experiment (W-31); the SSH side uses the pure-Rust set (W-29). Not unified, deliberately. |
-| Identity | rcgen test identities, or (round 5) an OpenSSH Ed25519 host key as a raw public key judged by `known_hosts`/SSH pin; P-06 mapping settled for Ed25519 only. Encrypted keys, agents/HSMs and host certificates not supported. |
+| Identity | rcgen test identities, or Ed25519, RSA and P-256 OpenSSH host keys as raw public keys judged by `known_hosts`/SSH pin (W-43). Encrypted keys, agents/HSMs and host certificates not supported. |
 | Second-opinion backend | Not done; quiche when MSRV 1.88 is acceptable. |
 | Observer (b) | Blocked on §5. |

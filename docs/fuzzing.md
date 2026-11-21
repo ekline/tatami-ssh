@@ -1,11 +1,12 @@
 # Fuzzing
 
-Status: rounds 3–5, 2026-09-26. Coverage-guided libFuzzer harnesses exist for
+Status through round 6: 21 targets. Coverage-guided libFuzzer harnesses exist for
 every implemented protocol surface, including (round 4) the KEX/service/
 EXT_INFO codecs, key and signature blobs, algorithm negotiation, AES-GCM
 packet protection and the complete client handshake state machine, and
 (round 5) strict SPKI conversion, `known_hosts` parsing/matching/decisions
-and the OpenSSH private-key validation adapter. Nothing
+and the OpenSSH private-key validation adapter. Round 6 extended existing
+targets for RSA/P-256 rather than adding new targets. Nothing
 here fuzzes the upstream TLS/QUIC stack, authentication or SFTP (see
 [Future targets](#future-targets)); the QUIC diagnostic adapter is covered by
 deterministic in-memory tests rather than a libFuzzer target (see
@@ -264,8 +265,7 @@ write, deadline exhaustion inside a packet body, reads never exceeding
 are waited for rather than spun on. Sink failure, capacity saturation and
 requested stop at the listener level remain in `tests/observer_loopback.rs`
 with real sockets and threads; libFuzzer does not explore thread schedules,
-and none of this validates constant-time behaviour (there is no
-cryptography yet). No `adapter_events` fuzz target was added: the scripted
+and none of this validates constant-time behaviour. No `adapter_events` fuzz target was added: the scripted
 seam is exercised by enumerated scenarios whose oracles are exact expected
 timelines, which a mutation engine adds little to.
 
@@ -414,10 +414,12 @@ with 4096, so they did not reach `TooLarge`. After the follow-up fixes (TCP
 
 No round-5 coverage figures are recorded here.
 
-ASan runs and the pinned nightly were not executed locally (no rustup on the
-development machine); they run in CI, and for the round-5 targets that CI
-evidence has not yet been observed. No coverage percentage is a goal in
-itself.
+For round 6, all 21 targets replayed locally without ASan, followed by 30 s
+campaigns on the six affected targets, with no findings. The separate
+[push Fuzz run at `d7bb394`](https://github.com/ekline/tatami-ssh/actions/runs/36355563773)
+passed the pinned-nightly ASan build, replay and bounded campaign for every
+target. A passing campaign is evidence for those runs, not proof of absence
+of bugs.
 
 ## Future targets
 
@@ -425,7 +427,7 @@ Recorded so the next slices arrive with harnesses, not claimed as fuzzed:
 
 | Future surface | Target requirements |
 |---|---|
-| `authorized_keys` policy, RSA/ECDSA/certificate blobs, `@cert-authority` | Policy engine model with distinct host-trust vs user-authorization decisions; further blob layouts; never a real private key in a corpus (Ed25519 blobs, signatures, fingerprints and the pinned policy are covered by `key_blobs`; the `known_hosts` subset by `known_hosts`; only synthetic test keys appear in `openssh_private_key`) |
+| `authorized_keys` policy, certificate blobs, `@cert-authority` | Policy engine model with distinct host-trust vs user-authorization decisions; further blob layouts; never a real private key in a corpus (Ed25519 blobs, signatures, fingerprints and the pinned policy are covered by `key_blobs`; the `known_hosts` subset by `known_hosts`; only synthetic test keys appear in `openssh_private_key`) |
 | Rekeying and general sessions | Rekey state model (second exchange hash distinct from the session id), sequence-number and counter behaviour across re-keys, key-usage limits; the diagnostic currently refuses rekey and is fuzzed only for that refusal |
 | Userauth (`tatami_ssh_auth`) | Method state machines with a model of allowed transitions; signature-input construction against hand-assembled bytes; session-identifier provenance preserved |
 | QUIC stream association and flow control | Association registry model (stream IDs vs SSH numbers), pending/refused stream reclamation, SSH-window vs QUIC-credit separation; only after the record format (AQ-018) exists |
